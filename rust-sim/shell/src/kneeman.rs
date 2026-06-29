@@ -137,10 +137,78 @@ fn save_identity(id: &Identity) {
 /// 32x32 frames; we slice them into SpriteFrames clips. Swap to any sibling under
 /// assets/pixelfrog ("ninjafrog", "maskdude", "pinkman", "virtualguy") — same strips/counts.
 /// Test art only — CC0, not a shipping character.
-const SPRITE_DIR: &str = "pixelfrog/ninjafrog";
-const SPRITE_FRAME: f32 = 32.0; // source cell size (square)
-const SPRITE_SCALE: f32 = 3.3; // 32px art -> ~105px tall, near the ECB height
-const SPRITE_OFFSET_Y: f32 = -12.0; // seat the frog's feet on pos (scale-invariant)
+// Character roster. Cosmetic only -- a character's art is never folded into smash_net::checksum,
+// so adding or reordering the roster cannot desync a netplay session. Each fighter slot holds an
+// index into ROSTER (KneeMan::characters); char-select (later) just writes those indices.
+struct Character {
+    dir: &'static str,        // asset subdir under res://assets/
+    scale: f32,               // node scale so the art lands ~105px tall (near the ECB height)
+    offset_y: f32,            // sprite offset (texture px) so the feet sit on pos
+    sheet: Sheet,             // how this character's PNGs are laid out on disk
+    clips: &'static [Clip],   // one per CharState clip name (see clip_for)
+}
+
+/// How a character's frames are stored.
+enum Sheet {
+    /// One horizontal strip per clip, sliced into `frame_px` square cells. File = `<clip.files[0]>.png`.
+    Strip { frame_px: f32 },
+    /// One whole PNG per pose, named `<prefix>_<file>.png`. Each entry in `clip.files` is one frame.
+    Poses { prefix: &'static str },
+}
+
+/// One animation clip. For Strip, `files` holds the single strip name and `frames` is the cell
+/// count; for Poses, `files` is the per-frame pose list and `frames` is ignored.
+struct Clip {
+    name: &'static str,
+    files: &'static [&'static str],
+    frames: i32,
+    fps: f64,
+    looped: bool,
+}
+
+const ROSTER: &[Character] = &[FROG, ZOMBIE];
+
+/// P1 default: the Kenney/PixelFrog ninja frog (32px strips).
+const FROG: Character = Character {
+    dir: "pixelfrog/ninjafrog",
+    scale: 3.3, // 32px art -> ~105px tall
+    offset_y: -12.0,
+    sheet: Sheet::Strip { frame_px: 32.0 },
+    clips: &[
+        Clip { name: "idle", files: &["idle"], frames: 11, fps: 14.0, looped: true },
+        Clip { name: "walk", files: &["run"], frames: 12, fps: 14.0, looped: true },
+        Clip { name: "run", files: &["run"], frames: 12, fps: 20.0, looped: true },
+        Clip { name: "crouch", files: &["fall"], frames: 1, fps: 1.0, looped: false },
+        Clip { name: "skid", files: &["fall"], frames: 1, fps: 1.0, looped: false },
+        Clip { name: "jump", files: &["jump"], frames: 1, fps: 1.0, looped: false },
+        Clip { name: "fall", files: &["fall"], frames: 1, fps: 1.0, looped: false },
+        Clip { name: "hang", files: &["wall_jump"], frames: 5, fps: 12.0, looped: true },
+        Clip { name: "climb", files: &["double_jump"], frames: 6, fps: 14.0, looped: true },
+        Clip { name: "jab", files: &["hit"], frames: 7, fps: 20.0, looped: false },
+        Clip { name: "nair", files: &["double_jump"], frames: 6, fps: 18.0, looped: true },
+    ],
+};
+
+/// P2 default: the Kenney zombie (80x110 single-pose PNGs). Different silhouette from the frog.
+const ZOMBIE: Character = Character {
+    dir: "kenney/zombie",
+    scale: 0.95, // 110px art -> ~105px tall
+    offset_y: -55.0,
+    sheet: Sheet::Poses { prefix: "zombie" },
+    clips: &[
+        Clip { name: "idle", files: &["idle"], frames: 1, fps: 1.0, looped: false },
+        Clip { name: "walk", files: &["walk1", "walk2"], frames: 2, fps: 8.0, looped: true },
+        Clip { name: "run", files: &["walk1", "walk2"], frames: 2, fps: 13.0, looped: true },
+        Clip { name: "skid", files: &["skid"], frames: 1, fps: 1.0, looped: false },
+        Clip { name: "crouch", files: &["duck"], frames: 1, fps: 1.0, looped: false },
+        Clip { name: "jump", files: &["jump"], frames: 1, fps: 1.0, looped: false },
+        Clip { name: "fall", files: &["fall"], frames: 1, fps: 1.0, looped: false },
+        Clip { name: "hang", files: &["hang"], frames: 1, fps: 1.0, looped: false },
+        Clip { name: "climb", files: &["climb1", "climb2"], frames: 2, fps: 8.0, looped: true },
+        Clip { name: "jab", files: &["action1"], frames: 1, fps: 1.0, looped: false },
+        Clip { name: "nair", files: &["kick"], frames: 1, fps: 1.0, looped: false },
+    ],
+};
 
 /// Boundary: the pure sim speaks glam::Vec2; Godot wants its own Vector2. Convert on the way out.
 #[inline]
@@ -232,6 +300,7 @@ pub struct KneeMan {
     sig: SigCounts,                     // handshake-frame tallies feeding netdbg
     identity: Mutable<Identity>,        // local player name+color, edited by the panel, persisted
     saved_identity: Identity,           // last value written to localStorage (change detection)
+    characters: [usize; 2],             // per-slot index into ROSTER; char-select writes these later
 
     // --- netplay (Godot WebRTC). All None/Offline until the player joins a match (Enter). ---
     phase: Phase,
@@ -261,6 +330,7 @@ impl INode2D for KneeMan {
             sig: SigCounts::default(),
             identity: Mutable::new(Identity::default()),
             saved_identity: Identity::default(),
+            characters: [0, 1], // P1 frog, P2 zombie until char-select sets them
             phase: Phase::Offline,
             role: None,
             local_handle: 0,
@@ -284,9 +354,10 @@ impl INode2D for KneeMan {
             .get_node_or_null("Anim")
             .and_then(|n| n.try_cast::<AnimatedSprite2D>().ok())
         {
-            a.set_sprite_frames(&build_frames());
-            a.set_scale(Vector2::splat(SPRITE_SCALE));
-            a.set_offset(Vector2::new(0.0, SPRITE_OFFSET_Y)); // feet on pos
+            let c = &ROSTER[self.characters[0]];
+            a.set_sprite_frames(&build_frames(c));
+            a.set_scale(Vector2::splat(c.scale));
+            a.set_offset(Vector2::new(0.0, c.offset_y)); // feet on pos
             a.set_texture_filter(godot::classes::canvas_item::TextureFilter::NEAREST); // crisp pixels
             a.play_ex().name("idle").done();
             self.anim = Some(a);
@@ -307,10 +378,11 @@ impl INode2D for KneeMan {
         self.saved_identity = id.clone();
 
         // P2 as a real sprite (world-space sibling under the parent, positioned each frame).
+        let c2 = &ROSTER[self.characters[1]];
         let mut p2 = AnimatedSprite2D::new_alloc();
-        p2.set_sprite_frames(&build_frames());
-        p2.set_scale(Vector2::splat(SPRITE_SCALE));
-        p2.set_offset(Vector2::new(0.0, SPRITE_OFFSET_Y));
+        p2.set_sprite_frames(&build_frames(c2));
+        p2.set_scale(Vector2::splat(c2.scale));
+        p2.set_offset(Vector2::new(0.0, c2.offset_y));
         p2.set_texture_filter(godot::classes::canvas_item::TextureFilter::NEAREST);
         p2.play_ex().name("idle").done();
         // Nametags: world-space labels that hover over each head, wearing the player's color.
@@ -375,31 +447,34 @@ impl INode2D for KneeMan {
         }
     }
 
-    /// Debug overlay: active hitbox (red) + dummy hurtbox (yellow). Coordinates are world,
+    /// Debug overlay: each fighter's ECB (cyan), hurtbox (yellow), and active hitbox (red).
+    /// Drawn for both players so P2's attacks show their boxes too. Coordinates are world,
     /// converted to this node's local space (the node sits at the player position).
     fn draw(&mut self) {
         let s = self.state.get();
         let t = self.tune.get();
         let origin = self.base().get_position();
 
-        // ECB diamond (cyan): the actual collision shape — bottom vert = feet, side verts = walls.
-        let v = sim::ecb_verts(s.fighters[0].pos);
         let ecb = Color::from_rgba(0.20, 0.85, 0.95, 0.85);
-        for k in 0..4 {
-            let a = gv(v[k]) - origin;
-            let b = gv(v[(k + 1) % 4]) - origin;
-            self.base_mut().draw_line_ex(a, b, ecb).width(2.0).done();
-        }
-
-        // fighter[1] hurtbox (yellow): the opponent/dummy circle the attack lands on.
-        let (bc, br) = sim::hurtbox(&s.fighters[1]);
-        let hurt = gv(bc) - origin;
-        self.base_mut()
-            .draw_circle(hurt, br, Color::from_rgba(0.95, 0.85, 0.20, 0.30));
-        if let Some((hc, hr)) = sim::active_hitbox(&s.fighters[0], &t) {
-            let c = gv(hc) - origin;
-            self.base_mut()
-                .draw_circle(c, hr, Color::from_rgba(0.95, 0.25, 0.25, 0.45));
+        let hurt_col = Color::from_rgba(0.95, 0.85, 0.20, 0.30);
+        let hit_col = Color::from_rgba(0.95, 0.25, 0.25, 0.45);
+        for f in &s.fighters {
+            // ECB diamond: the actual collision shape — bottom vert = feet, side verts = walls.
+            let v = sim::ecb_verts(f.pos);
+            for k in 0..4 {
+                let a = gv(v[k]) - origin;
+                let b = gv(v[(k + 1) % 4]) - origin;
+                self.base_mut().draw_line_ex(a, b, ecb).width(2.0).done();
+            }
+            // hurtbox: the circle an attack lands on.
+            let (bc, br) = sim::hurtbox(f);
+            let hurt = gv(bc) - origin;
+            self.base_mut().draw_circle(hurt, br, hurt_col);
+            // active hitbox: present only while this fighter's attack is live.
+            if let Some((hc, hr)) = sim::active_hitbox(f, &t) {
+                let c = gv(hc) - origin;
+                self.base_mut().draw_circle(c, hr, hit_col);
+            }
         }
 
         // items + projectiles (debug shapes for now; model_id -> sprite is the later polish)
@@ -897,39 +972,35 @@ fn clip_for(f: &Fighter) -> &'static str {
     }
 }
 
-/// Build SpriteFrames by slicing the frog's animation strips. Our 11 movement clips map onto the
-/// 7 frog animations (choppy by design; no per-state art): walk/run reuse Run, crouch/skid reuse
-/// Fall, hang reuses the Wall-Jump cling, climb/nair reuse the Double-Jump flip, jab reuses Hit.
-fn build_frames() -> Gd<SpriteFrames> {
+/// Build a character's SpriteFrames from its clip table. Strip clips slice a sheet into cells;
+/// Poses clips take one whole PNG per frame. Clip names match `clip_for` (choppy by design; the
+/// art has no per-state poses, so several CharStates reuse one clip).
+fn build_frames(c: &Character) -> Gd<SpriteFrames> {
     let mut sf = SpriteFrames::new_gd();
-    add_strip(&mut sf, "idle", "idle", 11, 14.0, true);
-    add_strip(&mut sf, "walk", "run", 12, 14.0, true);
-    add_strip(&mut sf, "run", "run", 12, 20.0, true);
-    add_strip(&mut sf, "crouch", "fall", 1, 1.0, false);
-    add_strip(&mut sf, "skid", "fall", 1, 1.0, false);
-    add_strip(&mut sf, "jump", "jump", 1, 1.0, false);
-    add_strip(&mut sf, "fall", "fall", 1, 1.0, false);
-    add_strip(&mut sf, "hang", "wall_jump", 5, 12.0, true);
-    add_strip(&mut sf, "climb", "double_jump", 6, 14.0, true);
-    add_strip(&mut sf, "jab", "hit", 7, 20.0, false);
-    add_strip(&mut sf, "nair", "double_jump", 6, 18.0, true);
-    sf
-}
-
-/// One clip from a horizontal strip: load the sheet once, add an AtlasTexture per 32x32 cell.
-fn add_strip(sf: &mut Gd<SpriteFrames>, name: &str, file: &str, frames: i32, fps: f64, looped: bool) {
-    sf.add_animation(name);
-    sf.set_animation_speed(name, fps);
-    sf.set_animation_loop(name, looped);
-    let sheet = load::<Texture2D>(&format!("res://assets/{SPRITE_DIR}/{file}.png"));
-    for i in 0..frames {
-        let mut at = AtlasTexture::new_gd();
-        at.set_atlas(&sheet);
-        at.set_region(Rect2::new(
-            Vector2::new(i as f32 * SPRITE_FRAME, 0.0),
-            Vector2::new(SPRITE_FRAME, SPRITE_FRAME),
-        ));
-        let tex = at.upcast::<Texture2D>();
-        sf.add_frame(name, &tex);
+    for clip in c.clips {
+        sf.add_animation(clip.name);
+        sf.set_animation_speed(clip.name, clip.fps);
+        sf.set_animation_loop(clip.name, clip.looped);
+        match &c.sheet {
+            Sheet::Strip { frame_px } => {
+                let sheet = load::<Texture2D>(&format!("res://assets/{}/{}.png", c.dir, clip.files[0]));
+                for i in 0..clip.frames {
+                    let mut at = AtlasTexture::new_gd();
+                    at.set_atlas(&sheet);
+                    at.set_region(Rect2::new(
+                        Vector2::new(i as f32 * frame_px, 0.0),
+                        Vector2::splat(*frame_px),
+                    ));
+                    sf.add_frame(clip.name, &at.upcast::<Texture2D>());
+                }
+            }
+            Sheet::Poses { prefix } => {
+                for f in clip.files {
+                    let tex = load::<Texture2D>(&format!("res://assets/{}/{}_{}.png", c.dir, prefix, f));
+                    sf.add_frame(clip.name, &tex);
+                }
+            }
+        }
     }
+    sf
 }
