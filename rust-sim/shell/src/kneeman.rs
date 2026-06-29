@@ -81,17 +81,18 @@ struct SigCounts {
 pub struct Identity {
     pub name: String,
     pub color: Color,
+    pub font_px: i32, // nametag font size (HUD-wide; both tags share the local player's setting)
 }
 
 impl Default for Identity {
     fn default() -> Self {
-        Self { name: "Player".into(), color: Color::from_rgb(0.35, 0.75, 1.0) }
+        Self { name: "Player".into(), color: Color::from_rgb(0.35, 0.75, 1.0), font_px: 32 }
     }
 }
 
 /// Stable default for the remote slot until Cut 2 trades the real identity over the signaling ws.
 fn p2_identity() -> Identity {
-    Identity { name: "P2".into(), color: Color::from_rgb(1.0, 0.55, 0.35) }
+    Identity { name: "P2".into(), color: Color::from_rgb(1.0, 0.55, 0.35), font_px: 32 }
 }
 
 /// Cap the name length and trim; cosmetic only (the tag and the saved file both show this).
@@ -122,6 +123,9 @@ fn load_identity() -> Identity {
     if let Ok(c) = cfg.get_value("player", "color").try_to::<Color>() {
         id.color = c;
     }
+    if let Ok(px) = cfg.get_value("player", "font_px").try_to::<i64>() {
+        id.font_px = (px as i32).clamp(10, 96);
+    }
     id
 }
 
@@ -130,6 +134,7 @@ fn save_identity(id: &Identity) {
     let _ = cfg.load(IDENTITY_PATH); // keep any other keys already on disk
     cfg.set_value("player", "name", &GString::from(sanitize_name(&id.name).as_str()).to_variant());
     cfg.set_value("player", "color", &id.color.to_variant());
+    cfg.set_value("player", "font_px", &(id.font_px as i64).to_variant());
     cfg.save(IDENTITY_PATH);
 }
 
@@ -386,8 +391,8 @@ impl INode2D for KneeMan {
         p2.set_texture_filter(godot::classes::canvas_item::TextureFilter::NEAREST);
         p2.play_ex().name("idle").done();
         // Nametags: world-space labels that hover over each head, wearing the player's color.
-        let tag_p1 = make_tag(&id.name, id.color);
-        let tag_p2 = make_tag(&p2_identity().name, p2_identity().color);
+        let tag_p1 = make_tag(&id.name, id.color, id.font_px);
+        let tag_p2 = make_tag(&p2_identity().name, p2_identity().color, id.font_px);
         // Add as world-space siblings under our parent. Deferred: during ready() the parent is still
         // "busy setting up children", so an immediate add_child is rejected (re-entrant child setup).
         // call_deferred runs it the moment setup finishes, before the first frame draws.
@@ -901,6 +906,10 @@ impl KneeMan {
         if let Some(mut tag) = self.tag_p1.clone() {
             tag.set_text(&id.name);
             tag.add_theme_color_override("font_color", id.color);
+            tag.add_theme_font_size_override("font_size", id.font_px);
+        }
+        if let Some(mut tag) = self.tag_p2.clone() {
+            tag.add_theme_font_size_override("font_size", id.font_px);
         }
         self.saved_identity = id;
     }
@@ -930,10 +939,10 @@ fn sprite_tint(f: &Fighter, color: Color) -> Color {
 
 /// A world-space nametag: small, the player's color, with a dark outline so it reads over the
 /// light stage. Centered horizontally each frame in `place_tag` (Label origin is top-left).
-fn make_tag(name: &str, color: Color) -> Gd<Label> {
+fn make_tag(name: &str, color: Color, font_px: i32) -> Gd<Label> {
     let mut l = Label::new_alloc();
     l.set_text(name);
-    l.add_theme_font_size_override("font_size", 15);
+    l.add_theme_font_size_override("font_size", font_px);
     l.add_theme_color_override("font_color", color);
     l.add_theme_constant_override("outline_size", 6);
     l.add_theme_color_override("font_outline_color", Color::from_rgba(0.05, 0.06, 0.10, 0.92));

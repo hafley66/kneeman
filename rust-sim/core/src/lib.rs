@@ -370,6 +370,7 @@ pub struct Fighter {
     pub damage: f32,       // accumulated % (knockback scales with this)
     pub hitstun: i64,      // frames launched/can't act (drives the hit flash + knockback slide)
     pub holding: i8,       // index into SimState.items of the held item, or -1 (empty-handed)
+    pub coyote: u8,        // grace frames after walking off an edge where jump = full grounded jump
 }
 
 /// Max simultaneous items+projectiles on screen (fixed so SimState stays Copy + checksums cheaply).
@@ -447,6 +448,7 @@ impl Fighter {
             damage: 0.0,
             hitstun: 0,
             holding: -1,
+            coyote: 0,
         }
     }
 
@@ -656,6 +658,7 @@ pub struct Tune {
     pub dair_threshold: f32, // aim_y past this (and steeper than horizontal) picks dair over nair
     pub autohop_dmg: f32, // damage multiplier for auto-short-hop aerials (jump+attack macro)
     pub di_max_angle: f32, // max degrees the victim's stick can rotate a launch trajectory (survival DI)
+    pub coyote_frames: i64, // grace window after walking off an edge to still get a full grounded jump
     // items (match settings, not character-derived)
     pub items_on: bool,           // master switch for item spawns
     pub item_spawn_interval: i64, // frames between spawn attempts (0 = off)
@@ -709,6 +712,7 @@ impl Tune {
             dair_threshold: 0.5,
             autohop_dmg: 0.85, // Ultimate-ish 15% cut on the easy jump+attack aerial
             di_max_angle: 18.0, // ~18 deg of trajectory DI, the survival-DI ceiling
+            coyote_frames: 9, // walk off the lip and you keep your real jump for ~9f (forgiving edge grace)
             items_on: true,
             item_spawn_interval: 480, // ~8s between spawns
             laser: ItemConfig::LASER,
@@ -830,6 +834,9 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
         if s.timer > 0 {
             s.timer -= 1;
         }
+    }
+    if n.coyote > 0 {
+        n.coyote -= 1;
     }
     {
         let m = &mut n.buf[Lane::Movement as usize];
@@ -1079,7 +1086,18 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
                 // double jump: cancels fall (crisp upward pop even while falling fast) and
                 // REDIRECTS horizontal from the stick — hold back to reverse momentum.
                 let want_djump = matches!(n.live(Lane::Movement), Action::Jump | Action::ShortHop);
-                if want_djump && n.air_jumps > 0 {
+                if want_djump && n.coyote > 0 {
+                    // coyote jump: walked off the lip a few frames ago, so this is still the
+                    // GROUNDED jump (full/short by which lane), instant (no jumpsquat), and it
+                    // does NOT spend the air jump. Fixes "lost a jump the instant I left the edge".
+                    let full = n.live(Lane::Movement) == Action::Jump;
+                    n.clear_lane(Lane::Movement);
+                    n.coyote = 0;
+                    n.vel.y = if full { t.fullhop_v } else { t.shorthop_v };
+                    n.fast_falling = false;
+                    let h = n.vel.x * t.momentum_carry + i.dir * t.jump_h_init;
+                    n.vel.x = h.clamp(-t.jump_h_max, t.jump_h_max);
+                } else if want_djump && n.air_jumps > 0 {
                     n.clear_lane(Lane::Movement);
                     n.air_jumps -= 1;
                     n.vel.y = t.airjump_v;
@@ -1236,6 +1254,7 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
                     n.fast_falling = false;
                     n.air_jumps = t.max_air_jumps as u8;
                     n.air_dodges = t.max_air_dodges as u8;
+                    n.coyote = 0; // landed: the grace window is spent
                     n.ground_plat = idx as i32;
                     n.state = CharState::Landing; // carries vel.x -> Landing friction = slide
                     break;
@@ -1273,6 +1292,7 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
             // down there is a wavedash aim, and we're committed to the jump)
             n.state = CharState::Air;
             n.ground_plat = -1;
+            n.coyote = t.coyote_frames as u8;
         } else {
             n.pos.y = p.y;
             n.vel.y = 0.0;
@@ -1282,6 +1302,7 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
                 if sgn < 0.0 {
                     n.state = CharState::Air;
                     n.ground_plat = -1;
+                    n.coyote = t.coyote_frames as u8;
                     if p.solid {
                         n.regrab_lock = 12;
                     }
@@ -1293,6 +1314,7 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
                 if sgn > 0.0 {
                     n.state = CharState::Air;
                     n.ground_plat = -1;
+                    n.coyote = t.coyote_frames as u8;
                     if p.solid {
                         n.regrab_lock = 12;
                     }
@@ -1711,5 +1733,48 @@ mod di_tests {
         let v = Vector2::new(40.0, -90.0);
         assert_eq!(apply_di(v, Vector2::ZERO, 18.0), v);
         assert_eq!(apply_di(v, Vector2::new(0.1, 0.1), 18.0), v); // below the 0.3 deadzone
+    }
+
+    // Walked off the lip (Air + coyote window) and pressed jump: it's the GROUNDED jump
+    // (fullhop velocity), it does NOT spend the air jump, and the window closes.
+    #[test]
+    fn coyote_jump_is_full_and_keeps_air_jump() {
+        let t = Tune::from_char(&CharData::KNEEMAN);
+        let mut s = SimState::spawn();
+        let f = &mut s.fighters[0];
+        f.state = CharState::Air;
+        f.pos = Vector2::new(600.0, 200.0); // airborne over center, far from any platform/ledge
+        f.vel = Vector2::new(0.0, 40.0); // falling
+        f.air_jumps = 1;
+        f.coyote = 4;
+        let jump = InputFrame { jump: true, jump_held: true, ..Default::default() };
+        let idle = InputFrame::default();
+        let out = step(&s, [&jump, &idle], &t);
+        let g = &out.fighters[0];
+        // one frame of gravity is integrated after takeoff, so compare against fullhop + g*DT.
+        let expect = t.fullhop_v + t.gravity * DT;
+        assert!((g.vel.y - expect).abs() < 1e-3, "coyote jump uses fullhop velocity");
+        assert_eq!(g.air_jumps, 1, "coyote jump must not consume the air jump");
+        assert_eq!(g.coyote, 0, "the grace window closes after the jump");
+    }
+
+    // Same airborne state but the window has expired: jump spends the air jump instead.
+    #[test]
+    fn expired_coyote_spends_air_jump() {
+        let t = Tune::from_char(&CharData::KNEEMAN);
+        let mut s = SimState::spawn();
+        let f = &mut s.fighters[0];
+        f.state = CharState::Air;
+        f.pos = Vector2::new(600.0, 200.0);
+        f.vel = Vector2::new(0.0, 40.0);
+        f.air_jumps = 1;
+        f.coyote = 0;
+        let jump = InputFrame { jump: true, jump_held: true, ..Default::default() };
+        let idle = InputFrame::default();
+        let out = step(&s, [&jump, &idle], &t);
+        let g = &out.fighters[0];
+        let expect = t.airjump_v + t.gravity * DT;
+        assert!((g.vel.y - expect).abs() < 1e-3, "no coyote -> air jump velocity");
+        assert_eq!(g.air_jumps, 0, "air jump is consumed");
     }
 }

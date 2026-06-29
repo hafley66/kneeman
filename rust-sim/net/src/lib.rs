@@ -137,6 +137,7 @@ pub fn checksum(s: &SimState) -> u128 {
         fold(f.damage.to_bits() as u64);
         fold(f.hitstun as u64);
         fold(f.holding as u64);
+        fold(f.coyote as u64);
     }
     fold(s.tick);
     fold(s.rng);

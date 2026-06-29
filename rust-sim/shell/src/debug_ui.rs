@@ -206,6 +206,7 @@ fn draw_panel(
             c |= slider(ui, &mut t.jump_h_init, 0.0..=1000.0, "jump_h_init");
             c |= slider(ui, &mut t.jump_h_max, 0.0..=2000.0, "jump_h_max");
             c |= slider(ui, &mut t.momentum_carry, 0.0..=1.5, "momentum_carry");
+            c |= islider(ui, &mut t.coyote_frames, 0..=12, "coyote_frames (edge grace)");
         });
         egui::CollapsingHeader::new("air / fall").default_open(false).show(ui, |ui| {
             c |= slider(ui, &mut t.gravity, 200.0..=6000.0, "gravity");
@@ -335,6 +336,11 @@ fn identity_card(ui: &mut egui::Ui, cell: &Mutable<Identity>) {
                 id.color = Color::from_rgb(rgb[0], rgb[1], rgb[2]);
                 changed = true;
             }
+        });
+        ui.horizontal(|ui| {
+            ui.colored_label(theme::MUTED, "tag size");
+            let resp = ui.add(egui::Slider::new(&mut id.font_px, 10..=96).suffix("px"));
+            changed |= resp.changed();
         });
     });
     ui.add_space(4.0);
