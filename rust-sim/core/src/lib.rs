@@ -108,10 +108,23 @@ pub enum CharState {
     LedgeClimb,// ledge getup
     Jab,       // grounded quick attack
     Nair,      // neutral aerial
+    Dair,      // down aerial: steep spike, drives the opponent down
+    DashAttack,// attack out of dash/run: lunges forward, keeps momentum
+}
+
+/// The "next action" a fighter's state machine emits each frame: a pure descriptor of an effect it
+/// can't apply alone because it needs the whole `SimState` (the item array). `advance` returns one;
+/// `step` actuates it via `apply_act`. The input stream is never mutated — the FSM just describes.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Act {
+    None,
+    Fire { auto: bool }, // held gun + attack: spawn a bolt (auto = held, not a fresh tap: weaker)
+    Drop,                // held item + grab: detach to the ground
+    Pickup,              // empty hands + attack over an item: claim it (else attack jabs)
 }
 
 fn airborne(st: CharState) -> bool {
-    matches!(st, CharState::Air | CharState::AirDodge | CharState::Nair)
+    matches!(st, CharState::Air | CharState::AirDodge | CharState::Nair | CharState::Dair)
 }
 
 fn is_ledge(st: CharState) -> bool {
@@ -161,6 +174,67 @@ impl AttackData {
         kb_scale: 4.2,
         kb_angle: 45.0,
     };
+    const DAIR: Self = Self {
+        startup: 10,
+        active: 6,
+        recovery: 18,
+        off: Vector2::new(10.0, 18.0), // hitbox below the feet (down + slightly forward)
+        r: 30.0,
+        damage: 11.0,
+        kb_base: 460.0,
+        kb_scale: 3.8,
+        kb_angle: -72.0, // negative = downward launch: the spike
+    };
+    const DASH_ATTACK: Self = Self {
+        startup: 8,
+        active: 4,
+        recovery: 22, // long endlag — the commitment that pays for the forward lunge
+        off: Vector2::new(52.0, -44.0),
+        r: 30.0,
+        damage: 9.0,
+        kb_base: 480.0,
+        kb_scale: 3.6,
+        kb_angle: 40.0,
+    };
+}
+
+/// Per-item-kind config (spawn rate + behavior + model). Lives in Tune so the panel edits it live.
+/// `hit` reuses AttackData for the projectile's damage/knockback (startup/active/recovery unused).
+#[derive(Copy, Clone)]
+pub struct ItemConfig {
+    pub spawn_weight: f32, // relative spawn chance vs other kinds (0 = never spawns)
+    pub ammo: i64,         // shots a fresh gun carries
+    pub cooldown: i64,     // frames between shots (a clean tap)
+    pub autofire_cd: i64,  // frames between shots while holding (shorter = drains faster)
+    pub autofire_dmg: f32, // damage multiplier for held auto-fire bolts (< 1 = weaker)
+    pub speed: f32,        // projectile speed (px/s)
+    pub range: i64,        // projectile lifetime in frames before it fizzles
+    pub model_id: u8,      // shell sprite key (rendering only; sim ignores it)
+    pub hit: AttackData,   // projectile damage + knockback
+}
+
+impl ItemConfig {
+    pub const LASER: Self = Self {
+        spawn_weight: 1.0,
+        ammo: 16,
+        cooldown: 6,      // ~10 shots/sec on clean taps
+        autofire_cd: 4,   // ~15 shots/sec while held — drains the mag faster
+        autofire_dmg: 0.6, // held spray is weaker per bolt (the funny tax)
+        speed: 1400.0,
+        range: 70,
+        model_id: 0,
+        hit: AttackData {
+            startup: 0,
+            active: 1,
+            recovery: 0,
+            off: Vector2::ZERO,
+            r: 12.0,
+            damage: 2.5,
+            kb_base: 180.0,
+            kb_scale: 1.2,
+            kb_angle: 12.0, // near-flat: lasers push, don't launch
+        },
+    };
 }
 
 /// The (live) attack definition for a state, if it is one.
@@ -168,7 +242,20 @@ pub fn attack_for(t: &Tune, st: CharState) -> Option<AttackData> {
     match st {
         CharState::Jab => Some(t.jab),
         CharState::Nair => Some(t.nair),
+        CharState::Dair => Some(t.dair),
+        CharState::DashAttack => Some(t.dash_attack),
         _ => None,
+    }
+}
+
+/// Pick which aerial comes out from the aim captured at the attack press. Down past the threshold
+/// picks dair; otherwise nair. No diagonal-vs-cardinal gate yet: with only nair + dair, holding a
+/// horizontal for drift must NOT steal the dair (that gate returns when fair/bair land).
+pub fn aerial_for(aim: Vector2, t: &Tune) -> CharState {
+    if aim.y >= t.dair_threshold {
+        CharState::Dair
+    } else {
+        CharState::Nair
     }
 }
 
@@ -189,16 +276,72 @@ pub fn hurtbox(f: &Fighter) -> (Vector2, f32) {
     (f.pos + Vector2::new(0.0, -ECB_HALF_H), DUMMY_R)
 }
 
-/// A queued action from the input buffer. Recorded on the button edge with the aim at that
-/// moment, then consumed when the state machine reaches a point where it can act. This is what
+/// Every input edge that can be buffered, as one type. Recorded on the button edge with the aim at
+/// that moment, consumed when the state machine reaches a point where it can act — this is what
 /// makes wavedash / jump-out-of-lag / the down-diagonal feel reliable instead of frame-perfect.
+/// `window` is the only place a buffer length is decided, dispatched by a match (the enum's job —
+/// no bit tricks): the lookahead edges share the live Tune window; `Grab` is 0 (press-frame only,
+/// as today) but expressible, the seam to give it a real buffer later.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
-pub enum Buffered {
+pub enum Action {
     #[default]
     None,
     Jump,
     ShortHop,
     AirDodge,
+    Aerial,
+    Attack,
+    Grab,
+}
+
+impl Action {
+    /// Display label for the debug panel.
+    pub fn name(self) -> &'static str {
+        match self {
+            Action::None => "—",
+            Action::Jump => "JUMP",
+            Action::ShortHop => "SHORTHOP",
+            Action::AirDodge => "AIRDODGE",
+            Action::Aerial => "AERIAL",
+            Action::Attack => "ATTACK",
+            Action::Grab => "GRAB",
+        }
+    }
+
+    fn window(self, t: &Tune) -> i64 {
+        match self {
+            Action::None | Action::Grab => 0,
+            Action::Jump
+            | Action::ShortHop
+            | Action::AirDodge
+            | Action::Aerial
+            | Action::Attack => t.buffer_frames,
+        }
+    }
+}
+
+/// Buffer lanes. Each lane holds at most one pending action and lanes coexist, so a jump and an
+/// aerial pressed together for the auto-short-hop both survive. The `Movement` lane carries
+/// whichever of jump / short-hop / air-dodge was pressed most recently (they're mutually-exclusive
+/// intents — newest wins); the rest are single-action.
+#[repr(usize)]
+#[derive(Copy, Clone)]
+enum Lane {
+    Movement,
+    Aerial,
+    Attack,
+    Grab,
+}
+const N_LANE: usize = 4;
+
+/// One lane's pending action. `timer == 0` (or `action == None`) means empty; while live, `aim` is
+/// the stick captured at the press and, on the movement lane, refreshed within the window — the
+/// diagonal that lets a buffered air-dodge keep its latest direction.
+#[derive(Copy, Clone, PartialEq, Default, Debug)]
+pub struct Slot {
+    pub action: Action,
+    pub timer: i64,
+    pub aim: Vector2,
 }
 
 /// One fighter as a plain value. Two of these make a `SimState`. Everything here is
@@ -216,10 +359,7 @@ pub struct Fighter {
     pub air_dodges: u8,    // remaining air dodges
     pub fast_falling: bool,
     pub full_hop: bool,    // decided during JumpSquat (jump still held at takeoff)
-    pub buffered: Buffered,// queued action from the input buffer
-    pub buf_timer: i64,    // frames the buffered action stays valid
-    pub buf_aim: Vector2,  // aim captured/refreshed for the buffered action (the diagonal)
-    pub aerial_buf: i64,   // dedicated aerial buffer (separate slot so jump+attack holds both)
+    pub buf: [Slot; N_LANE], // input buffer, one lane each (Movement/Aerial/Attack/Grab); see Lane
     pub autohop_aerial: bool, // current aerial came from the jump+attack auto-short-hop (reduced dmg)
     pub intangible: bool,  // dodge / ledge i-frames (drives the debug color)
     pub regrab_lock: i64,  // frames before a ledge can be re-grabbed
@@ -228,13 +368,59 @@ pub struct Fighter {
     pub hitlag: i64,       // impact freeze on connect (this fighter held)
     pub damage: f32,       // accumulated % (knockback scales with this)
     pub hitstun: i64,      // frames launched/can't act (drives the hit flash + knockback slide)
+    pub holding: i8,       // index into SimState.items of the held item, or -1 (empty-handed)
 }
 
-/// The entire sim state as a plain value: two fighters. This is what the BehaviorSubject holds,
-/// what ggrs saves/rolls back, and what egui renders. `Copy` so snapshots are free.
+/// Max simultaneous items+projectiles on screen (fixed so SimState stays Copy + checksums cheaply).
+pub const MAX_ITEMS: usize = 8;
+
+/// What an item slot is. `None` = empty slot. Add kinds freely; behavior dispatches by `match`
+/// (the "trait methods" are functions keyed on kind), config lives per-kind in Tune.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum ItemKind {
+    None,
+    LaserGun,  // pickup weapon: hold + attack to fire LaserBolts until ammo runs out
+    LaserBolt, // the projectile a LaserGun fires
+}
+
+/// One item OR projectile. Plain Copy data so it rolls back. `owner`: -1 = unowned ground item;
+/// else the fighter index that holds it (gun) or fired it (bolt). `timer`: gun = fire cooldown,
+/// bolt = remaining lifetime. `ammo`: gun shots left.
+#[derive(Copy, Clone, PartialEq)]
+pub struct Item {
+    pub kind: ItemKind,
+    pub pos: Vector2,
+    pub vel: Vector2,
+    pub owner: i8,
+    pub ammo: i64,
+    pub timer: i64,
+    pub facing: f32,
+}
+
+impl Item {
+    pub const EMPTY: Self = Self {
+        kind: ItemKind::None,
+        pos: Vector2::ZERO,
+        vel: Vector2::ZERO,
+        owner: -1,
+        ammo: 0,
+        timer: 0,
+        facing: 1.0,
+    };
+    pub fn active(&self) -> bool {
+        !matches!(self.kind, ItemKind::None)
+    }
+}
+
+/// The entire sim state as a plain value: two fighters + the item field. This is what the
+/// BehaviorSubject holds, what ggrs saves/rolls back, and what egui renders. `Copy` so snapshots
+/// are free.
 #[derive(Copy, Clone, PartialEq)]
 pub struct SimState {
     pub fighters: [Fighter; 2],
+    pub items: [Item; MAX_ITEMS],
+    pub tick: u64, // global frame counter (drives item spawn cadence)
+    pub rng: u64,  // deterministic LCG state (item spawn positions/kinds; rolls back with state)
 }
 
 impl Fighter {
@@ -250,10 +436,7 @@ impl Fighter {
             air_dodges: 1,
             fast_falling: false,
             full_hop: true,
-            buffered: Buffered::None,
-            buf_timer: 0,
-            buf_aim: Vector2::ZERO,
-            aerial_buf: 0,
+            buf: [Slot::default(); N_LANE],
             autohop_aerial: false,
             intangible: false,
             regrab_lock: 0,
@@ -262,7 +445,42 @@ impl Fighter {
             hitlag: 0,
             damage: 0.0,
             hitstun: 0,
+            holding: -1,
         }
+    }
+
+    /// The action currently buffered in a lane, or `None` if the lane is empty/expired.
+    #[inline]
+    fn live(&self, l: Lane) -> Action {
+        let s = &self.buf[l as usize];
+        if s.timer > 0 {
+            s.action
+        } else {
+            Action::None
+        }
+    }
+
+    /// Record an edge into its lane: timer = the action's window + 1 (so the press frame always
+    /// counts, since aging has already run this frame). Newer presses overwrite the lane.
+    #[inline]
+    fn record(&mut self, l: Lane, a: Action, aim: Vector2, t: &Tune) {
+        self.buf[l as usize] = Slot { action: a, timer: a.window(t) + 1, aim };
+    }
+
+    #[inline]
+    fn clear_lane(&mut self, l: Lane) {
+        self.buf[l as usize] = Slot::default();
+    }
+
+    /// Debug/inspection accessors (the panel reads these; nothing else needs the lane indices).
+    pub fn move_buffer(&self) -> Slot {
+        self.buf[Lane::Movement as usize]
+    }
+    pub fn aerial_buffer_frames(&self) -> i64 {
+        self.buf[Lane::Aerial as usize].timer
+    }
+    pub fn attack_buffer_frames(&self) -> i64 {
+        self.buf[Lane::Attack as usize].timer
     }
 
     pub fn state_name(&self) -> &'static str {
@@ -285,6 +503,8 @@ impl Fighter {
             CharState::LedgeClimb => "LEDGE_CLIMB",
             CharState::Jab => "JAB",
             CharState::Nair => "NAIR",
+            CharState::Dair => "DAIR",
+            CharState::DashAttack => "DASHATK",
         }
     }
 }
@@ -294,6 +514,9 @@ impl SimState {
     pub fn spawn() -> Self {
         Self {
             fighters: [Fighter::spawn(480.0, 1.0), Fighter::spawn(720.0, -1.0)],
+            items: [Item::EMPTY; MAX_ITEMS],
+            tick: 0,
+            rng: 0x9E37_79B9_7F4A_7C15, // fixed seed: both peers spawn identical items
         }
     }
 }
@@ -334,6 +557,8 @@ pub struct CharData {
     pub landing_lag: i64,     // est 4
     pub dash_window: i64,     // est 12 (dash-dance window; dash -> run after this)
     pub pivot_frames: i64,    // ult 1
+    pub dash_pivot_keep: f32, // 0..1 fraction of the dash burst kept when reversing (1=free flip)
+    pub dashstop_friction: f32, // braking friction when a dash/run slides to a stop (Skid)
     pub spotdodge_frames: i64,// est 22
     pub roll_frames: i64,     // est 22
     pub airdodge_frames: i64, // est 28 (then actionable again — Ultimate-style, not helpless)
@@ -372,6 +597,8 @@ impl CharData {
         landing_lag: 4,
         dash_window: 12,
         pivot_frames: 1,
+        dash_pivot_keep: 0.35, // reversing kills most momentum; dash dancing now costs speed
+        dashstop_friction: 0.30, // grippier than ground_friction (0.22) so a dash brakes hard
         spotdodge_frames: 22,
         roll_frames: 22,
         airdodge_frames: 28,
@@ -413,6 +640,8 @@ pub struct Tune {
     pub landing_lag: i64,
     pub dash_window: i64,
     pub pivot_frames: i64,
+    pub dash_pivot_keep: f32,
+    pub dashstop_friction: f32,
     pub spotdodge_frames: i64,
     pub roll_frames: i64,
     pub airdodge_frames: i64,
@@ -421,7 +650,15 @@ pub struct Tune {
     pub buffer_frames: i64,
     pub jab: AttackData,
     pub nair: AttackData,
+    pub dair: AttackData,
+    pub dash_attack: AttackData,
+    pub dair_threshold: f32, // aim_y past this (and steeper than horizontal) picks dair over nair
     pub autohop_dmg: f32, // damage multiplier for auto-short-hop aerials (jump+attack macro)
+    // items (match settings, not character-derived)
+    pub items_on: bool,           // master switch for item spawns
+    pub item_spawn_interval: i64, // frames between spawn attempts (0 = off)
+    pub laser: ItemConfig,
+    pub fastfall_threshold: f32,  // stick aim_y must reach this (and beat |dir|) to fast fall
 }
 
 impl Tune {
@@ -455,6 +692,8 @@ impl Tune {
             landing_lag: c.landing_lag,
             dash_window: c.dash_window,
             pivot_frames: c.pivot_frames,
+            dash_pivot_keep: c.dash_pivot_keep, // unitless ratio, no space conversion
+            dashstop_friction: acc(c.dashstop_friction),
             spotdodge_frames: c.spotdodge_frames,
             roll_frames: c.roll_frames,
             airdodge_frames: c.airdodge_frames,
@@ -463,7 +702,14 @@ impl Tune {
             buffer_frames: c.buffer_frames,
             jab: AttackData::JAB,
             nair: AttackData::NAIR,
+            dair: AttackData::DAIR,
+            dash_attack: AttackData::DASH_ATTACK,
+            dair_threshold: 0.5,
             autohop_dmg: 0.85, // Ultimate-ish 15% cut on the easy jump+attack aerial
+            items_on: true,
+            item_spawn_interval: 480, // ~8s between spawns
+            laser: ItemConfig::LASER,
+            fastfall_threshold: 0.6,
         }
     }
 }
@@ -486,7 +732,9 @@ pub struct InputFrame {
     pub shield_pressed: bool,// shield pressed THIS frame (airborne -> AirDodge)
     pub down: bool,          // down held (fast fall / spot dodge / soft-platform drop)
     pub down_pressed: bool,  // down pressed THIS frame (deliberate ledge drop)
-    pub attack: bool,        // attack pressed THIS frame (jab / aerial)
+    pub attack: bool,        // attack pressed THIS frame (jab / aerial / pickup / fire)
+    pub attack_held: bool,   // attack currently held (full-auto gun fire)
+    pub grab: bool,          // grab pressed THIS frame (drop a held item)
 }
 
 /// PURE scan step: (state, input, tune) -> next state.
@@ -497,18 +745,29 @@ pub struct InputFrame {
 /// frame during rollback). `inputs[k]` drives `fighters[k]`.
 pub fn step(s: &SimState, inputs: [&InputFrame; 2], t: &Tune) -> SimState {
     let mut n = *s;
-    advance(&mut n.fighters[0], inputs[0], t);
-    advance(&mut n.fighters[1], inputs[1], t);
+    n.tick = n.tick.wrapping_add(1);
+    maybe_spawn_item(&mut n, t);
+
+    // Each fighter's FSM scans its raw input and emits a pure "next action" (Act). The input is never
+    // mutated; `apply_act` actuates the descriptor into the whole SimState (spawn bolt / drop / grab).
+    let items0 = n.items; // read-only snapshot so the FSM can decide pickup-vs-jab without borrowing
+    let act0 = advance(&mut n.fighters[0], &items0, inputs[0], t);
+    let items1 = n.items;
+    let act1 = advance(&mut n.fighters[1], &items1, inputs[1], t);
+    apply_act(&mut n, 0, act0, t);
+    apply_act(&mut n, 1, act1, t);
     // split the array so both fighters can be borrowed mutably at once
     let (l, r) = n.fighters.split_at_mut(1);
     resolve_combat(&mut l[0], &mut r[0], t); // p0 attacks p1
     resolve_combat(&mut r[0], &mut l[0], t); // p1 attacks p0
+
+    update_items(&mut n, t); // move bolts, follow held guns, resolve bolt hits
     n
 }
 
 /// Advance ONE fighter by one frame from its own input: buffer, state machine, integrate +
 /// stage collision. No cross-fighter combat (that is `resolve_combat`). Mutates in place.
-fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
+fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune) -> Act {
     let mut n = *f;
     let prev = n.state;
     let mut force_reset = false; // re-enter same state (dash-dance) -> reset the frame timer
@@ -521,7 +780,7 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
     if n.hitlag > 0 {
         n.hitlag -= 1;
         *f = n;
-        return;
+        return Act::None;
     }
 
     // launched: skip the state machine, run the knockback slide (the old training-dummy physics).
@@ -548,54 +807,80 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
         }
         if n.pos.y > BLAST_Y {
             *f = Fighter::spawn(spawn_x(n.pos.x), n.facing);
-            return;
+            return Act::None;
         }
         *f = n;
-        return;
+        return Act::None;
     }
 
     if n.regrab_lock > 0 {
         n.regrab_lock -= 1;
     }
 
-    // ── input buffer: age the current entry (keeping its aim fresh), then record new edges ──
-    if n.buf_timer > 0 {
-        n.buf_timer -= 1;
-        if n.buf_timer == 0 {
-            n.buffered = Buffered::None;
-        } else if aim.length() > 0.3 {
-            n.buf_aim = aim; // latest non-neutral aim within the window wins (the diagonal)
+    // ── input buffer (part 1): age every lane once, refresh the movement-lane diagonal, and record
+    // the edges that don't depend on item context (movement + grab). Lanes coexist; within the
+    // movement lane the newest of jump / short-hop / air-dodge wins. ──
+    for s in &mut n.buf {
+        if s.timer > 0 {
+            s.timer -= 1;
         }
     }
+    {
+        let m = &mut n.buf[Lane::Movement as usize];
+        if m.timer > 0 && aim.length() > 0.3 {
+            m.aim = aim; // latest non-neutral aim within the window wins (the diagonal)
+        }
+    }
+    if i.grab {
+        n.record(Lane::Grab, Action::Grab, aim, t);
+    }
     if i.shorthop {
-        n.buffered = Buffered::ShortHop;
-        n.buf_timer = t.buffer_frames + 1; // +1 so the press frame always counts; 0 = no lookahead
-        n.buf_aim = aim;
+        n.record(Lane::Movement, Action::ShortHop, aim, t);
     } else if i.jump {
-        n.buffered = Buffered::Jump;
-        n.buf_timer = t.buffer_frames + 1; // +1 so the press frame always counts; 0 = no lookahead
-        n.buf_aim = aim;
+        n.record(Lane::Movement, Action::Jump, aim, t);
     }
     // shield press only buffers an air dodge when airborne or mid-jumpsquat (else it's a shield)
     if i.shield_pressed && (airborne(n.state) || n.state == CharState::JumpSquat) {
-        n.buffered = Buffered::AirDodge;
-        n.buf_timer = t.buffer_frames + 1; // +1 so the press frame always counts; 0 = no lookahead
-        n.buf_aim = aim;
+        n.record(Lane::Movement, Action::AirDodge, aim, t);
     }
-    // aerial buffer — its OWN slot, separate from the jump/dodge buffer, so a jump+attack combo
-    // can hold both at once. Queue an aerial when airborne, mid-jumpsquat, or when attack is
-    // pressed together with a jump (the auto-short-hop macro). Grounded attack alone stays a jab.
-    if n.aerial_buf > 0 {
-        n.aerial_buf -= 1;
+
+    // ── item intents: emit a pure descriptor; do NOT mutate the input. `advance` only reads `items`
+    // (to know if an attack should grab vs jab); `apply_act` does the mutation. ──
+    //   holding: grab=drop, attack(held)=fire (full-auto, weaker when held not freshly tapped)
+    //   empty + grounded over an item: attack=pickup; else attack=jab/aerial as normal
+    let holding = n.holding >= 0;
+    let pickup_target = if holding { None } else { nearest_pickup(&n, items) };
+    let grab = n.live(Lane::Grab) == Action::Grab;
+    let mut act = Act::None;
+    if holding {
+        if grab {
+            act = Act::Drop;
+        } else if i.attack || i.attack_held {
+            act = Act::Fire { auto: i.attack_held && !i.attack };
+        }
+    } else if i.attack && pickup_target.is_some() {
+        act = Act::Pickup;
     }
+    let fire = matches!(act, Act::Fire { .. });
+    let grabbing = matches!(act, Act::Pickup | Act::Drop);
+    let atk = i.attack && !fire && !grabbing; // effective attack for jab/aerial
+
+    // ── input buffer (part 2): the attack edge, now that item context (fire/grab) is resolved.
+    // Aerial and Attack are separate lanes, so a jump+attack combo holds both at once (the
+    // auto-short-hop macro). Queue an aerial when airborne, mid-jumpsquat, or pressed together with
+    // a jump; a grounded attack alone queues a jab that fires on the next actionable ground frame. ──
     let jumping_now = i.jump || i.shorthop;
-    if i.attack && (airborne(n.state) || n.state == CharState::JumpSquat || jumping_now) {
-        n.aerial_buf = t.buffer_frames + 1;
+    if atk {
+        if airborne(n.state) || n.state == CharState::JumpSquat || jumping_now {
+            n.record(Lane::Aerial, Action::Aerial, aim, t);
+        } else {
+            n.record(Lane::Attack, Action::Attack, aim, t);
+        }
     }
 
     match n.state {
         CharState::Stand => {
-            if !try_ground_action(&mut n, i) {
+            if !try_ground_action(&mut n, i, atk) {
                 if i.down {
                     if sgn != 0.0 {
                         n.facing = sgn;
@@ -614,7 +899,7 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
             }
         }
         CharState::Walk => {
-            if !try_ground_action(&mut n, i) {
+            if !try_ground_action(&mut n, i, atk) {
                 if mag < WALK_THRESH {
                     n.state = CharState::Stand;
                 } else if sgn != n.facing {
@@ -625,14 +910,15 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
             }
         }
         CharState::Dash => {
-            if !try_ground_action(&mut n, i) {
+            if !try_ground_action(&mut n, i, atk) {
                 if sgn != 0.0 && sgn != n.facing && mag >= DASH_THRESH {
-                    // dash-dance: flip and re-burst, restart the dash window
+                    // dash-dance: flip and re-burst, restart the dash window. The reversal keeps only
+                    // `dash_pivot_keep` of the burst (vs the full instant flip), so it costs momentum.
                     n.facing = sgn;
-                    n.vel.x = sgn * t.dash_init;
+                    n.vel.x = sgn * t.dash_init * t.dash_pivot_keep;
                     force_reset = true;
                 } else if mag < WALK_THRESH {
-                    n.state = CharState::Stand;
+                    n.state = CharState::Skid; // release mid-dash -> slide to a stop (dashstop)
                 } else {
                     n.vel.x = move_toward(n.vel.x, n.facing * t.run_speed, t.ground_accel * DT);
                     if n.frame >= t.dash_window {
@@ -642,7 +928,7 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
             }
         }
         CharState::Run => {
-            if !try_ground_action(&mut n, i) {
+            if !try_ground_action(&mut n, i, atk) {
                 if mag < WALK_THRESH || sgn != n.facing {
                     n.state = CharState::Skid; // release or reverse -> run brake
                 } else {
@@ -652,10 +938,10 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
         }
         CharState::Turn => {
             n.vel.x = move_toward(n.vel.x, 0.0, t.ground_friction * DT);
-            if !try_ground_action(&mut n, i) && n.frame >= t.pivot_frames {
+            if !try_ground_action(&mut n, i, atk) && n.frame >= t.pivot_frames {
                 n.facing = -n.facing;
                 if sgn != 0.0 && mag >= DASH_THRESH {
-                    n.vel.x = n.facing * t.dash_init;
+                    n.vel.x = n.facing * t.dash_init * t.dash_pivot_keep;
                     n.state = CharState::Dash;
                 } else if sgn != 0.0 && mag >= WALK_THRESH {
                     n.state = CharState::Walk;
@@ -665,13 +951,13 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
             }
         }
         CharState::Skid => {
-            if !try_ground_action(&mut n, i) {
+            if !try_ground_action(&mut n, i, atk) {
                 if sgn != 0.0 && sgn != n.facing && mag >= DASH_THRESH {
                     n.facing = sgn; // pivot out of the skid
-                    n.vel.x = sgn * t.dash_init;
+                    n.vel.x = sgn * t.dash_init * t.dash_pivot_keep;
                     n.state = CharState::Dash;
                 } else {
-                    n.vel.x = move_toward(n.vel.x, 0.0, t.ground_friction * DT);
+                    n.vel.x = move_toward(n.vel.x, 0.0, t.dashstop_friction * DT);
                     if n.vel.x.abs() < STOP_EPS {
                         n.vel.x = 0.0;
                         n.state = CharState::Stand;
@@ -683,7 +969,7 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
             // hold down to stay crouched; jump/shield available; release down -> stand.
             // bleed any residual run momentum to a stop while squatting.
             n.vel.x = move_toward(n.vel.x, 0.0, t.ground_friction * DT);
-            if !try_ground_action(&mut n, i) && !i.down {
+            if !try_ground_action(&mut n, i, atk) && !i.down {
                 n.state = CharState::Stand;
             }
         }
@@ -744,15 +1030,15 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
                 n.full_hop = false; // released before takeoff -> short hop
             }
             if n.frame >= t.jumpsquat - 1 {
-                let wavedash = n.buffered == Buffered::AirDodge && n.buf_timer > 0;
+                let wavedash = n.live(Lane::Movement) == Action::AirDodge;
                 if wavedash {
                     let aim = dodge_aim(&n, i);
-                    clear_buffer(&mut n);
+                    n.clear_lane(Lane::Movement);
                     do_airdodge(&mut n, aim, t); // wavedash: airdodge straight out of jumpsquat
                 } else {
                     // jump+attack combo = auto short-hop aerial (Ultimate): force a short hop and
                     // tag the aerial for reduced damage. Set before vel.y so the hop comes out short.
-                    if n.aerial_buf > 0 {
+                    if n.live(Lane::Aerial) == Action::Aerial {
                         n.full_hop = false;
                         n.autohop_aerial = true;
                     }
@@ -766,28 +1052,35 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
             }
         }
         CharState::Air => {
-            let want_dodge = n.buffered == Buffered::AirDodge && n.buf_timer > 0;
-            let want_nair = i.attack || n.aerial_buf > 0;
-            if want_nair {
-                n.aerial_buf = 0;
-                n.state = CharState::Nair; // aerial; keeps drifting, lands into Landing
+            let want_dodge = n.live(Lane::Movement) == Action::AirDodge;
+            let buffered_aerial = n.live(Lane::Aerial) == Action::Aerial;
+            let want_aerial = atk || buffered_aerial;
+            if want_aerial {
+                // a same-frame press has no captured aim yet; read it live in that case.
+                let aim = if buffered_aerial {
+                    n.buf[Lane::Aerial as usize].aim
+                } else {
+                    Vector2::new(i.dir, i.aim_y)
+                };
+                n.clear_lane(Lane::Aerial);
+                n.state = aerial_for(aim, t); // nair or dair, by the captured stick direction
                 n.attack_hit = false;
             } else if want_dodge && n.air_dodges > 0 {
                 let a = dodge_aim(&n, i);
-                clear_buffer(&mut n);
+                n.clear_lane(Lane::Movement);
                 do_airdodge(&mut n, a, t); // directional burst; into the ground = wavedash
             } else {
                 // double jump: cancels fall (crisp upward pop even while falling fast) and
                 // REDIRECTS horizontal from the stick — hold back to reverse momentum.
-                let want_djump =
-                    matches!(n.buffered, Buffered::Jump | Buffered::ShortHop) && n.buf_timer > 0;
+                let want_djump = matches!(n.live(Lane::Movement), Action::Jump | Action::ShortHop);
                 if want_djump && n.air_jumps > 0 {
-                    clear_buffer(&mut n);
+                    n.clear_lane(Lane::Movement);
                     n.air_jumps -= 1;
                     n.vel.y = t.airjump_v;
                     n.fast_falling = false;
                     if sgn != 0.0 {
-                        n.facing = sgn;
+                        // momentum redirects with the stick, but facing does NOT flip: an air jump
+                        // can't turn you around (only a turnaround special could). Ult-style.
                         let dj = sgn * t.airjump_h;
                         // hold AWAY -> reverse to fresh horizontal; hold TOWARD -> keep your
                         // speed, never slow below airjump_h.
@@ -800,8 +1093,14 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
                     // neutral stick: keep current horizontal momentum
                 }
                 air_drift(&mut n, i, t, sgn);
-                // fast fall (instant snap) + gravity
-                if !n.fast_falling && n.vel.y > 0.0 && i.down {
+                // fast fall (instant snap) + gravity. Gate on a STEEP-down stick: aim_y past the
+                // threshold AND more vertical than horizontal, so down-forward drifting doesn't
+                // accidentally fast fall (digital down alone still triggers: dir=0).
+                if !n.fast_falling
+                    && n.vel.y > 0.0
+                    && i.aim_y >= t.fastfall_threshold
+                    && i.aim_y > i.dir.abs()
+                {
                     n.fast_falling = true;
                 }
                 if n.fast_falling {
@@ -862,6 +1161,15 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
                 n.state = if i.shield_held { CharState::Shield } else { CharState::Stand };
             }
         }
+        CharState::DashAttack => {
+            // lunge: keep the entry run momentum and slide it out (dashstop friction, lighter than a
+            // jab's hard brake), run out the long endlag, then neutral. No mid-attack steering.
+            n.vel.x = move_toward(n.vel.x, 0.0, t.dashstop_friction * DT);
+            let atk = attack_for(t, CharState::DashAttack).unwrap();
+            if n.frame >= atk.total() - 1 {
+                n.state = if i.shield_held { CharState::Shield } else { CharState::Stand };
+            }
+        }
         CharState::Nair => {
             // aerial: drift + gravity still apply; ends back to Air (or lands via integrate).
             air_drift(&mut n, i, t, sgn);
@@ -870,6 +1178,19 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
                 n.vel.y = t.max_fall;
             }
             let atk = attack_for(t, CharState::Nair).unwrap();
+            if n.frame >= atk.total() - 1 {
+                n.state = CharState::Air;
+                n.autohop_aerial = false;
+            }
+        }
+        CharState::Dair => {
+            // down aerial: reduced air control (it's a commitment), gravity still pulls, ends to Air.
+            air_drift(&mut n, i, t, sgn);
+            n.vel.y += t.gravity * DT;
+            if n.vel.y > t.max_fall {
+                n.vel.y = t.max_fall;
+            }
+            let atk = attack_for(t, CharState::Dair).unwrap();
             if n.frame >= atk.total() - 1 {
                 n.state = CharState::Air;
                 n.autohop_aerial = false;
@@ -985,7 +1306,7 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
     // blast zone -> respawn this fighter (combat lives in resolve_combat, not here)
     if n.pos.y > BLAST_Y {
         *f = Fighter::spawn(spawn_x(n.pos.x), n.facing);
-        return;
+        return Act::None;
     }
 
     // frame counter resets on transition (or a forced re-enter), else advances
@@ -1002,6 +1323,7 @@ fn advance(f: &mut Fighter, i: &InputFrame, t: &Tune) {
         _ => false,
     };
     *f = n;
+    act
 }
 
 /// Which side to respawn on after a blast-zone KO (keep the fighter on its half of the stage).
@@ -1026,7 +1348,7 @@ fn resolve_combat(a: &mut Fighter, b: &mut Fighter, t: &Tune) {
     }
     let atk = attack_for(t, a.state).unwrap();
     a.attack_hit = true;
-    let dmg = if a.state == CharState::Nair && a.autohop_aerial {
+    let dmg = if matches!(a.state, CharState::Nair | CharState::Dair) && a.autohop_aerial {
         atk.damage * t.autohop_dmg // auto short-hop aerial: reduced damage (Ultimate)
     } else {
         atk.damage
@@ -1041,17 +1363,227 @@ fn resolve_combat(a: &mut Fighter, b: &mut Fighter, t: &Tune) {
     b.hitlag = freeze;
 }
 
+// --- items ---------------------------------------------------------------------------------------
+
+const HOLD_OFFSET: Vector2 = Vector2::new(34.0, -56.0); // held item position relative to fighter feet
+const BOLT_R: f32 = 12.0;  // laser bolt collision radius
+const ITEM_R: f32 = 30.0;  // pickup reach: ground item within this of the body is grabbable
+const DROP_TOSS_X: f32 = 180.0; // forward velocity given to a dropped item
+const DROP_TOSS_Y: f32 = -120.0; // small upward pop on drop (negative = up); gravity arcs it down
+
+/// Deterministic LCG step (same constants as the SyncTest's generator). Advances `state` and
+/// returns the high bits. Pure + integer, so both peers stay in lockstep.
+fn next_rng(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    *state >> 33
+}
+
+/// Every `item_spawn_interval` ticks, drop a weighted-random item into a free slot. Position is
+/// chosen from the LCG so it is identical on both peers.
+fn maybe_spawn_item(n: &mut SimState, t: &Tune) {
+    if !t.items_on || t.item_spawn_interval <= 0 || n.tick == 0 {
+        return;
+    }
+    if n.tick % (t.item_spawn_interval as u64) != 0 {
+        return;
+    }
+    let Some(slot) = n.items.iter().position(|it| !it.active()) else {
+        return; // field full
+    };
+    // weighted kind pick (only LaserGun for now; add kinds to this table as they land)
+    let total = t.laser.spawn_weight;
+    if total <= 0.0 {
+        return;
+    }
+    // (single-kind: the roll always lands on the laser; structure kept for more kinds)
+    let _roll = next_rng(&mut n.rng);
+    let kind = ItemKind::LaserGun;
+
+    let span = (FLOOR_RIGHT - FLOOR_LEFT - 120.0).max(0.0);
+    let frac = (next_rng(&mut n.rng) % 1000) as f32 / 1000.0;
+    let x = FLOOR_LEFT + 60.0 + frac * span;
+    n.items[slot] = Item {
+        kind,
+        pos: Vector2::new(x, GROUND_Y - 240.0), // drop in from above
+        vel: Vector2::ZERO,
+        owner: -1,
+        ammo: t.laser.ammo,
+        timer: 0,
+        facing: 1.0,
+    };
+}
+
+/// Actuate one fighter's emitted `Act` into the SimState. The only place item intents become item
+/// effects; `advance` decided WHAT to do (purely), this carries it out on the shared item array.
+fn apply_act(n: &mut SimState, idx: usize, act: Act, t: &Tune) {
+    match act {
+        Act::None => {}
+        Act::Fire { auto } => fire_gun(n, idx, auto, t),
+        Act::Drop => drop_item(n, idx),
+        Act::Pickup => pickup_item(n, idx),
+    }
+}
+
+/// Nearest unowned ground gun overlapping a grounded, actionable fighter (the pickup the attack
+/// button claims instead of jabbing). None in the air / during hitstun so attack stays an aerial.
+fn nearest_pickup(f: &Fighter, items: &[Item; MAX_ITEMS]) -> Option<usize> {
+    if airborne(f.state) || f.hitstun != 0 || f.hitlag != 0 {
+        return None;
+    }
+    let (bc, br) = hurtbox(f);
+    items.iter().position(|it| {
+        it.active() && it.owner < 0 && it.kind == ItemKind::LaserGun && (it.pos - bc).length() <= br + ITEM_R
+    })
+}
+
+/// Held gun + fire intent: spawn a bolt if off cooldown with ammo, decrement, vanish when spent.
+/// `auto` (held, not a fresh tap) marks the bolt weak via its `ammo` slot — apply_bolt_hit scales it.
+fn fire_gun(n: &mut SimState, idx: usize, auto: bool, t: &Tune) {
+    let holding = n.fighters[idx].holding;
+    if holding < 0 {
+        return;
+    }
+    let k = holding as usize;
+    if n.items[k].kind != ItemKind::LaserGun || n.items[k].timer > 0 || n.items[k].ammo <= 0 {
+        return; // wrong item, on cooldown, or empty — the intent fired but nothing comes out
+    }
+    let f = n.fighters[idx];
+    let muzzle = f.pos + Vector2::new((HOLD_OFFSET.x + 20.0) * f.facing, HOLD_OFFSET.y);
+    if let Some(slot) = n.items.iter().position(|x| !x.active()) {
+        n.items[slot] = Item {
+            kind: ItemKind::LaserBolt,
+            pos: muzzle,
+            vel: Vector2::new(f.facing * t.laser.speed, 0.0),
+            owner: idx as i8,
+            ammo: auto as i64, // 1 = auto-fire (weak), 0 = a clean tap (full power)
+            timer: t.laser.range,
+            facing: f.facing,
+        };
+    }
+    n.items[k].ammo -= 1;
+    n.items[k].timer = if auto { t.laser.autofire_cd } else { t.laser.cooldown };
+    if n.items[k].ammo <= 0 {
+        n.items[k] = Item::EMPTY; // spent gun vanishes
+        n.fighters[idx].holding = -1;
+    }
+}
+
+/// Drop intent: detach the held item to the ground with a small forward toss (update_items arcs it).
+fn drop_item(n: &mut SimState, idx: usize) {
+    let holding = n.fighters[idx].holding;
+    if holding < 0 {
+        return;
+    }
+    let k = holding as usize;
+    let f = n.fighters[idx];
+    n.items[k].owner = -1;
+    n.items[k].vel = Vector2::new(f.facing * DROP_TOSS_X, DROP_TOSS_Y);
+    n.fighters[idx].holding = -1;
+}
+
+/// Pickup intent: claim the nearest overlapping unowned ground item.
+fn pickup_item(n: &mut SimState, idx: usize) {
+    let f = n.fighters[idx];
+    if let Some(k) = nearest_pickup(&f, &n.items) {
+        n.items[k].owner = idx as i8;
+        n.fighters[idx].holding = k as i8;
+    }
+}
+
+/// Post-step item physics: ground guns fall + rest, held guns follow their owner (dropping if the
+/// owner died/respawned), bolts fly + hit + expire.
+fn update_items(n: &mut SimState, t: &Tune) {
+    for k in 0..MAX_ITEMS {
+        let it = n.items[k];
+        if !it.active() {
+            continue;
+        }
+        match it.kind {
+            ItemKind::LaserGun if it.owner >= 0 => {
+                let o = it.owner as usize;
+                if n.fighters[o].holding != k as i8 {
+                    n.items[k].owner = -1; // owner let go / died: drop to the ground where it is
+                } else {
+                    let f = n.fighters[o];
+                    n.items[k].pos = f.pos + Vector2::new(HOLD_OFFSET.x * f.facing, HOLD_OFFSET.y);
+                    n.items[k].facing = f.facing;
+                    if n.items[k].timer > 0 {
+                        n.items[k].timer -= 1; // tick the fire cooldown while held
+                    }
+                }
+            }
+            ItemKind::LaserGun => {
+                // unowned: gravity, settle on the floor
+                let mut p = it.pos;
+                let mut v = it.vel;
+                p += v * DT;
+                if p.y < GROUND_Y {
+                    v.y += t.gravity * DT;
+                } else {
+                    p.y = GROUND_Y;
+                    v = Vector2::ZERO;
+                }
+                n.items[k].pos = p;
+                n.items[k].vel = v;
+            }
+            ItemKind::LaserBolt => {
+                let p = it.pos + it.vel * DT;
+                n.items[k].pos = p;
+                n.items[k].timer -= 1;
+                let mut spent = n.items[k].timer <= 0
+                    || p.x < FLOOR_LEFT - 400.0
+                    || p.x > FLOOR_RIGHT + 400.0;
+                for fi in 0..2 {
+                    if fi as i8 == it.owner {
+                        continue; // your own bolts pass through you
+                    }
+                    let (bc, br) = hurtbox(&n.fighters[fi]);
+                    if (p - bc).length() <= br + BOLT_R {
+                        apply_bolt_hit(&mut n.fighters[fi], &it, t);
+                        spent = true;
+                    }
+                }
+                if spent {
+                    n.items[k] = Item::EMPTY;
+                }
+            }
+            ItemKind::None => {}
+        }
+    }
+}
+
+/// A laser bolt connecting: damage + flat push + brief hitstun/hitlag. Mirrors `resolve_combat`'s
+/// tail but sourced from a projectile (launch direction = the bolt's travel direction).
+fn apply_bolt_hit(b: &mut Fighter, bolt: &Item, t: &Tune) {
+    let atk = t.laser.hit;
+    let scale = if bolt.ammo == 1 { t.laser.autofire_dmg } else { 1.0 }; // auto-fire bolts are weaker
+    b.damage += atk.damage * scale;
+    let speed = atk.kb_base + atk.kb_scale * b.damage;
+    let ang = atk.kb_angle.to_radians();
+    b.vel = Vector2::new(ang.cos() * bolt.facing, -ang.sin()) * speed;
+    b.hitstun = (speed * 0.12) as i64;
+    b.hitlag = (atk.damage * HITLAG_PER_DMG) as i64 + 2;
+}
+
 /// Jump / shield are available from every actionable ground state; factor them out.
 /// Jump comes from the buffer so a slightly-early press still fires.
-fn try_ground_action(n: &mut Fighter, i: &InputFrame) -> bool {
+fn try_ground_action(n: &mut Fighter, i: &InputFrame, atk: bool) -> bool {
     if let Some(full) = take_jump(n) {
         n.state = CharState::JumpSquat;
         n.full_hop = full;
         true
-    } else if i.attack {
-        n.state = CharState::Jab;
+    } else if atk || n.live(Lane::Attack) == Action::Attack {
+        n.clear_lane(Lane::Attack);
         n.attack_hit = false;
-        n.vel.x *= 0.25; // plant feet: a dash/run jab mostly kills momentum on startup
+        if matches!(n.state, CharState::Dash | CharState::Run) {
+            // attacking out of momentum = a dash attack: keep the forward run speed, lunge through.
+            n.state = CharState::DashAttack;
+        } else {
+            n.state = CharState::Jab;
+            n.vel.x *= 0.25; // plant feet: a standing jab mostly kills momentum on startup
+        }
         true
     } else if i.shield_held {
         n.state = CharState::Shield;
@@ -1061,33 +1593,27 @@ fn try_ground_action(n: &mut Fighter, i: &InputFrame) -> bool {
     }
 }
 
-fn clear_buffer(n: &mut Fighter) {
-    n.buffered = Buffered::None;
-    n.buf_timer = 0;
-}
-
-/// Consume a buffered jump/shorthop if one is live. Returns Some(full_hop) when taken.
+/// Consume a buffered jump/shorthop if one is live in the movement lane. Returns Some(full_hop).
 fn take_jump(n: &mut Fighter) -> Option<bool> {
-    if n.buf_timer == 0 {
-        return None;
-    }
-    match n.buffered {
-        Buffered::Jump => {
-            clear_buffer(n);
+    match n.live(Lane::Movement) {
+        Action::Jump => {
+            n.clear_lane(Lane::Movement);
             Some(true)
         }
-        Buffered::ShortHop => {
-            clear_buffer(n);
+        Action::ShortHop => {
+            n.clear_lane(Lane::Movement);
             Some(false)
         }
         _ => None,
     }
 }
 
-/// The aim to use for a buffered air dodge: the buffered diagonal if set, else the live stick.
+/// The aim to use for a buffered air dodge: the movement lane's captured diagonal if set, else the
+/// live stick.
 fn dodge_aim(n: &Fighter, i: &InputFrame) -> Vector2 {
-    if n.buf_aim.length() > 0.3 {
-        n.buf_aim
+    let m = &n.buf[Lane::Movement as usize];
+    if m.aim.length() > 0.3 {
+        m.aim
     } else {
         Vector2::new(i.dir, i.aim_y)
     }

@@ -1,0 +1,14 @@
+[Unit]
+Description=smash WebRTC signaling relay (Godot web netplay)
+After=network.target
+
+[Service]
+Type=simple
+# Binds 127.0.0.1:3537; nginx terminates TLS and proxies wss://hafley.codes/rtc -> here. Pairs two
+# browsers and forwards their SDP/ICE; never sees gameplay (that is direct WebRTC P2P).
+ExecStart=/root/.cargo/bin/smash-signaling
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1026 @@
+mod stubs;
+
+use ggrs::{
+    DesyncDetection, GgrsError, GgrsEvent, PlayerType, SessionBuilder, SessionState,
+    UdpNonBlockingSocket,
+};
+use instant::Duration;
+use serial_test::serial;
+use stubs::{StubConfig, StubInput};
+
+#[test]
+#[serial]
+fn test_add_more_players() -> Result<(), GgrsError> {
+    let socket = UdpNonBlockingSocket::bind_to_port(7700).unwrap();
+    let remote_addr1 = stubs::localhost(8080);
+    let remote_addr2 = stubs::localhost(8081);
+    let remote_addr3 = stubs::localhost(8082);
+    let spec_addr = stubs::localhost(8090);
+
+    let _sess = SessionBuilder::<StubConfig>::new()
+        .with_num_players(4)?
+        .add_player(PlayerType::Local, 0)?
+        .add_player(PlayerType::Remote(remote_addr1), 1)?
+        .add_player(PlayerType::Remote(remote_addr2), 2)?
+        .add_player(PlayerType::Remote(remote_addr3), 3)?
+        .add_player(PlayerType::Spectator(spec_addr), 4)?
+        .start_p2p_session(socket)?;
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_start_session() -> Result<(), GgrsError> {
+    let socket = UdpNonBlockingSocket::bind_to_port(7701).unwrap();
+    let remote_addr = stubs::localhost(8080);
+    let spec_addr = stubs::localhost(8090);
+
+    let _sess = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 0)?
+        .add_player(PlayerType::Remote(remote_addr), 1)?
+        .add_player(PlayerType::Spectator(spec_addr), 2)?
+        .start_p2p_session(socket)?;
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_disconnect_player() -> Result<(), GgrsError> {
+    let socket = UdpNonBlockingSocket::bind_to_port(7702).unwrap();
+    let remote_addr = stubs::localhost(8080);
+    let spec_addr = stubs::localhost(8090);
+
+    let mut sess = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 0)?
+        .add_player(PlayerType::Remote(remote_addr), 1)?
+        .add_player(PlayerType::Spectator(spec_addr), 2)?
+        .start_p2p_session(socket)?;
+
+    assert!(sess.disconnect_player(5).is_err()); // invalid handle
+    assert!(sess.disconnect_player(0).is_err()); // for now, local players cannot be disconnected
+    assert!(sess.disconnect_player(1).is_ok());
+    assert!(sess.disconnect_player(1).is_err()); // already disconnected
+    assert!(sess.disconnect_player(2).is_ok());
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_synchronize_p2p_sessions() -> Result<(), GgrsError> {
+    let addr1 = stubs::localhost(7703);
+    let addr2 = stubs::localhost(7704);
+
+    let socket1 = UdpNonBlockingSocket::bind_to_port(7703).unwrap();
+    let mut sess1 = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 0)?
+        .add_player(PlayerType::Remote(addr2), 1)?
+        .start_p2p_session(socket1)?;
+
+    let socket2 = UdpNonBlockingSocket::bind_to_port(7704).unwrap();
+    let mut sess2 = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 1)?
+        .add_player(PlayerType::Remote(addr1), 0)?
+        .start_p2p_session(socket2)?;
+
+    assert!(sess1.current_state() == SessionState::Synchronizing);
+    assert!(sess2.current_state() == SessionState::Synchronizing);
+
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    assert!(sess1.current_state() == SessionState::Running);
+    assert!(sess2.current_state() == SessionState::Running);
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_advance_frame_p2p_sessions() -> Result<(), GgrsError> {
+    let addr1 = stubs::localhost(7705);
+    let addr2 = stubs::localhost(7706);
+
+    let socket1 = UdpNonBlockingSocket::bind_to_port(7705).unwrap();
+    let mut sess1 = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 0)?
+        .add_player(PlayerType::Remote(addr2), 1)?
+        .start_p2p_session(socket1)?;
+
+    let socket2 = UdpNonBlockingSocket::bind_to_port(7706).unwrap();
+    let mut sess2 = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Remote(addr1), 0)?
+        .add_player(PlayerType::Local, 1)?
+        .start_p2p_session(socket2)?;
+
+    assert!(sess1.current_state() == SessionState::Synchronizing);
+    assert!(sess2.current_state() == SessionState::Synchronizing);
+
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    assert!(sess1.current_state() == SessionState::Running);
+    assert!(sess2.current_state() == SessionState::Running);
+
+    let mut stub1 = stubs::GameStub::new();
+    let mut stub2 = stubs::GameStub::new();
+    let reps = 10;
+    for i in 0..reps {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+
+        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
+        let requests1 = sess1.advance_frame().unwrap();
+        stub1.handle_requests(requests1);
+        sess2.add_local_input(1, StubInput { inp: i }).unwrap();
+        let requests2 = sess2.advance_frame().unwrap();
+        stub2.handle_requests(requests2);
+
+        // gamestate evolves
+        assert_eq!(stub1.gs.frame, i as i32 + 1);
+        assert_eq!(stub2.gs.frame, i as i32 + 1);
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_desyncs_detected() -> Result<(), GgrsError> {
+    let addr1 = stubs::localhost(7707);
+    let addr2 = stubs::localhost(7708);
+    let desync_mode = DesyncDetection::On { interval: 100 };
+
+    let socket1 = UdpNonBlockingSocket::bind_to_port(7707).unwrap();
+    let mut sess1 = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 0)?
+        .add_player(PlayerType::Remote(addr2), 1)?
+        .with_desync_detection_mode(desync_mode)
+        .start_p2p_session(socket1)?;
+
+    let socket2 = UdpNonBlockingSocket::bind_to_port(7708).unwrap();
+    let mut sess2 = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Remote(addr1), 0)?
+        .add_player(PlayerType::Local, 1)?
+        .with_desync_detection_mode(desync_mode)
+        .start_p2p_session(socket2)?;
+
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    // drain events
+    assert!(sess1.events().chain(sess2.events()).all(|e| matches!(
+        e,
+        GgrsEvent::Synchronizing { .. } | GgrsEvent::Synchronized { .. }
+    )));
+
+    let mut stub1 = stubs::GameStub::new();
+    let mut stub2 = stubs::GameStub::new();
+
+    // run normally for some frames (past first desync interval)
+    for i in 0..110 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+
+        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
+        sess2.add_local_input(1, StubInput { inp: i }).unwrap();
+
+        let requests1 = sess1.advance_frame().unwrap();
+        let requests2 = sess2.advance_frame().unwrap();
+
+        stub1.handle_requests(requests1);
+        stub2.handle_requests(requests2);
+    }
+
+    // check that there are no unexpected events yet
+    assert_eq!(sess1.events().len(), 0);
+    assert_eq!(sess2.events().len(), 0);
+
+    // run for some more frames
+    for _ in 0..100 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+
+        // mess up state for peer 1
+        stub1.gs.state = 1234;
+
+        // keep input steady (to avoid loads, which would restore valid state)
+        sess1.add_local_input(0, StubInput { inp: 0 }).unwrap();
+        sess2.add_local_input(1, StubInput { inp: 1 }).unwrap();
+
+        let requests1 = sess1.advance_frame().unwrap();
+        let requests2 = sess2.advance_frame().unwrap();
+
+        stub1.handle_requests(requests1);
+        stub2.handle_requests(requests2);
+    }
+
+    // check that we got desync events
+    let sess1_events: Vec<_> = sess1.events().collect();
+    let sess2_events: Vec<_> = sess2.events().collect();
+    assert_eq!(sess1_events.len(), 1);
+    assert_eq!(sess2_events.len(), 1);
+
+    let GgrsEvent::DesyncDetected {
+        frame: desync_frame1,
+        local_checksum: desync_local_checksum1,
+        remote_checksum: desync_remote_checksum1,
+        addr: desync_addr1,
+    } = sess1_events[0]
+    else {
+        panic!("no desync for peer 1");
+    };
+    assert_eq!(desync_frame1, 200);
+    assert_eq!(desync_addr1, addr2);
+    assert_ne!(desync_local_checksum1, desync_remote_checksum1);
+
+    let GgrsEvent::DesyncDetected {
+        frame: desync_frame2,
+        local_checksum: desync_local_checksum2,
+        remote_checksum: desync_remote_checksum2,
+        addr: desync_addr2,
+    } = sess2_events[0]
+    else {
+        panic!("no desync for peer 2");
+    };
+    assert_eq!(desync_frame2, 200);
+    assert_eq!(desync_addr2, addr1);
+    assert_ne!(desync_local_checksum2, desync_remote_checksum2);
+
+    // check that checksums match
+    assert_eq!(desync_remote_checksum1, desync_local_checksum2);
+    assert_eq!(desync_remote_checksum2, desync_local_checksum1);
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_desyncs_and_input_delay_no_panic() -> Result<(), GgrsError> {
+    let addr1 = stubs::localhost(7709);
+    let addr2 = stubs::localhost(7710);
+    let desync_mode = DesyncDetection::On { interval: 100 };
+
+    let socket1 = UdpNonBlockingSocket::bind_to_port(7709).unwrap();
+    let mut sess1 = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 0)?
+        .add_player(PlayerType::Remote(addr2), 1)?
+        .with_input_delay(5)
+        .with_desync_detection_mode(desync_mode)
+        .start_p2p_session(socket1)?;
+
+    let socket2 = UdpNonBlockingSocket::bind_to_port(7710).unwrap();
+    let mut sess2 = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Remote(addr1), 0)?
+        .add_player(PlayerType::Local, 1)?
+        .with_input_delay(5)
+        .with_desync_detection_mode(desync_mode)
+        .start_p2p_session(socket2)?;
+
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    // drain events
+    assert!(sess1.events().chain(sess2.events()).all(|e| matches!(
+        e,
+        GgrsEvent::Synchronizing { .. } | GgrsEvent::Synchronized { .. }
+    )));
+
+    let mut stub1 = stubs::GameStub::new();
+    let mut stub2 = stubs::GameStub::new();
+
+    // run normally for some frames (past first desync interval)
+    for i in 0..150 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+
+        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
+        sess2.add_local_input(1, StubInput { inp: i }).unwrap();
+
+        let requests1 = sess1.advance_frame().unwrap();
+        let requests2 = sess2.advance_frame().unwrap();
+
+        stub1.handle_requests(requests1);
+        stub2.handle_requests(requests2);
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_desync_detection_with_sparse_saving_no_panic() -> Result<(), GgrsError> {
+    let addr1 = stubs::localhost(7731);
+    let addr2 = stubs::localhost(7732);
+    let desync_mode = DesyncDetection::On { interval: 6 };
+
+    let socket1 = UdpNonBlockingSocket::bind_to_port(7731).unwrap();
+    let mut sess1 = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 0)?
+        .add_player(PlayerType::Remote(addr2), 1)?
+        .with_sparse_saving_mode(true)
+        .with_desync_detection_mode(desync_mode)
+        .start_p2p_session(socket1)?;
+
+    let socket2 = UdpNonBlockingSocket::bind_to_port(7732).unwrap();
+    let mut sess2 = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Remote(addr1), 0)?
+        .add_player(PlayerType::Local, 1)?
+        .with_sparse_saving_mode(true)
+        .with_desync_detection_mode(desync_mode)
+        .start_p2p_session(socket2)?;
+
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    let mut stub1 = stubs::GameStub::new();
+    let mut stub2 = stubs::GameStub::new();
+
+    for i in 0..40 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+
+        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
+        sess2.add_local_input(1, StubInput { inp: i }).unwrap();
+
+        let requests1 = sess1.advance_frame().unwrap();
+        let requests2 = sess2.advance_frame().unwrap();
+
+        stub1.handle_requests(requests1);
+        stub2.handle_requests(requests2);
+    }
+
+    Ok(())
+}
+
+// ── set_input_delay ───────────────────────────────────────────────────────────
+
+#[test]
+#[serial]
+fn test_set_input_delay_mid_session() -> Result<(), GgrsError> {
+    let (mut sess1, mut sess2) = stubs::make_p2p_sessions(7779, 8889);
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    let mut stub1 = stubs::GameStub::new();
+    let mut stub2 = stubs::GameStub::new();
+
+    for i in 0..10 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
+        sess2.add_local_input(1, StubInput { inp: i }).unwrap();
+        stub1.handle_requests(sess1.advance_frame().unwrap());
+        stub2.handle_requests(sess2.advance_frame().unwrap());
+    }
+
+    // increase delay mid-session
+    sess1.set_input_delay(0, 4).unwrap();
+    sess2.set_input_delay(1, 4).unwrap();
+
+    for i in 0..20 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
+        sess2.add_local_input(1, StubInput { inp: i }).unwrap();
+        stub1.handle_requests(sess1.advance_frame().unwrap());
+        stub2.handle_requests(sess2.advance_frame().unwrap());
+    }
+
+    // decrease delay mid-session
+    sess1.set_input_delay(0, 1).unwrap();
+    sess2.set_input_delay(1, 1).unwrap();
+
+    for i in 0..10 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
+        sess2.add_local_input(1, StubInput { inp: i }).unwrap();
+        stub1.handle_requests(sess1.advance_frame().unwrap());
+        stub2.handle_requests(sess2.advance_frame().unwrap());
+    }
+
+    // both sessions must agree on the game state after all the delay changes
+    assert_eq!(stub1.gs.frame, stub2.gs.frame);
+    assert_eq!(stub1.gs.state, stub2.gs.state);
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_increase_input_delay_does_not_freeze() -> Result<(), GgrsError> {
+    // Regression test: increasing input delay mid-session used to cause advance_frame()
+    // to stop emitting AdvanceFrame requests, freezing the game.
+    let (mut sess1, mut sess2) = stubs::make_p2p_sessions(7724, 7725);
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    let mut stub1 = stubs::GameStub::new();
+    let mut stub2 = stubs::GameStub::new();
+
+    for i in 0..5 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
+        sess2.add_local_input(1, StubInput { inp: i }).unwrap();
+        stub1.handle_requests(sess1.advance_frame().unwrap());
+        stub2.handle_requests(sess2.advance_frame().unwrap());
+    }
+
+    let frame_before = stub1.gs.frame;
+
+    // Increase delay by 1 — this was the exact scenario that caused the freeze
+    sess1.set_input_delay(0, 1).unwrap();
+    sess2.set_input_delay(1, 1).unwrap();
+
+    for i in 0..10 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
+        sess2.add_local_input(1, StubInput { inp: i }).unwrap();
+        stub1.handle_requests(sess1.advance_frame().unwrap());
+        stub2.handle_requests(sess2.advance_frame().unwrap());
+    }
+
+    // Sessions must have advanced beyond the point where the delay was changed
+    assert!(
+        stub1.gs.frame > frame_before,
+        "session 1 froze after delay increase (frame stayed at {frame_before})"
+    );
+    assert!(
+        stub2.gs.frame > frame_before,
+        "session 2 froze after delay increase (frame stayed at {frame_before})"
+    );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_input_delay_change_with_multiple_local_players() -> Result<(), GgrsError> {
+    let addr1 = stubs::localhost(7726);
+    let addr2 = stubs::localhost(7727);
+
+    let mut sess1 = SessionBuilder::<StubConfig>::new()
+        .with_num_players(3)?
+        .add_player(PlayerType::Local, 0)?
+        .add_player(PlayerType::Local, 1)?
+        .add_player(PlayerType::Remote(addr2), 2)?
+        .start_p2p_session(UdpNonBlockingSocket::bind_to_port(7726).unwrap())?;
+
+    let mut sess2 = SessionBuilder::<StubConfig>::new()
+        .with_num_players(3)?
+        .add_player(PlayerType::Remote(addr1), 0)?
+        .add_player(PlayerType::Remote(addr1), 1)?
+        .add_player(PlayerType::Local, 2)?
+        .start_p2p_session(UdpNonBlockingSocket::bind_to_port(7727).unwrap())?;
+
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    let mut stub1 = stubs::GameStub::new();
+    let mut stub2 = stubs::GameStub::new();
+
+    for i in 0..5 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+
+        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
+        sess1.add_local_input(1, StubInput { inp: i + 10 }).unwrap();
+        sess2.add_local_input(2, StubInput { inp: i }).unwrap();
+
+        stub1.handle_requests(sess1.advance_frame().unwrap());
+        stub2.handle_requests(sess2.advance_frame().unwrap());
+    }
+
+    let frame_before = stub1.gs.frame;
+
+    sess1.set_input_delay(0, 2).unwrap();
+
+    for i in 5..25 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+
+        sess1.add_local_input(0, StubInput { inp: i }).unwrap();
+        sess1.add_local_input(1, StubInput { inp: i + 10 }).unwrap();
+        sess2.add_local_input(2, StubInput { inp: i }).unwrap();
+
+        stub1.handle_requests(sess1.advance_frame().unwrap());
+        stub2.handle_requests(sess2.advance_frame().unwrap());
+    }
+
+    assert!(
+        stub1.gs.frame > frame_before,
+        "session with multiple local players froze after delay increase"
+    );
+    assert_eq!(stub1.gs.frame, stub2.gs.frame);
+    assert_eq!(stub1.gs.state, stub2.gs.state);
+
+    Ok(())
+}
+
+// ── Builder validation ────────────────────────────────────────────────────────
+
+#[test]
+fn test_builder_duplicate_player_handle_errors() {
+    let remote_addr = stubs::localhost(8080);
+    let result = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 0)
+        .unwrap()
+        .add_player(PlayerType::Remote(remote_addr), 0); // duplicate handle
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_builder_local_handle_out_of_range_errors() {
+    // handle 5 >= num_players(2) for a Local player → error
+    let result = SessionBuilder::<StubConfig>::new().add_player(PlayerType::Local, 5);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_builder_remote_handle_out_of_range_errors() {
+    let remote_addr = stubs::localhost(8080);
+    // handle 5 >= num_players(2) for a Remote player → error
+    let result = SessionBuilder::<StubConfig>::new().add_player(PlayerType::Remote(remote_addr), 5);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_builder_spectator_handle_below_num_players_errors() {
+    let spec_addr = stubs::localhost(9000);
+    // handle 0 < num_players(2) for a Spectator → error
+    let result =
+        SessionBuilder::<StubConfig>::new().add_player(PlayerType::Spectator(spec_addr), 0);
+    assert!(result.is_err());
+}
+
+#[test]
+#[serial]
+fn test_builder_missing_player_errors() {
+    let socket = UdpNonBlockingSocket::bind_to_port(7713).unwrap();
+    // num_players=2 but only player 0 registered
+    let result = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 0)
+        .unwrap()
+        .start_p2p_session(socket);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_builder_fps_zero_errors() {
+    let result = SessionBuilder::<StubConfig>::new().with_fps(0);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_builder_num_players_revalidates_local_handles() {
+    let result = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 1)
+        .unwrap()
+        .with_num_players(1);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_builder_num_players_revalidates_spectator_handles() {
+    let spec_addr = stubs::localhost(9001);
+    let result = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Spectator(spec_addr), 2)
+        .unwrap()
+        .with_num_players(3);
+    assert!(result.is_err());
+}
+
+#[test]
+#[serial]
+fn test_builder_desync_detection_interval_zero_errors() -> Result<(), GgrsError> {
+    let socket = UdpNonBlockingSocket::bind_to_port(7730).unwrap();
+    let result = SessionBuilder::<StubConfig>::new()
+        .with_num_players(1)?
+        .with_desync_detection_mode(DesyncDetection::On { interval: 0 })
+        .add_player(PlayerType::Local, 0)?
+        .start_p2p_session(socket);
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[test]
+fn test_builder_max_frames_behind_is_independent_of_catchup_speed() {
+    let result = SessionBuilder::<StubConfig>::new()
+        .with_catchup_speed(5)
+        .unwrap()
+        .with_max_frames_behind(5);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_builder_catchup_speed_can_exceed_max_frames_behind() {
+    let result = SessionBuilder::<StubConfig>::new()
+        .with_max_frames_behind(4)
+        .unwrap()
+        .with_catchup_speed(10);
+    assert!(result.is_ok());
+}
+
+// ── Session behaviour ─────────────────────────────────────────────────────────
+
+#[test]
+#[serial]
+fn test_synchronizing_events_emitted() -> Result<(), GgrsError> {
+    let (mut sess1, mut sess2) = stubs::make_p2p_sessions(7714, 7715);
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    let events1: Vec<_> = sess1.events().collect();
+    assert!(events1
+        .iter()
+        .any(|e| matches!(e, GgrsEvent::Synchronizing { .. })));
+    assert!(events1
+        .iter()
+        .any(|e| matches!(e, GgrsEvent::Synchronized { .. })));
+
+    let events2: Vec<_> = sess2.events().collect();
+    assert!(events2
+        .iter()
+        .any(|e| matches!(e, GgrsEvent::Synchronizing { .. })));
+    assert!(events2
+        .iter()
+        .any(|e| matches!(e, GgrsEvent::Synchronized { .. })));
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_network_stats_invalid_handles() -> Result<(), GgrsError> {
+    let (mut sess1, mut sess2) = stubs::make_p2p_sessions(7716, 7717);
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    // invalid handle → error
+    assert!(sess1.network_stats(99).is_err());
+    // local player handle → error (no network stats for local players)
+    assert!(sess1.network_stats(0).is_err());
+    assert!(sess2.network_stats(1).is_err());
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_network_stats_spectator_handle_does_not_panic() -> Result<(), GgrsError> {
+    let addr1 = stubs::localhost(7718);
+    let spec_addr = stubs::localhost(7719);
+
+    let socket = UdpNonBlockingSocket::bind_to_port(7718).unwrap();
+    let sess = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 0)?
+        .add_player(PlayerType::Remote(addr1), 1)?
+        .add_player(PlayerType::Spectator(spec_addr), 2)?
+        .start_p2p_session(socket)?;
+
+    // spectator handle must not panic — previously looked up addr in the wrong map
+    let result = sess.network_stats(2);
+    assert!(result.is_err()); // NotSynchronized is fine; a panic is not
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_game_state_converges() -> Result<(), GgrsError> {
+    let (mut sess1, mut sess2) = stubs::make_p2p_sessions(7720, 7721);
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    let mut stub1 = stubs::GameStub::new();
+    let mut stub2 = stubs::GameStub::new();
+
+    // use constant input so predictions always match — no mispredictions, fully deterministic
+    for _ in 0..50 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+
+        sess1.add_local_input(0, StubInput { inp: 0 }).unwrap();
+        let requests1 = sess1.advance_frame().unwrap();
+        stub1.handle_requests(requests1);
+
+        sess2.add_local_input(1, StubInput { inp: 0 }).unwrap();
+        let requests2 = sess2.advance_frame().unwrap();
+        stub2.handle_requests(requests2);
+    }
+
+    // both sessions must reach the same game state
+    assert_eq!(stub1.gs.state, stub2.gs.state);
+    assert_eq!(stub1.gs.frame, stub2.gs.frame);
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_desync_detection_off_by_default() -> Result<(), GgrsError> {
+    // Sessions created without calling with_desync_detection_mode → Off by default
+    let (mut sess1, mut sess2) = stubs::make_p2p_sessions(7722, 7723);
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    // drain sync events
+    let _ = sess1.events().count();
+    let _ = sess2.events().count();
+
+    let mut stub1 = stubs::GameStub::new();
+    let mut stub2 = stubs::GameStub::new();
+
+    for _ in 0..100 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+
+        // corrupt sess1 state so checksums diverge
+        stub1.gs.state = 9999;
+
+        sess1.add_local_input(0, StubInput { inp: 0 }).unwrap();
+        sess2.add_local_input(1, StubInput { inp: 0 }).unwrap();
+
+        let requests1 = sess1.advance_frame().unwrap();
+        let requests2 = sess2.advance_frame().unwrap();
+
+        stub1.handle_requests(requests1);
+        stub2.handle_requests(requests2);
+    }
+
+    // with detection off, no DesyncDetected events should have been emitted
+    let events1: Vec<_> = sess1.events().collect();
+    let events2: Vec<_> = sess2.events().collect();
+    assert!(!events1
+        .iter()
+        .any(|e| matches!(e, GgrsEvent::DesyncDetected { .. })));
+    assert!(!events2
+        .iter()
+        .any(|e| matches!(e, GgrsEvent::DesyncDetected { .. })));
+
+    Ok(())
+}
+
+// ── Lockstep mode ─────────────────────────────────────────────────────────────
+
+// Lockstep stalls when the remote's input has not been received.
+// When sess1 calls advance_frame first its internal poll finds nothing (sess2 has not
+// sent yet), so sess1 stalls. Only sess1's stall is asserted: sess2 calls advance_frame
+// second and its internal poll may already find sess1's just-sent packet (depending on
+// OS loopback timing), so sess2's outcome is deliberately not asserted here.
+// The full stall→poll→advance round-trip is covered by
+// test_lockstep_advances_with_zero_latency_zero_delay.
+#[test]
+#[serial]
+fn test_lockstep_stalls_without_remote_input() -> Result<(), GgrsError> {
+    let (mut sess1, mut sess2) = stubs::make_lockstep_sessions(7733, 7734, 0);
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    // sess1 calls advance_frame before sess2 has sent anything — its internal poll
+    // finds no remote input, so it must stall.
+    sess1.add_local_input(0, StubInput { inp: 0 })?;
+    let requests1 = sess1.advance_frame()?;
+
+    let advanced1 = requests1
+        .iter()
+        .any(|r| matches!(r, ggrs::GgrsRequest::AdvanceFrame { .. }));
+
+    assert!(
+        !advanced1,
+        "sess1 should stall when remote input has not arrived"
+    );
+
+    // sess2 is not called here; its stall behaviour is covered by
+    // test_lockstep_advances_with_zero_latency_zero_delay (first iteration).
+    let _ = sess2;
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_lockstep_wait_helper_stalls_without_remote_input() -> Result<(), GgrsError> {
+    let (mut sess1, mut sess2) = stubs::make_lockstep_sessions(7743, 7744, 1);
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    sess1.add_local_input(0, StubInput { inp: 0 })?;
+    let requests = sess1.advance_frame_with_wait_timeout(Duration::from_millis(1))?;
+
+    assert!(
+        requests.is_empty(),
+        "bounded wait helper should still stall when no remote input arrives"
+    );
+    assert_eq!(
+        sess1.current_frame(),
+        0,
+        "bounded wait helper must not consume a game frame on lockstep stalls"
+    );
+
+    let requests = sess1.advance_frame_with_wait_timeout(Duration::from_millis(1))?;
+
+    assert!(
+        requests.is_empty(),
+        "bounded wait helper should be safe to retry after a lockstep stall"
+    );
+    assert_eq!(
+        sess1.current_frame(),
+        0,
+        "retrying the bounded wait helper must not consume a game frame on lockstep stalls"
+    );
+
+    let _ = sess2;
+
+    Ok(())
+}
+
+// Lockstep advances every frame with zero latency and zero input delay.
+// With input_delay=0, each session must have the other's frame confirmed before it
+// can advance. advance_frame sends the local input packet unconditionally before
+// evaluating the gate, but poll_remote_clients is what delivers the other side's
+// packet and updates confirmed_frame. So the required sequence per frame is:
+//   1. Both sessions queue input and call advance_frame — input packets are sent,
+//      but the gate stalls because the remote input is not yet confirmed.
+//   2. Both sessions cross-poll — each now has the other's input confirmed.
+//   3. Both sessions call advance_frame again — gate passes, AdvanceFrame emitted.
+#[test]
+#[serial]
+fn test_lockstep_advances_with_zero_latency_zero_delay() -> Result<(), GgrsError> {
+    let (mut sess1, mut sess2) = stubs::make_lockstep_sessions(7735, 7736, 0);
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    let reps = 20;
+    for i in 0..reps {
+        // first advance: queues and sends the local input, stalls (remote not confirmed yet)
+        sess1.add_local_input(0, StubInput { inp: i })?;
+        sess2.add_local_input(1, StubInput { inp: i })?;
+        sess1.advance_frame()?;
+        sess2.advance_frame()?;
+
+        // poll until both sessions have confirmed the other's input, then advance.
+        // a single poll is not reliable under load (packets may arrive late on loopback),
+        // so we retry up to the sync timeout.
+        let deadline = std::time::Instant::now() + stubs::SYNC_TIMEOUT;
+        let mut advanced1;
+        let mut advanced2;
+        loop {
+            sess1.poll_remote_clients();
+            sess2.poll_remote_clients();
+
+            sess1.add_local_input(0, StubInput { inp: i })?;
+            sess2.add_local_input(1, StubInput { inp: i })?;
+            let r1 = sess1.advance_frame()?;
+            let r2 = sess2.advance_frame()?;
+
+            advanced1 = r1
+                .iter()
+                .any(|r| matches!(r, ggrs::GgrsRequest::AdvanceFrame { .. }));
+            advanced2 = r2
+                .iter()
+                .any(|r| matches!(r, ggrs::GgrsRequest::AdvanceFrame { .. }));
+
+            if advanced1 && advanced2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sess stalled on frame {i} — did not advance within timeout"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// Lockstep with input_delay=1 advances once both peers have exchanged their delayed inputs.
+// The session frame remains the game frame; input delay affects the effective input frame, not an
+// internal game-frame lead.
+#[test]
+#[serial]
+fn test_lockstep_advances_with_input_delay() -> Result<(), GgrsError> {
+    let (mut sess1, mut sess2) = stubs::make_lockstep_sessions(7737, 7738, 1);
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    let reps = 20;
+    for i in 0..reps {
+        // Retry until both sessions emit AdvanceFrame; loopback packet delivery is not
+        // instantaneous so a single poll may not be enough under load.
+        let deadline = std::time::Instant::now() + stubs::SYNC_TIMEOUT;
+        let mut advanced1 = false;
+        let mut advanced2 = false;
+
+        while !advanced1 || !advanced2 {
+            sess1.poll_remote_clients();
+            sess2.poll_remote_clients();
+
+            sess1.add_local_input(0, StubInput { inp: i })?;
+            sess2.add_local_input(1, StubInput { inp: i })?;
+            let r1 = sess1.advance_frame()?;
+            let r2 = sess2.advance_frame()?;
+
+            if r1
+                .iter()
+                .any(|r| matches!(r, ggrs::GgrsRequest::AdvanceFrame { .. }))
+            {
+                advanced1 = true;
+            }
+            if r2
+                .iter()
+                .any(|r| matches!(r, ggrs::GgrsRequest::AdvanceFrame { .. }))
+            {
+                advanced2 = true;
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sess stalled on iteration {i} — did not advance within timeout"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// With input_delay >= 1 and a silent remote, two invariants must hold:
+//   a) No AdvanceFrame is ever emitted — the game must not advance without confirmed inputs.
+//   b) The public current frame remains the game frame and does not advance on stalls.
+#[test]
+#[serial]
+fn test_lockstep_stalls_with_input_delay_and_no_remote_input() -> Result<(), GgrsError> {
+    let input_delay = 3;
+    let (mut sess1, mut sess2) = stubs::make_lockstep_sessions(7739, 7740, input_delay);
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    // Drive sess1 well past 128 iterations (the input queue length) without ever
+    // polling for sess2's packets. Duplicate stalled attempts must not consume game frames.
+    let mut game_frames_advanced = 0usize;
+    for _ in 0..200 {
+        sess1.add_local_input(0, StubInput { inp: 0 })?;
+        let requests = sess1.advance_frame()?;
+        if requests
+            .iter()
+            .any(|r| matches!(r, ggrs::GgrsRequest::AdvanceFrame { .. }))
+        {
+            game_frames_advanced += 1;
+        }
+    }
+
+    assert_eq!(
+        game_frames_advanced, 0,
+        "sess1 should not advance any game frames without remote input, \
+         even with input_delay={input_delay}"
+    );
+
+    assert_eq!(
+        sess1.current_frame(),
+        0,
+        "lockstep current_frame should remain the game frame on stalls, \
+         got current_frame={} with input_delay={input_delay}",
+        sess1.current_frame(),
+    );
+
+    Ok(())
+}
+
+// After repeated lockstep stalls, the session recovers correctly once the remote starts confirming
+// frames again.
+#[test]
+#[serial]
+fn test_lockstep_recovers_after_repeated_stalls() -> Result<(), GgrsError> {
+    let input_delay = 2;
+    let (mut sess1, mut sess2) = stubs::make_lockstep_sessions(7741, 7742, input_delay);
+    stubs::sync_p2p_sessions(&mut sess1, &mut sess2);
+
+    // Spin both sessions for many attempts without any cross-poll.
+    for _ in 0..input_delay + 10 {
+        sess1.add_local_input(0, StubInput { inp: 0 })?;
+        sess2.add_local_input(1, StubInput { inp: 0 })?;
+        sess1.advance_frame()?;
+        sess2.advance_frame()?;
+    }
+
+    // Now cross-poll and advance — both should eventually emit AdvanceFrame.
+    let deadline = std::time::Instant::now() + stubs::SYNC_TIMEOUT;
+    let mut advanced1 = false;
+    let mut advanced2 = false;
+
+    while !advanced1 || !advanced2 {
+        sess1.poll_remote_clients();
+        sess2.poll_remote_clients();
+
+        sess1.add_local_input(0, StubInput { inp: 0 })?;
+        sess2.add_local_input(1, StubInput { inp: 0 })?;
+        let r1 = sess1.advance_frame()?;
+        let r2 = sess2.advance_frame()?;
+
+        if r1
+            .iter()
+            .any(|r| matches!(r, ggrs::GgrsRequest::AdvanceFrame { .. }))
+        {
+            advanced1 = true;
+        }
+        if r2
+            .iter()
+            .any(|r| matches!(r, ggrs::GgrsRequest::AdvanceFrame { .. }))
+        {
+            advanced2 = true;
+        }
+
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session did not recover after repeated lockstep stalls"
+        );
+    }
+
+    Ok(())
+}

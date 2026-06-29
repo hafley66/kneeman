@@ -9,12 +9,15 @@ crate-type = ["cdylib"]
 
 [dependencies]
 smash_core = { path = "../core" }
+smash_net = { path = "../net" } # ggrs core + start_p2p; matchbox feature left OFF (detached)
 futures-signals = "0.3"
+ggrs = "0.13"     # for the NonBlockingSocket trait the Godot WebRTC transport implements
+bincode = "1.3"   # ggrs Message wire (same bincode the matchbox impl used)
 # godot-rust (gdext). Desktop uses the prebuilt API; wasm adds the web-export features below.
 godot = "0.4"
 
-# Desktop-only: egui debug overlay. gdext-egui pulls `open`, which doesn't build for wasm.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# egui debug overlay. gdext-egui pulls `open` (compile_error! on emscripten), gated off wasm via
+# the vendored patch in ../vendor/gdext-egui (see root Cargo.toml [patch.crates-io]).
 egui = "0.33"
 gdext-egui = "0.4"
 

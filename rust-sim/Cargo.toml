@@ -8,3 +8,12 @@
 [workspace]
 resolver = "2"
 members = ["core", "net", "shell"]
+exclude = ["vendor/gdext-egui", "vendor/ggrs"]
+
+# Vendored crates patched to build for the emscripten web export (both desktop-identical):
+#   gdext-egui 0.4.1 — `open` cfg-gated off wasm (emscripten compile_error!). src/context.rs.
+#   ggrs 0.13.0      — js-sys gated to wasm32-unknown-unknown only; emscripten uses SystemTime.
+#                      js-sys won't compile under threaded emscripten. src/network/protocol.rs.
+[patch.crates-io]
+gdext-egui = { path = "vendor/gdext-egui" }
+ggrs = { path = "vendor/ggrs" }

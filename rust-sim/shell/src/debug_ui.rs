@@ -4,9 +4,20 @@ use godot::prelude::*;
 
 use futures_signals::signal::Mutable;
 
-use crate::kneeman::KneeMan;
-use crate::sim::{AttackData, Buffered, Fighter, SimState, Tune};
+use crate::kneeman::{Identity, KneeMan, NetDebug};
+use crate::sim::{Action, AttackData, Fighter, SimState, Tune};
 use crate::theme;
+
+/// Which group of collapsers the panel is showing. Persisted on the node so it survives the
+/// per-frame immediate-mode redraw.
+#[derive(Clone, Copy, PartialEq, Default)]
+enum Tab {
+    #[default]
+    Status,
+    Feel,
+    Net,
+    Identity,
+}
 
 /// Hosts the egui bridge and draws "our stuff" panel by reading/writing the KneeMan
 /// BehaviorSubjects. Cmd+Shift+J toggles the panel; Cmd+Shift+R reloads the scene.
@@ -20,6 +31,7 @@ pub struct DebugUi {
     fighter: Option<Gd<KneeMan>>,
     camera: Option<Gd<Camera2D>>,
     show: bool,
+    tab: Tab,
 }
 
 #[godot_api]
@@ -32,6 +44,7 @@ impl INode for DebugUi {
             fighter: None,
             camera: None,
             show: false, // start hidden; Cmd+Shift+J toggles
+            tab: Tab::default(),
         }
     }
 
@@ -61,6 +74,12 @@ impl INode for DebugUi {
         if !key.is_pressed() || key.is_echo() {
             return;
         }
+        // Backtick toggles with no modifier — the web build can't use Cmd+Shift+J (Chrome eats it
+        // as the devtools shortcut), and ` triggers no default browser action over the canvas.
+        if key.get_keycode() == Key::QUOTELEFT {
+            self.show = !self.show;
+            return;
+        }
         if key.is_meta_pressed() && key.is_shift_pressed() {
             match key.get_keycode() {
                 Key::J => self.show = !self.show,
@@ -83,11 +102,19 @@ impl INode for DebugUi {
         }
         let ctx = bridge.bind().current_frame().clone();
         // grab the shared BehaviorSubjects (cheap clones of the same cells)
-        let (state_cell, tune_cell) = {
+        let (state_cell, tune_cell, net_cell, identity_cell) = {
             let f = fighter.bind();
-            (f.state_cell(), f.tune_cell())
+            (f.state_cell(), f.tune_cell(), f.net_cell(), f.identity_cell())
         };
-        draw_panel(&ctx, &state_cell, &tune_cell, self.camera.clone());
+        draw_panel(
+            &ctx,
+            &state_cell,
+            &tune_cell,
+            &net_cell,
+            &identity_cell,
+            self.camera.clone(),
+            &mut self.tab,
+        );
     }
 }
 
@@ -96,7 +123,10 @@ fn draw_panel(
     ctx: &egui::Context,
     state_cell: &Mutable<SimState>,
     tune_cell: &Mutable<Tune>,
+    net_cell: &Mutable<NetDebug>,
+    identity_cell: &Mutable<Identity>,
     camera: Option<Gd<Camera2D>>,
+    tab: &mut Tab,
 ) {
     let s = state_cell.get();
     let mut t = tune_cell.get();
@@ -104,42 +134,57 @@ fn draw_panel(
     egui::Window::new("KneeMan  ·  our stuff")
         .default_size(egui::vec2(300.0, 440.0))
         .show(ctx, |ui| {
+      ui.horizontal(|ui| {
+          ui.selectable_value(tab, Tab::Status, "status");
+          ui.selectable_value(tab, Tab::Feel, "feel");
+          ui.selectable_value(tab, Tab::Net, "net");
+          ui.selectable_value(tab, Tab::Identity, "identity");
+      });
+      ui.separator();
       egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+        match *tab {
+        Tab::Status => {
         let p = &s.fighters[0]; // debug panel tracks player 0
-        theme::card(ui, |ui| {
-            theme::stat(ui, "state", p.state_name());
-            theme::stat(ui, "frame", p.frame.to_string());
-            theme::stat(ui, "facing", if p.facing < 0.0 { "◄ left" } else { "right ►" });
-            theme::stat(ui, "pos", format!("{:.0}, {:.0}", p.pos.x, p.pos.y));
-            theme::stat(ui, "vel", format!("{:.0}, {:.0}", p.vel.x, p.vel.y));
-            theme::stat(ui, "air jumps", p.air_jumps.to_string());
-            theme::stat(ui, "air dodges", p.air_dodges.to_string());
-            theme::stat(ui, "fast fall", p.fast_falling.to_string());
-            theme::stat(ui, "intangible", p.intangible.to_string());
-            theme::stat(ui, "hitlag", p.hitlag.to_string());
-            theme::stat(ui, "aerial buf", p.aerial_buf.to_string());
-            theme::stat(ui, "autohop", if p.autohop_aerial { "yes (-dmg)" } else { "no" });
-            theme::stat(ui, "own %", format!("{:.0}", p.damage));
-            theme::stat(ui, "dummy %", format!("{:.0}", s.fighters[1].damage));
+        egui::CollapsingHeader::new("status").default_open(false).show(ui, |ui| {
+            theme::card(ui, |ui| {
+                theme::stat(ui, "state", p.state_name());
+                theme::stat(ui, "frame", p.frame.to_string());
+                theme::stat(ui, "facing", if p.facing < 0.0 { "◄ left" } else { "right ►" });
+                theme::stat(ui, "pos", format!("{:.0}, {:.0}", p.pos.x, p.pos.y));
+                theme::stat(ui, "vel", format!("{:.0}, {:.0}", p.vel.x, p.vel.y));
+                theme::stat(ui, "air jumps", p.air_jumps.to_string());
+                theme::stat(ui, "air dodges", p.air_dodges.to_string());
+                theme::stat(ui, "fast fall", p.fast_falling.to_string());
+                theme::stat(ui, "intangible", p.intangible.to_string());
+                theme::stat(ui, "hitlag", p.hitlag.to_string());
+                theme::stat(ui, "aerial buf", p.aerial_buffer_frames().to_string());
+                theme::stat(ui, "attack buf", p.attack_buffer_frames().to_string());
+                theme::stat(ui, "holding", if p.holding >= 0 { "gun" } else { "—" });
+                theme::stat(ui, "autohop", if p.autohop_aerial { "yes (-dmg)" } else { "no" });
+                theme::stat(ui, "own %", format!("{:.0}", p.damage));
+                theme::stat(ui, "dummy %", format!("{:.0}", s.fighters[1].damage));
+            });
         });
 
-        buffer_card(ui, &s.fighters[0], &t);
+        egui::CollapsingHeader::new("input buffer").default_open(false).show(ui, |ui| {
+            buffer_card(ui, &s.fighters[0], &t);
+        });
 
         if let Some(mut cam) = camera {
-            theme::card(ui, |ui| {
-                ui.label(egui::RichText::new("view scale").color(theme::MUTED));
-                let mut z = cam.get_zoom().x;
-                if ui
-                    .add(egui::Slider::new(&mut z, 0.4..=2.5).text("camera zoom"))
-                    .changed()
-                {
-                    cam.set_zoom(Vector2::new(z, z));
-                }
+            egui::CollapsingHeader::new("view scale").default_open(false).show(ui, |ui| {
+                theme::card(ui, |ui| {
+                    let mut z = cam.get_zoom().x;
+                    if ui
+                        .add(egui::Slider::new(&mut z, 0.4..=2.5).text("camera zoom"))
+                        .changed()
+                    {
+                        cam.set_zoom(Vector2::new(z, z));
+                    }
+                });
             });
         }
-
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("feel (live, pixel-space)").color(theme::MUTED));
+        }
+        Tab::Feel => {
         let mut c = false;
 
         egui::CollapsingHeader::new("ground").default_open(false).show(ui, |ui| {
@@ -148,6 +193,8 @@ fn draw_panel(
             c |= slider(ui, &mut t.run_speed, 0.0..=1500.0, "run_speed");
             c |= slider(ui, &mut t.ground_accel, 200.0..=8000.0, "ground_accel");
             c |= slider(ui, &mut t.ground_friction, 100.0..=8000.0, "ground_friction");
+            c |= slider(ui, &mut t.dashstop_friction, 100.0..=8000.0, "dashstop_friction");
+            c |= slider(ui, &mut t.dash_pivot_keep, 0.0..=1.0, "dash_pivot_keep (1=free dashdance)");
         });
         egui::CollapsingHeader::new("jump").default_open(false).show(ui, |ui| {
             c |= slider(ui, &mut t.fullhop_v, -2500.0..=-100.0, "fullhop_v");
@@ -165,6 +212,7 @@ fn draw_panel(
             c |= slider(ui, &mut t.air_speed, 0.0..=1500.0, "air_speed (drift cap)");
             c |= slider(ui, &mut t.air_accel, 100.0..=8000.0, "air_accel (mobility)");
             c |= slider(ui, &mut t.air_friction, 0.0..=2000.0, "air_friction (drag)");
+            c |= slider(ui, &mut t.fastfall_threshold, 0.1..=1.0, "fastfall threshold (down vs side)");
         });
         egui::CollapsingHeader::new("dodge / ledge").default_open(false).show(ui, |ui| {
             c |= slider(ui, &mut t.roll_speed, 0.0..=1500.0, "roll_speed");
@@ -178,6 +226,13 @@ fn draw_panel(
         egui::CollapsingHeader::new("attack · nair").default_open(false).show(ui, |ui| {
             c |= attack_sliders(ui, &mut t.nair);
             c |= slider(ui, &mut t.autohop_dmg, 0.5..=1.0, "autohop dmg x (jump+atk)");
+        });
+        egui::CollapsingHeader::new("attack · dair").default_open(false).show(ui, |ui| {
+            c |= slider(ui, &mut t.dair_threshold, 0.1..=1.0, "dair threshold (down vs side)");
+            c |= attack_sliders(ui, &mut t.dair);
+        });
+        egui::CollapsingHeader::new("attack · dash").default_open(false).show(ui, |ui| {
+            c |= attack_sliders(ui, &mut t.dash_attack);
         });
         egui::CollapsingHeader::new("frames").default_open(false).show(ui, |ui| {
             c |= islider(ui, &mut t.jumpsquat, 1..=10, "jumpsquat");
@@ -193,9 +248,25 @@ fn draw_panel(
             c |= islider(ui, &mut t.max_air_jumps, 0..=5, "max_air_jumps");
             c |= islider(ui, &mut t.max_air_dodges, 0..=5, "max_air_dodges");
         });
+        egui::CollapsingHeader::new("items · laser").default_open(false).show(ui, |ui| {
+            c |= ui.checkbox(&mut t.items_on, "items on").changed();
+            c |= islider(ui, &mut t.item_spawn_interval, 60..=1800, "spawn interval (f)");
+            c |= slider(ui, &mut t.laser.spawn_weight, 0.0..=10.0, "spawn weight");
+            c |= islider(ui, &mut t.laser.ammo, 1..=99, "ammo / gun");
+            c |= islider(ui, &mut t.laser.cooldown, 1..=60, "tap cooldown (f)");
+            c |= islider(ui, &mut t.laser.autofire_cd, 1..=60, "hold cooldown (f)");
+            c |= slider(ui, &mut t.laser.autofire_dmg, 0.1..=1.0, "hold dmg x (weaker)");
+            c |= slider(ui, &mut t.laser.speed, 200.0..=3000.0, "bolt speed");
+            c |= islider(ui, &mut t.laser.range, 10..=240, "bolt range (f)");
+            c |= attack_sliders(ui, &mut t.laser.hit);
+        });
 
         if c {
             tune_cell.set(t);
+        }
+        }
+        Tab::Net => net_card(ui, &net_cell.get()),
+        Tab::Identity => identity_card(ui, identity_cell),
         }
 
         ui.add_space(8.0);
@@ -207,24 +278,77 @@ fn draw_panel(
                 tune_cell.set(Tune::default());
             }
         });
-        ui.small("space/↑ jump · X shorthop · Z shield · C attack · arrows move · ↓ fastfall");
-        ui.small("Cmd+Shift+J hide · Cmd+Shift+R reset scene");
+        ui.small("space/↑ jump · X shorthop · Z shield · C attack/grab/hold-fire · V drop · arrows move · ↓ fastfall");
+        ui.small("` toggle panel · Cmd+Shift+J hide · Cmd+Shift+R reset scene · Enter find match");
       });
     });
+}
+
+/// Netplay transport readout. The handshake order is: ws open -> matched (role) -> host offer ->
+/// guest answer -> ICE both ways -> conn `connected` -> channel `open` -> rollback. A stall shows
+/// here: e.g. signal stuck at `have-local-offer` with answer in = 0 means the peer never answered.
+fn net_card(ui: &mut egui::Ui, n: &NetDebug) {
+    theme::card(ui, |ui| {
+        theme::stat(ui, "phase", n.phase);
+        theme::stat(ui, "role", format!("{} (handle {})", n.role, n.handle));
+        theme::stat(ui, "signaling ws", n.ws);
+        theme::stat(ui, "pc conn", n.conn);
+        theme::stat(ui, "ice gather", n.gather);
+        theme::stat(ui, "sdp signal", n.signal);
+        theme::stat(ui, "data channel", n.channel);
+    });
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("handshake frames  (out / in)").color(theme::MUTED));
+    theme::card(ui, |ui| {
+        theme::stat(ui, "offer", format!("{} / {}", n.offer.0, n.offer.1));
+        theme::stat(ui, "answer", format!("{} / {}", n.answer.0, n.answer.1));
+        theme::stat(ui, "ice", format!("{} / {}", n.ice.0, n.ice.1));
+    });
+}
+
+/// Player identity: name + color the sprite and nametag wear. Edits write back to the shared cell;
+/// KneeMan persists them to localStorage (web) and refreshes the tag. The color is godot-side RGBA;
+/// the picker works in RGB and rebuilds the color on change.
+fn identity_card(ui: &mut egui::Ui, cell: &Mutable<Identity>) {
+    let mut id = cell.get_cloned();
+    let mut changed = false;
+    theme::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.colored_label(theme::MUTED, "name");
+            let resp = egui::TextEdit::singleline(&mut id.name)
+                .char_limit(16)
+                .desired_width(170.0)
+                .show(ui)
+                .response;
+            changed |= resp.changed();
+        });
+        ui.horizontal(|ui| {
+            ui.colored_label(theme::MUTED, "color");
+            let mut rgb = [id.color.r, id.color.g, id.color.b];
+            if ui.color_edit_button_rgb(&mut rgb).changed() {
+                id.color = Color::from_rgb(rgb[0], rgb[1], rgb[2]);
+                changed = true;
+            }
+        });
+    });
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("saved to this browser · hovers over your fighter")
+            .size(11.0)
+            .color(theme::MUTED),
+    );
+    if changed {
+        cell.set(id);
+    }
 }
 
 /// Live readout of the input buffer: what's queued, how long it stays valid, and the captured
 /// aim (the diagonal that the air dodge / wavedash will fire with).
 fn buffer_card(ui: &mut egui::Ui, f: &Fighter, t: &Tune) {
     theme::card(ui, |ui| {
-        ui.label(egui::RichText::new("input buffer").color(theme::MUTED));
-        let active = f.buf_timer > 0 && f.buffered != Buffered::None;
-        let name = match f.buffered {
-            Buffered::None => "—",
-            Buffered::Jump => "JUMP",
-            Buffered::ShortHop => "SHORTHOP",
-            Buffered::AirDodge => "AIRDODGE",
-        };
+        let slot = f.move_buffer();
+        let active = slot.timer > 0 && slot.action != Action::None;
+        let name = slot.action.name();
         let col = if active { theme::ACCENT } else { theme::MUTED };
         ui.horizontal(|ui| {
             ui.colored_label(theme::MUTED, "queued");
@@ -234,11 +358,11 @@ fn buffer_card(ui: &mut egui::Ui, f: &Fighter, t: &Tune) {
         });
 
         let denom = (t.buffer_frames + 1).max(1) as f32;
-        let frac = (f.buf_timer as f32 / denom).clamp(0.0, 1.0);
+        let frac = (slot.timer as f32 / denom).clamp(0.0, 1.0);
         ui.add(
             egui::ProgressBar::new(frac)
                 .desired_height(8.0)
-                .text(format!("{} / {} f", f.buf_timer, t.buffer_frames)),
+                .text(format!("{} / {} f", slot.timer, t.buffer_frames)),
         );
 
         // aim compass: line points to the buffered aim (the diagonal that will be used)
@@ -250,7 +374,7 @@ fn buffer_card(ui: &mut egui::Ui, f: &Fighter, t: &Tune) {
         painter.circle_stroke(ctr, r, grid);
         painter.line_segment([egui::pos2(ctr.x - r, ctr.y), egui::pos2(ctr.x + r, ctr.y)], grid);
         painter.line_segment([egui::pos2(ctr.x, ctr.y - r), egui::pos2(ctr.x, ctr.y + r)], grid);
-        let a = f.buf_aim;
+        let a = slot.aim;
         if a.length() > 0.01 {
             let n = a.normalize_or_zero();
             let end = egui::pos2(ctr.x + n.x * r, ctr.y + n.y * r);

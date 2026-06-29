@@ -7,28 +7,39 @@
 //! and compares state checksums. Any non-determinism in `step` makes it return MismatchedChecksum
 //! and the test fails. Run it after touching the sim.
 
+use bitflags::bitflags;
 use ggrs::{Config, GgrsRequest, PlayerType, PredictRepeatLast, SessionBuilder, SyncTestSession};
 use serde::{Deserialize, Serialize};
 use smash_core::{step, InputFrame, SimState, Tune};
 
+bitflags! {
+    /// Every button edge/hold that travels over the wire, one flag each. `Buttons::empty()` = no
+    /// input (also ggrs's disconnected-player default). bitflags' serde serializes the raw bits
+    /// under bincode, so the packet stays a single `u16`.
+    #[derive(Copy, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+    pub struct Buttons: u16 {
+        const JUMP           = 1 << 0;
+        const JUMP_HELD      = 1 << 1;
+        const SHORTHOP       = 1 << 2;
+        const SHIELD_HELD    = 1 << 3;
+        const SHIELD_PRESSED = 1 << 4;
+        const DOWN           = 1 << 5;
+        const DOWN_PRESSED   = 1 << 6;
+        const ATTACK         = 1 << 7;
+        const GRAB           = 1 << 8;
+        const ATTACK_HELD    = 1 << 9;
+    }
+}
+
 /// The only game data sent over the wire. Quantize the analog stick to `i8` (kills float-input
-/// divergence + shrinks packets); pack the eight buttons into a bitmask. `Default` = no input,
+/// divergence + shrinks packets); the buttons are a typed `Buttons` set. `Default` = no input,
 /// which ggrs also uses for a disconnected player.
 #[derive(Copy, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct NetInput {
-    pub buttons: u8, // bit flags, see B_* below
+    pub buttons: Buttons,
     pub stick_x: i8, // dir   * 127
     pub stick_y: i8, // aim_y * 127
 }
-
-const B_JUMP: u8 = 1 << 0;
-const B_JUMP_HELD: u8 = 1 << 1;
-const B_SHORTHOP: u8 = 1 << 2;
-const B_SHIELD_HELD: u8 = 1 << 3;
-const B_SHIELD_PRESSED: u8 = 1 << 4;
-const B_DOWN: u8 = 1 << 5;
-const B_DOWN_PRESSED: u8 = 1 << 6;
-const B_ATTACK: u8 = 1 << 7;
 
 #[inline]
 fn q(v: f32) -> i8 {
@@ -38,31 +49,17 @@ fn q(v: f32) -> i8 {
 /// Sample -> wire. The shell calls this on the locally sampled `InputFrame` before handing it to
 /// the session; the result is what travels to the peer.
 pub fn encode(i: &InputFrame) -> NetInput {
-    let mut b = 0u8;
-    if i.jump {
-        b |= B_JUMP;
-    }
-    if i.jump_held {
-        b |= B_JUMP_HELD;
-    }
-    if i.shorthop {
-        b |= B_SHORTHOP;
-    }
-    if i.shield_held {
-        b |= B_SHIELD_HELD;
-    }
-    if i.shield_pressed {
-        b |= B_SHIELD_PRESSED;
-    }
-    if i.down {
-        b |= B_DOWN;
-    }
-    if i.down_pressed {
-        b |= B_DOWN_PRESSED;
-    }
-    if i.attack {
-        b |= B_ATTACK;
-    }
+    let mut b = Buttons::empty();
+    b.set(Buttons::JUMP, i.jump);
+    b.set(Buttons::JUMP_HELD, i.jump_held);
+    b.set(Buttons::SHORTHOP, i.shorthop);
+    b.set(Buttons::SHIELD_HELD, i.shield_held);
+    b.set(Buttons::SHIELD_PRESSED, i.shield_pressed);
+    b.set(Buttons::DOWN, i.down);
+    b.set(Buttons::DOWN_PRESSED, i.down_pressed);
+    b.set(Buttons::ATTACK, i.attack);
+    b.set(Buttons::GRAB, i.grab);
+    b.set(Buttons::ATTACK_HELD, i.attack_held);
     NetInput { buttons: b, stick_x: q(i.dir), stick_y: q(i.aim_y) }
 }
 
@@ -72,14 +69,16 @@ pub fn decode(n: NetInput) -> InputFrame {
     InputFrame {
         dir: n.stick_x as f32 / 127.0,
         aim_y: n.stick_y as f32 / 127.0,
-        jump: b & B_JUMP != 0,
-        jump_held: b & B_JUMP_HELD != 0,
-        shorthop: b & B_SHORTHOP != 0,
-        shield_held: b & B_SHIELD_HELD != 0,
-        shield_pressed: b & B_SHIELD_PRESSED != 0,
-        down: b & B_DOWN != 0,
-        down_pressed: b & B_DOWN_PRESSED != 0,
-        attack: b & B_ATTACK != 0,
+        jump: b.contains(Buttons::JUMP),
+        jump_held: b.contains(Buttons::JUMP_HELD),
+        shorthop: b.contains(Buttons::SHORTHOP),
+        shield_held: b.contains(Buttons::SHIELD_HELD),
+        shield_pressed: b.contains(Buttons::SHIELD_PRESSED),
+        down: b.contains(Buttons::DOWN),
+        down_pressed: b.contains(Buttons::DOWN_PRESSED),
+        attack: b.contains(Buttons::ATTACK),
+        attack_held: b.contains(Buttons::ATTACK_HELD),
+        grab: b.contains(Buttons::GRAB),
     }
 }
 
@@ -123,11 +122,12 @@ pub fn checksum(s: &SimState) -> u128 {
         fold(f.air_dodges as u64);
         fold(f.fast_falling as u64);
         fold(f.full_hop as u64);
-        fold(f.buffered as u64);
-        fold(f.buf_timer as u64);
-        fold(f.buf_aim.x.to_bits() as u64);
-        fold(f.buf_aim.y.to_bits() as u64);
-        fold(f.aerial_buf as u64);
+        for s in &f.buf {
+            fold(s.action as u64);
+            fold(s.timer as u64);
+            fold(s.aim.x.to_bits() as u64);
+            fold(s.aim.y.to_bits() as u64);
+        }
         fold(f.autohop_aerial as u64);
         fold(f.intangible as u64);
         fold(f.regrab_lock as u64);
@@ -136,6 +136,20 @@ pub fn checksum(s: &SimState) -> u128 {
         fold(f.hitlag as u64);
         fold(f.damage.to_bits() as u64);
         fold(f.hitstun as u64);
+        fold(f.holding as u64);
+    }
+    fold(s.tick);
+    fold(s.rng);
+    for it in &s.items {
+        fold(it.kind as u64);
+        fold(it.pos.x.to_bits() as u64);
+        fold(it.pos.y.to_bits() as u64);
+        fold(it.vel.x.to_bits() as u64);
+        fold(it.vel.y.to_bits() as u64);
+        fold(it.owner as u64);
+        fold(it.ammo as u64);
+        fold(it.timer as u64);
+        fold(it.facing.to_bits() as u64);
     }
     h as u128
 }
@@ -172,6 +186,39 @@ impl Game {
             }
         }
     }
+}
+
+/// ggrs types a frontend needs to drive a P2P session, re-exported so a shell depends only on
+/// `smash_net` (plus `ggrs` itself for the `NonBlockingSocket` trait it implements). Available on
+/// every build — NOT gated on the matchbox feature, since the Godot WebRTC transport lives in the
+/// shell and supplies its own socket.
+pub use ggrs::{GgrsError, Message, NonBlockingSocket, P2PSession, SessionState};
+
+/// Build a 2-player rollback session over a caller-supplied socket (the transport). Handle order is
+/// FIXED so both peers agree: handle 0 = host, handle 1 = guest. `local_handle` says which one this
+/// peer is; `remote_addr` is the address the socket tags inbound packets with (host sees the guest
+/// as `remote_addr`, guest sees the host). `input_delay` frames trade latency for fewer rollbacks.
+pub fn start_p2p<S>(
+    local_handle: usize,
+    remote_addr: PeerAddr,
+    socket: S,
+    input_delay: usize,
+) -> Result<P2PSession<GgrsConfig>, GgrsError>
+where
+    S: NonBlockingSocket<PeerAddr> + 'static,
+{
+    let mut b = SessionBuilder::<GgrsConfig>::new()
+        .with_num_players(2)?
+        .with_input_delay(input_delay);
+    for handle in 0..2 {
+        let player = if handle == local_handle {
+            PlayerType::Local
+        } else {
+            PlayerType::Remote(remote_addr)
+        };
+        b = b.add_player(player, handle)?;
+    }
+    b.start_p2p_session(socket)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -270,9 +317,9 @@ mod tests {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let r = (*seed >> 33) as u32;
         NetInput {
-            buttons: (r & 0xff) as u8,
-            stick_x: ((r >> 8) & 0xff) as i8,
-            stick_y: ((r >> 16) & 0xff) as i8,
+            buttons: Buttons::from_bits_truncate((r & 0x3ff) as u16), // 10 button bits now
+            stick_x: ((r >> 10) & 0xff) as i8,
+            stick_y: ((r >> 18) & 0xff) as i8,
         }
     }
 
@@ -307,10 +354,13 @@ mod tests {
             down: true,
             down_pressed: false,
             attack: true,
+            attack_held: true,
+            grab: true,
         };
         let d = decode(encode(&i));
         assert_eq!(d.jump, i.jump);
         assert_eq!(d.attack, i.attack);
+        assert_eq!(d.grab, i.grab);
         assert_eq!(d.shield_held, i.shield_held);
         assert_eq!(d.down, i.down);
         assert!((d.dir - 1.0).abs() < 0.02);

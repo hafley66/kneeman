@@ -1,0 +1,54 @@
+[package]
+edition = "2021"
+name = "gdext-egui"
+version = "0.4.1"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "egui bindings for gdext"
+readme = "README.md"
+license = "MPL-2.0"
+repository = "https://github.com/kang-sw/gdext-egui"
+
+# Standalone workspace so this path-patch is not absorbed into the consuming workspace.
+[workspace]
+exclude = ["example/.rust"]
+
+[lib]
+name = "gdext_egui"
+path = "src/lib.rs"
+
+[dependencies.crossbeam-queue]
+version = "0.3"
+
+[dependencies.derive_setters]
+version = "0.1"
+
+[dependencies.educe]
+version = "0.6"
+
+[dependencies.egui]
+version = "0.33"
+
+[dependencies.godot]
+version = "0.4"
+
+[dependencies.itertools]
+version = "0.14"
+
+[dependencies.oneshot]
+version = "0.2"
+
+[dependencies.tap]
+version = "1"
+
+[dependencies.with_drop]
+version = "0"
+
+# `open` 5.x emits compile_error! on target_os = "emscripten" (and any other unlisted OS). It is
+# only used for egui's OutputCommand::OpenUrl (src/context.rs). Gate it off wasm.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.open]
+version = "5"

@@ -1,0 +1,22 @@
+[package]
+name = "smash-signaling"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone — NOT a member of the rust-sim gdext workspace (it pulls tokio, which has no business
+# in the wasm sim build). Runs on the VPS next to matchbox; nginx reverse-proxies wss /rtc to it.
+# Job: pair browsers two at a time and blindly relay the WebRTC handshake (SDP offer/answer + ICE)
+# between the pair. It never sees gameplay — that goes peer-to-peer over the data channel.
+
+[[bin]]
+name = "smash-signaling"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+[profile.release]
+opt-level = "s"
+lto = true

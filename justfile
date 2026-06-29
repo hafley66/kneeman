@@ -65,8 +65,21 @@ vps-deploy:
     ssh {{vps}} 'mkdir -p /etc/nginx/snippets'
     scp deploy/nginx/matchbox-ws.conf {{vps}}:/etc/nginx/snippets/matchbox-ws.conf
     scp deploy/nginx/web.conf {{vps}}:/etc/nginx/snippets/web.conf
+    scp deploy/nginx/godot.conf {{vps}}:/etc/nginx/snippets/godot.conf
+    scp deploy/nginx/rtc.conf {{vps}}:/etc/nginx/snippets/rtc.conf
     scp deploy/systemd/matchbox.service {{vps}}:/etc/systemd/system/matchbox.service
+    scp deploy/systemd/smash-signaling.service {{vps}}:/etc/systemd/system/smash-signaling.service
+    rsync -az --delete --exclude target signaling/ {{vps}}:/root/smash-signaling-src/
     ssh {{vps}} 'bash -s' < deploy/setup-vps.sh
+
+# rebuild + restart just the WebRTC signaling relay (no full setup rerun). Run `vps-deploy` once first.
+signaling-deploy:
+    rsync -az --delete --exclude target signaling/ {{vps}}:/root/smash-signaling-src/
+    ssh {{vps}} 'source $HOME/.cargo/env && cargo install --path /root/smash-signaling-src --force && systemctl restart smash-signaling && systemctl --no-pager status smash-signaling | head -4'
+
+# tail the live signaling relay log (connect / matched / disconnect lines)
+signaling-logs:
+    ssh {{vps}} 'journalctl -u smash-signaling -n 60 -f'
 
 # tail the signaling service log
 vps-logs:
@@ -95,6 +108,31 @@ web-deploy: web
     rsync -az --delete {{proj}}/web/dist/ {{vps}}:/var/www/smash/
     ssh {{vps}} 'nginx -t && systemctl reload nginx'
     @echo "live at https://hafley.codes/play/"
+
+# --- real Godot web export (served at /game/) ---
+
+godot45 := "$HOME/godot45/Godot.app/Contents/MacOS/Godot"
+
+# build the gdext sim for the web target (release). Needs emsdk sourced + nightly + 4.5 binary.
+godot-wasm:
+    cd {{proj}}/rust-sim && source ~/emsdk/emsdk_env.sh && \
+      GODOT4_BIN="{{godot45}}" cargo +nightly build -p smash_sim -Zbuild-std \
+      --target wasm32-unknown-emscripten --release
+
+# export the Godot "Web" preset to build/web (runs the 4.5 editor headless)
+godot-export: godot-wasm
+    cd {{proj}} && mkdir -p build/web && source ~/emsdk/emsdk_env.sh && \
+      "{{godot45}}" --headless --path . --export-release "Web" build/web/index.html
+
+# push build/web to the VPS (/var/www/smash-godot), reload nginx. Run `vps-deploy` once first.
+godot-deploy: godot-export
+    rsync -az --delete {{proj}}/build/web/ {{vps}}:/var/www/smash-godot/
+    ssh {{vps}} 'nginx -t && systemctl reload nginx'
+    @echo "live at https://hafley.codes/game/"
+
+# ship the game: gate on the rollback determinism test, then compile + export + deploy.
+# Use this (not raw godot-deploy) for any change that touches the sim or netplay path.
+ship: net-test godot-deploy
 
 # --- submodules / assets ---
 

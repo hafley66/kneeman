@@ -21,3 +21,9 @@ assets/
 
 # old git history, backed up before the clean re-init
 .git-old/
+
+# local agent worktrees/scratch
+.claude/
+signaling/target/
+rust-sim/vendor/*/target/
+**/target/

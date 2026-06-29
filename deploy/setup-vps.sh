@@ -13,6 +13,12 @@ if [ ! -x "$HOME/.cargo/bin/matchbox_server" ]; then
   cargo install matchbox_server
 fi
 
+# 1b. smash-signaling relay — build/refresh from the source rsync'd by `just vps-deploy`.
+. "$HOME/.cargo/env" 2>/dev/null || true
+if [ -d "$HOME/smash-signaling-src" ]; then
+  cargo install --path "$HOME/smash-signaling-src" --force
+fi
+
 # 2. nginx — include the /ws proxy + /play static snippets inside the 443 server block (once each).
 SITE=/etc/nginx/sites-enabled/default
 ANCHOR='/server_name www.hafley.codes hafley.codes; # managed by Certbot/'
@@ -22,14 +28,22 @@ fi
 if ! grep -q 'snippets/web.conf' "$SITE"; then
   sed -i "${ANCHOR}a\\    include snippets/web.conf;" "$SITE"
 fi
-mkdir -p /var/www/smash
+if ! grep -q 'snippets/godot.conf' "$SITE"; then
+  sed -i "${ANCHOR}a\\    include snippets/godot.conf;" "$SITE"
+fi
+if ! grep -q 'snippets/rtc.conf' "$SITE"; then
+  sed -i "${ANCHOR}a\\    include snippets/rtc.conf;" "$SITE"
+fi
+mkdir -p /var/www/smash /var/www/smash-godot
 
-# 3. systemd — load + enable + start the service.
+# 3. systemd — load + enable + start the services.
 systemctl daemon-reload
 systemctl enable --now matchbox
+systemctl enable --now smash-signaling
+systemctl restart smash-signaling   # pick up a freshly rebuilt binary
 
 # 4. validate nginx, then reload.
 nginx -t
 systemctl reload nginx
 
-echo "OK: matchbox on 127.0.0.1:3536 (wss://hafley.codes/ws), game served at /play/ from /var/www/smash"
+echo "OK: matchbox :3536 (wss /ws), smash-signaling :3537 (wss /rtc), canvas /play/, Godot /game/"
