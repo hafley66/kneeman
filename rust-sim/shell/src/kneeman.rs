@@ -388,10 +388,13 @@ impl INode2D for KneeMan {
         // Nametags: world-space labels that hover over each head, wearing the player's color.
         let tag_p1 = make_tag(&id.name, id.color);
         let tag_p2 = make_tag(&p2_identity().name, p2_identity().color);
+        // Add as world-space siblings under our parent. Deferred: during ready() the parent is still
+        // "busy setting up children", so an immediate add_child is rejected (re-entrant child setup).
+        // call_deferred runs it the moment setup finishes, before the first frame draws.
         if let Some(mut parent) = self.base().get_parent() {
-            parent.add_child(&p2);
-            parent.add_child(&tag_p1);
-            parent.add_child(&tag_p2);
+            parent.call_deferred("add_child", &[p2.to_variant()]);
+            parent.call_deferred("add_child", &[tag_p1.to_variant()]);
+            parent.call_deferred("add_child", &[tag_p2.to_variant()]);
         }
         self.p2 = Some(p2);
         self.tag_p1 = Some(tag_p1);
