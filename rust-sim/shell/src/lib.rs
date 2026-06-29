@@ -1,9 +1,11 @@
 use godot::prelude::*;
 
-mod debug_ui; // egui UI layer
+#[cfg(not(target_arch = "wasm32"))]
+mod debug_ui; // egui UI layer (desktop only; egui/gdext-egui don't build for wasm)
 mod kneeman; // impure shell: input -> step -> publish -> render
 mod grid; // training-room grid backdrop
-mod theme; // egui stylesheet + components
+#[cfg(not(target_arch = "wasm32"))]
+mod theme; // egui stylesheet + components (desktop only)
 
 // Pure sim now lives in its own crate (core/). Re-export under `sim` so the shell modules
 // keep referring to `crate::sim::*` unchanged. `gv()` is the glam->godot vector boundary.

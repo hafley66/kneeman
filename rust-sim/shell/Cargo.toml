@@ -9,9 +9,16 @@ crate-type = ["cdylib"]
 
 [dependencies]
 smash_core = { path = "../core" }
-egui = "0.33"
 futures-signals = "0.3"
+# godot-rust (gdext). Desktop uses the prebuilt API; wasm adds the web-export features below.
+godot = "0.4"
+
+# Desktop-only: egui debug overlay. gdext-egui pulls `open`, which doesn't build for wasm.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+egui = "0.33"
 gdext-egui = "0.4"
-# godot-rust (gdext). Pin to whatever is current when you build; API shifts across minors.
-# experimental-wasm(+nothreads) enables the Godot web export path (no-op on desktop). See GODOT_WEB.md.
-godot = { version = "0.4", features = ["experimental-wasm", "experimental-wasm-nothreads"] }
+
+# Web export (wasm32-unknown-emscripten): regenerate the API against the Godot binary (api-custom,
+# fixes the 32-bit offset overflow), enable the experimental wasm path + lazy function tables.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+godot = { version = "0.4", features = ["api-custom", "experimental-wasm", "lazy-function-tables"] }

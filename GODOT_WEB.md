@@ -89,30 +89,34 @@ Recommendation: Phase 1 first (get the game in the browser at all), then Phase 2
   `deploy/nginx/web.conf` -> replace with the Godot static host snippet.
 - Keep `smash_net` (the ggrs core is reused; only the matchbox transport module gets swapped).
 
-## Session status (left here for next pickup)
-- emsdk 3.1.74 + `wasm32-unknown-emscripten` target + nightly `rust-src`: installed.
-- `rust-sim/.cargo/config.toml` (emscripten link flags) + `shell/Cargo.toml` godot
-  `experimental-wasm,experimental-wasm-nothreads` features: added. Desktop build still green
-  (verified — both are no-ops off the wasm target).
-- `cargo +nightly build -p smash_sim --target wasm32-unknown-emscripten -Zbuild-std=std,panic_abort`
-  ATTEMPTED. Two concrete blockers hit (both must be fixed before an export is possible):
+## Phase 1 status — the gdext wasm cdylib BUILDS
 
-  1. **`gdext-egui` is not wasm-portable.** It pulls the `open` crate, which hard-errors:
-     `error: open is not supported on this platform`. The debug overlay (egui/gdext-egui) is
-     desktop-only. FIX: cfg-gate egui out of the wasm build — move `egui`, `gdext-egui`,
-     `futures-signals` and the `debug_ui` module behind `#[cfg(not(target_arch = "wasm32"))]`
-     (or a `desktop` feature that's default-on, off for web). The sim + renderer don't need egui.
+The blocker was version skew, not a wasm pointer-width bug. gdext 0.4.x is the **Godot 4.5** API
+level (gdext Changelog: 0.4.0 added 4.5; 0.5.0 added 4.6; 4.7 is newer still). Building against the
+Godot **4.7** binary made `api-custom` dump a 4.7 API that gdext 0.4.5 can't compile — first a
+codegen panic (`mode_flags ... can only replace int with enum`), then godot-core source mismatches
+(`&GString` vs `AsArg<StringName>`, `.ok_or_else` on a now-non-Option `get_root()`). Those are
+4.6/4.7 API changes; godot-core compiles its whole source against the dumped API, so the tail is
+unbounded — not worth hand-patching.
 
-  2. **`godot-ffi` const-eval overflows on 32-bit wasm.** The generated `gdextension_interface.rs`
-     computes struct field offsets that underflow on `wasm32` (32-bit pointers), e.g.
-     `attempt to compute 12_usize - 24_usize, which would overflow`, repeated across the interface.
-     This is a gdext-0.4 + wasm32 pointer-width issue in the bindings, independent of our code.
-     NEXT: check the godot-rust book's current "Export to web" page + gdext issue tracker for the
-     supported gdext/Godot/emscripten matrix; may need a newer gdext (git) or a specific
-     Godot-4.7 binding regen. This is the real gate — resolve before sinking more time into export
-     templates/preset (steps 4-6).
+Fix: **match the versions — build against Godot 4.5.** Done, and it compiles clean.
 
-Bottom line: Phase 1 is blocked on (1) a mechanical egui cfg-gate we control, and (2) a gdext/wasm32
-binding bug we don't. The matchbox/emscripten incompatibility (Phase 2) is unchanged. Until gdext
-web is unblocked, the working browser build remains the canvas client at `/play/` (frozen, not
-maintained per the latest call).
+Installed/configured (all verified):
+- emsdk 3.1.74, `wasm32-unknown-emscripten` target, nightly + `rust-src`.
+- Godot **4.5** standalone (do not disturb a system 4.7): binary + export templates.
+- `shell/Cargo.toml`: egui/gdext-egui are `cfg(not(target_arch = "wasm32"))` (gdext-egui pulls the
+  non-wasm `open` crate); the wasm target adds godot features `api-custom, experimental-wasm,
+  lazy-function-tables`. `debug_ui`/`theme` modules cfg-gated off wasm in `shell/src/lib.rs`.
+- `rust-sim/.cargo/config.toml`: emscripten link flags from the godot-rust web docs.
+
+Build (compiles clean → `target/wasm32-unknown-emscripten/debug/smash_sim.wasm`):
+```
+source ~/emsdk/emsdk_env.sh
+GODOT4_BIN="$HOME/godot45/Godot.app/Contents/MacOS/Godot" \
+  cargo +nightly build -p smash_sim -Zbuild-std --target wasm32-unknown-emscripten   # add --release
+```
+Desktop build stays green (gdext's prebuilt 4.5 API; runs under a 4.7 editor too, runtime ≥ api).
+
+Remaining to a playable export: add `web.debug.wasm32`/`web.release.wasm32` to `sim.gdextension`;
+install the 4.5 templates; add a Web export preset; export; host. Then Phase 2 (Godot WebRTC
+transport) for browser netplay.
