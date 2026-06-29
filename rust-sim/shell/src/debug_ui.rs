@@ -17,6 +17,7 @@ enum Tab {
     Feel,
     Net,
     Identity,
+    Gamepad,
 }
 
 /// Hosts the egui bridge and draws "our stuff" panel by reading/writing the KneeMan
@@ -139,6 +140,7 @@ fn draw_panel(
           ui.selectable_value(tab, Tab::Feel, "feel");
           ui.selectable_value(tab, Tab::Net, "net");
           ui.selectable_value(tab, Tab::Identity, "identity");
+          ui.selectable_value(tab, Tab::Gamepad, "pad");
       });
       ui.separator();
       egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
@@ -234,6 +236,9 @@ fn draw_panel(
         egui::CollapsingHeader::new("attack · dash").default_open(false).show(ui, |ui| {
             c |= attack_sliders(ui, &mut t.dash_attack);
         });
+        egui::CollapsingHeader::new("knockback").default_open(false).show(ui, |ui| {
+            c |= slider(ui, &mut t.di_max_angle, 0.0..=30.0, "di_max_angle° (survival DI)");
+        });
         egui::CollapsingHeader::new("frames").default_open(false).show(ui, |ui| {
             c |= islider(ui, &mut t.jumpsquat, 1..=10, "jumpsquat");
             c |= islider(ui, &mut t.landing_lag, 1..=20, "landing_lag");
@@ -267,6 +272,7 @@ fn draw_panel(
         }
         Tab::Net => net_card(ui, &net_cell.get()),
         Tab::Identity => identity_card(ui, identity_cell),
+        Tab::Gamepad => gamepad_card(ui),
         }
 
         ui.add_space(8.0);
@@ -340,6 +346,96 @@ fn identity_card(ui: &mut egui::Ui, cell: &Mutable<Identity>) {
     if changed {
         cell.set(id);
     }
+}
+
+/// Live controller readout: connected pad name, both sticks as dots in a gate, triggers as bars, and
+/// a pip per button lit when held (labeled with the action it drives). Reads Godot's Input singleton,
+/// which on web is fed by the browser Gamepad API through the SDL mapping DB. No pad showing usually
+/// means the browser hasn't seen input yet -- click the canvas and press a button.
+fn gamepad_card(ui: &mut egui::Ui) {
+    use godot::classes::Input;
+    use godot::global::{JoyAxis, JoyButton};
+    let mut input = Input::singleton();
+    let Some(dev) = input.get_connected_joypads().get(0) else {
+        theme::card(ui, |ui| {
+            ui.colored_label(theme::MUTED, "no controller detected");
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "pair the pad, click the game, then press any button \
+                 (browsers hide gamepads until they send input)",
+            )
+            .size(11.0)
+            .color(theme::MUTED),
+        );
+        return;
+    };
+    let dev = dev as i32; // Input methods take i32 device ids
+
+    theme::card(ui, |ui| {
+        theme::stat(ui, "device", input.get_joy_name(dev).to_string());
+    });
+    ui.add_space(6.0);
+
+    ui.horizontal(|ui| {
+        stick_box(ui, "L stick (move/DI)",
+            input.get_joy_axis(dev, JoyAxis::LEFT_X), input.get_joy_axis(dev, JoyAxis::LEFT_Y));
+        stick_box(ui, "R stick",
+            input.get_joy_axis(dev, JoyAxis::RIGHT_X), input.get_joy_axis(dev, JoyAxis::RIGHT_Y));
+    });
+    ui.add_space(6.0);
+
+    theme::card(ui, |ui| {
+        let lt = input.get_joy_axis(dev, JoyAxis::TRIGGER_LEFT).clamp(0.0, 1.0);
+        let rt = input.get_joy_axis(dev, JoyAxis::TRIGGER_RIGHT).clamp(0.0, 1.0);
+        ui.add(egui::ProgressBar::new(lt).desired_height(8.0).text("L2"));
+        ui.add(egui::ProgressBar::new(rt).desired_height(8.0).text("R2"));
+    });
+    ui.add_space(6.0);
+
+    // button = our action where one is bound (see project.godot [input]).
+    let pips = [
+        (JoyButton::A, "✕ jump"),
+        (JoyButton::X, "□ attack"),
+        (JoyButton::LEFT_SHOULDER, "L1 shield"),
+        (JoyButton::RIGHT_SHOULDER, "R1 shorthop"),
+        (JoyButton::BACK, "create · grab"),
+        (JoyButton::B, "○"),
+        (JoyButton::Y, "△"),
+        (JoyButton::START, "options"),
+        (JoyButton::DPAD_UP, "d-up"),
+        (JoyButton::DPAD_DOWN, "d-down"),
+        (JoyButton::DPAD_LEFT, "d-left"),
+        (JoyButton::DPAD_RIGHT, "d-right"),
+    ];
+    theme::card(ui, |ui| {
+        for (b, label) in pips {
+            let on = input.is_joy_button_pressed(dev, b);
+            ui.horizontal(|ui| {
+                let (resp, painter) = ui.allocate_painter(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                painter.circle_filled(resp.rect.center(), 5.0, if on { theme::ACCENT } else { theme::LINE });
+                ui.colored_label(if on { theme::ACCENT } else { theme::MUTED }, label);
+            });
+        }
+    });
+}
+
+/// One analog stick: a circular gate with crosshair and a dot at the stick position (-1..1 each axis).
+fn stick_box(ui: &mut egui::Ui, label: &str, x: f32, y: f32) {
+    ui.vertical(|ui| {
+        ui.colored_label(theme::MUTED, label);
+        let (resp, painter) = ui.allocate_painter(egui::vec2(72.0, 72.0), egui::Sense::hover());
+        let ctr = resp.rect.center();
+        let r = 28.0_f32;
+        let grid = egui::Stroke::new(1.0_f32, theme::LINE);
+        painter.circle_stroke(ctr, r, grid);
+        painter.line_segment([egui::pos2(ctr.x - r, ctr.y), egui::pos2(ctr.x + r, ctr.y)], grid);
+        painter.line_segment([egui::pos2(ctr.x, ctr.y - r), egui::pos2(ctr.x, ctr.y + r)], grid);
+        let p = egui::pos2(ctr.x + x.clamp(-1.0, 1.0) * r, ctr.y + y.clamp(-1.0, 1.0) * r);
+        painter.circle_filled(p, 4.0, theme::ACCENT);
+        ui.colored_label(theme::MUTED, format!("{x:+.2}, {y:+.2}"));
+    });
 }
 
 /// Live readout of the input buffer: what's queued, how long it stays valid, and the captured

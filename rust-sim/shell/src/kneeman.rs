@@ -171,7 +171,7 @@ const ROSTER: &[Character] = &[FROG, ZOMBIE];
 /// P1 default: the Kenney/PixelFrog ninja frog (32px strips).
 const FROG: Character = Character {
     dir: "pixelfrog/ninjafrog",
-    scale: 3.3, // 32px art -> ~105px tall
+    scale: 4.4, // 32px art -> ~140px tall, matching the ECB body
     offset_y: -12.0,
     sheet: Sheet::Strip { frame_px: 32.0 },
     clips: &[
@@ -192,7 +192,7 @@ const FROG: Character = Character {
 /// P2 default: the Kenney zombie (80x110 single-pose PNGs). Different silhouette from the frog.
 const ZOMBIE: Character = Character {
     dir: "kenney/zombie",
-    scale: 0.95, // 110px art -> ~105px tall
+    scale: 1.27, // 110px art -> ~140px tall, matching the ECB body
     offset_y: -55.0,
     sheet: Sheet::Poses { prefix: "zombie" },
     clips: &[
@@ -943,7 +943,7 @@ fn make_tag(name: &str, color: Color) -> Gd<Label> {
 
 /// Position a nametag above a fighter's feet position, centered on the body.
 fn place_tag(tag: &mut Gd<Label>, feet: sim::Vector2) {
-    const TAG_RISE: f32 = 132.0; // above the feet, clear of the ~105px-tall sprite's head
+    const TAG_RISE: f32 = 168.0; // above the feet, clear of the ~140px-tall sprite's head
     let half_w = tag.get_size().x * 0.5;
     let head = gv(feet) + Vector2::new(-half_w, -TAG_RISE);
     tag.set_global_position(head);

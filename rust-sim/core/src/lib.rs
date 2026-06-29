@@ -22,8 +22,9 @@ const FLOOR_RIGHT: f32 = 1050.0; // main platform = 900 wide, centered on x=600
 // Environment Collision Box: a diamond carried with the fighter, like classic platform fighters.
 // `pos` is the BOTTOM vertex (the feet); the other three verts sit a half-height up and to the
 // sides. The bottom vert lands on floors; the side verts collide with stage walls.
-pub const ECB_HALF_W: f32 = 24.0; // left/right vert offset from center (x)
-pub const ECB_HALF_H: f32 = 42.0; // top/bottom vert offset from center (y)
+pub const ECB_HALF_W: f32 = 38.0; // left/right vert offset from center (x)
+pub const ECB_HALF_H: f32 = 70.0; // top/bottom vert offset from center (y); body ~140px ≈ 3/4 the
+                                  // ground→side-platform gap (185px). Was 42 (jiggly-sized).
 
 /// The four ECB verts in WORLD space for a feet position, ordered [top, right, bottom, left].
 pub fn ecb_verts(feet: Vector2) -> [Vector2; 4] {
@@ -62,7 +63,7 @@ const WALK_THRESH: f32 = 0.25; // |stick| past this but under DASH = walk (needs
 const STOP_EPS: f32 = 1.0; // |vel.x| under this in a braking state snaps to 0
 const LEDGE_FALL_EPS: f32 = 150.0; // must be falling at least this fast to snap a ledge
 
-pub const DUMMY_R: f32 = 28.0;    // training dummy hurtbox radius (circle)
+pub const DUMMY_R: f32 = 48.0;    // body hurtbox radius (circle), scaled with the taller ECB
 const DUMMY_FRICTION: f32 = 1200.0; // px/s^2 the dummy's knockback slide bleeds
 const HITLAG_PER_DMG: f32 = 0.8;  // impact-freeze frames per point of damage
 
@@ -156,8 +157,8 @@ impl AttackData {
         startup: 3,
         active: 3,
         recovery: 9,
-        off: Vector2::new(40.0, -48.0),
-        r: 24.0,
+        off: Vector2::new(44.0, -64.0),
+        r: 32.0,
         damage: 3.0,
         kb_base: 320.0,
         kb_scale: 3.0,
@@ -167,8 +168,8 @@ impl AttackData {
         startup: 5,
         active: 9,
         recovery: 14,
-        off: Vector2::new(28.0, -48.0),
-        r: 34.0,
+        off: Vector2::new(26.0, -60.0), // centered on the taller body so a jump-in connects
+        r: 52.0,
         damage: 8.0,
         kb_base: 520.0,
         kb_scale: 4.2,
@@ -178,8 +179,8 @@ impl AttackData {
         startup: 10,
         active: 6,
         recovery: 18,
-        off: Vector2::new(10.0, 18.0), // hitbox below the feet (down + slightly forward)
-        r: 30.0,
+        off: Vector2::new(10.0, 24.0), // hitbox below the feet (down + slightly forward)
+        r: 40.0,
         damage: 11.0,
         kb_base: 460.0,
         kb_scale: 3.8,
@@ -189,8 +190,8 @@ impl AttackData {
         startup: 8,
         active: 4,
         recovery: 22, // long endlag — the commitment that pays for the forward lunge
-        off: Vector2::new(52.0, -44.0),
-        r: 30.0,
+        off: Vector2::new(60.0, -60.0),
+        r: 40.0,
         damage: 9.0,
         kb_base: 480.0,
         kb_scale: 3.6,
@@ -654,6 +655,7 @@ pub struct Tune {
     pub dash_attack: AttackData,
     pub dair_threshold: f32, // aim_y past this (and steeper than horizontal) picks dair over nair
     pub autohop_dmg: f32, // damage multiplier for auto-short-hop aerials (jump+attack macro)
+    pub di_max_angle: f32, // max degrees the victim's stick can rotate a launch trajectory (survival DI)
     // items (match settings, not character-derived)
     pub items_on: bool,           // master switch for item spawns
     pub item_spawn_interval: i64, // frames between spawn attempts (0 = off)
@@ -706,6 +708,7 @@ impl Tune {
             dash_attack: AttackData::DASH_ATTACK,
             dair_threshold: 0.5,
             autohop_dmg: 0.85, // Ultimate-ish 15% cut on the easy jump+attack aerial
+            di_max_angle: 18.0, // ~18 deg of trajectory DI, the survival-DI ceiling
             items_on: true,
             item_spawn_interval: 480, // ~8s between spawns
             laser: ItemConfig::LASER,
@@ -756,10 +759,13 @@ pub fn step(s: &SimState, inputs: [&InputFrame; 2], t: &Tune) -> SimState {
     let act1 = advance(&mut n.fighters[1], &items1, inputs[1], t);
     apply_act(&mut n, 0, act0, t);
     apply_act(&mut n, 1, act1, t);
-    // split the array so both fighters can be borrowed mutably at once
+    // split the array so both fighters can be borrowed mutably at once. The victim's stick this frame
+    // feeds trajectory DI, so each call passes the defender's aim.
+    let aim0 = Vector2::new(inputs[0].dir, inputs[0].aim_y);
+    let aim1 = Vector2::new(inputs[1].dir, inputs[1].aim_y);
     let (l, r) = n.fighters.split_at_mut(1);
-    resolve_combat(&mut l[0], &mut r[0], t); // p0 attacks p1
-    resolve_combat(&mut r[0], &mut l[0], t); // p1 attacks p0
+    resolve_combat(&mut l[0], &mut r[0], aim1, t); // p0 attacks p1 (victim p1 DIs)
+    resolve_combat(&mut r[0], &mut l[0], aim0, t); // p1 attacks p0 (victim p0 DIs)
 
     update_items(&mut n, t); // move bolts, follow held guns, resolve bolt hits
     n
@@ -1335,9 +1341,24 @@ fn spawn_x(x: f32) -> f32 {
     }
 }
 
+/// Trajectory DI: the victim's stick rotates a launch toward its component perpendicular to the
+/// knockback, up to `max_deg`. Speed is untouched -- only the angle -- so you can steer a launch
+/// toward the stage to live, but never cancel your own knockback. Pure, so it rolls back cleanly.
+fn apply_di(vel: Vector2, stick: Vector2, max_deg: f32) -> Vector2 {
+    let speed = vel.length();
+    if speed < 1.0 || stick.length() < 0.3 {
+        return vel; // no knockback worth steering, or stick inside the deadzone
+    }
+    let u = vel / speed; // unit trajectory
+    let s = stick.clamp_length_max(1.0);
+    let cross = (u.x * s.y - u.y * s.x).clamp(-1.0, 1.0); // signed perpendicular component
+    let (sin, cos) = (max_deg.to_radians() * cross).sin_cos();
+    Vector2::new(vel.x * cos - vel.y * sin, vel.x * sin + vel.y * cos)
+}
+
 /// Cross-fighter combat: `a`'s active hitbox vs `b`'s hurtbox (circle/circle), one hit per swing.
 /// On connect: damage + knockback + hitstun to `b`, impact freeze (hitlag) to BOTH (the hit "pop").
-fn resolve_combat(a: &mut Fighter, b: &mut Fighter, t: &Tune) {
+fn resolve_combat(a: &mut Fighter, b: &mut Fighter, b_aim: Vector2, t: &Tune) {
     let Some((hc, hr)) = active_hitbox(a, t) else { return };
     if a.attack_hit {
         return; // already connected this swing
@@ -1357,6 +1378,7 @@ fn resolve_combat(a: &mut Fighter, b: &mut Fighter, t: &Tune) {
     let speed = atk.kb_base + atk.kb_scale * b.damage; // knockback scales with accumulated %
     let ang = atk.kb_angle.to_radians();
     b.vel = Vector2::new(ang.cos() * a.facing, -ang.sin()) * speed; // launch away from attacker
+    b.vel = apply_di(b.vel, b_aim, t.di_max_angle); // victim angles the trajectory (survival DI)
     b.hitstun = (speed * 0.12) as i64; // stun scales with knockback
     let freeze = (atk.damage * HITLAG_PER_DMG) as i64 + 4; // both fighters pop on impact
     a.hitlag = freeze;
@@ -1664,5 +1686,30 @@ fn move_toward(from: f32, to: f32, delta: f32) -> f32 {
         to
     } else {
         from + (to - from).signum() * delta
+    }
+}
+
+#[cfg(test)]
+mod di_tests {
+    use super::*;
+
+    // Holding right while launched straight up should bend the trajectory toward +x by di_max_angle,
+    // leaving the speed untouched (survival DI steers the angle, never the magnitude).
+    #[test]
+    fn di_rotates_angle_keeps_speed() {
+        let up = Vector2::new(0.0, -100.0); // screen-up launch
+        let out = apply_di(up, Vector2::new(1.0, 0.0), 18.0);
+        assert!((out.length() - 100.0).abs() < 1e-3, "speed must be preserved");
+        assert!(out.x > 0.0, "stick right bends the launch toward +x");
+        let deg = (out.x).atan2(-out.y).to_degrees(); // angle off vertical
+        assert!((deg - 18.0).abs() < 0.5, "rotation should hit the 18 deg cap, got {deg}");
+    }
+
+    // Neutral stick (and stick inside the deadzone) leaves the trajectory alone.
+    #[test]
+    fn di_neutral_is_identity() {
+        let v = Vector2::new(40.0, -90.0);
+        assert_eq!(apply_di(v, Vector2::ZERO, 18.0), v);
+        assert_eq!(apply_di(v, Vector2::new(0.1, 0.1), 18.0), v); // below the 0.3 deadzone
     }
 }
