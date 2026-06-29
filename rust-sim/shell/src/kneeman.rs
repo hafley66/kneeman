@@ -645,9 +645,12 @@ impl KneeMan {
         InputFrame {
             dir,
             aim_y,
-            jump: input.is_action_just_pressed("ui_accept")
+            jump: input.is_action_just_pressed("jump")
+                || input.is_action_just_pressed("ui_accept")
                 || input.is_action_just_pressed("ui_up"),
-            jump_held: input.is_action_pressed("ui_accept") || input.is_action_pressed("ui_up"),
+            jump_held: input.is_action_pressed("jump")
+                || input.is_action_pressed("ui_accept")
+                || input.is_action_pressed("ui_up"),
             shorthop: input.is_action_just_pressed("shorthop"),
             shield_held: input.is_action_pressed("shield"),
             shield_pressed: input.is_action_just_pressed("shield"),
