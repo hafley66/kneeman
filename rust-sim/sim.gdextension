@@ -1,0 +1,17 @@
+; Tells Godot where to find the built native lib (== a .gdextension descriptor).
+; reloadable=true is the hot-reload switch that beat C# to the punch.
+
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.2
+reloadable = true
+
+[libraries]
+linux.debug.x86_64     = "res://rust-sim/target/debug/libsmash_sim.so"
+linux.release.x86_64   = "res://rust-sim/target/release/libsmash_sim.so"
+macos.debug            = "res://rust-sim/target/debug/libsmash_sim.dylib"
+macos.release          = "res://rust-sim/target/release/libsmash_sim.dylib"
+macos.debug.arm64      = "res://rust-sim/target/debug/libsmash_sim.dylib"
+macos.release.arm64    = "res://rust-sim/target/release/libsmash_sim.dylib"
+windows.debug.x86_64   = "res://rust-sim/target/debug/smash_sim.dll"
+windows.release.x86_64 = "res://rust-sim/target/release/smash_sim.dll"

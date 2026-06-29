@@ -1,0 +1,53 @@
+[gd_scene format=3]
+
+[node name="Game" type="Node2D"]
+
+[node name="Camera2D" type="Camera2D" parent="."]
+position = Vector2(600, 560)
+zoom = Vector2(1.2, 1.2)
+
+[node name="Grid" type="Grid" parent="."]
+
+[node name="Stage" type="Node2D" parent="."]
+
+[node name="Main" type="ColorRect" parent="Stage"]
+offset_left = 150.0
+offset_top = 760.0
+offset_right = 1050.0
+offset_bottom = 900.0
+color = Color(0.2, 0.2, 0.25, 1)
+
+[node name="PlatLeft" type="ColorRect" parent="Stage"]
+offset_left = 280.0
+offset_top = 575.0
+offset_right = 540.0
+offset_bottom = 593.0
+color = Color(0.28, 0.28, 0.34, 1)
+
+[node name="PlatRight" type="ColorRect" parent="Stage"]
+offset_left = 660.0
+offset_top = 575.0
+offset_right = 920.0
+offset_bottom = 593.0
+color = Color(0.28, 0.28, 0.34, 1)
+
+[node name="PlatTop" type="ColorRect" parent="Stage"]
+offset_left = 470.0
+offset_top = 410.0
+offset_right = 730.0
+offset_bottom = 428.0
+color = Color(0.28, 0.28, 0.34, 1)
+
+[node name="KneeMan" type="KneeMan" parent="."]
+position = Vector2(600, 250)
+
+[node name="Anim" type="AnimatedSprite2D" parent="KneeMan"]
+offset = Vector2(0, -55)
+
+[node name="Dummy" type="ColorRect" parent="."]
+offset_right = 50.0
+offset_bottom = 80.0
+color = Color(0.45, 0.45, 0.55, 1)
+
+[node name="DebugUi" type="DebugUi" parent="."]
+fighter_path = NodePath("../KneeMan")

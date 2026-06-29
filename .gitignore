@@ -1,0 +1,23 @@
+# --- build output ---
+rust-sim/target/
+.godot/
+/build/
+web/dist/
+web/target/
+
+# --- OS / editor ---
+.DS_Store
+
+# --- PRIVATE: never published to the public repo ---
+# Working notes + cross-session memory (kept local).
+AGENTS.md
+# Session transcripts.
+chat_log/
+# Reference / prior-art repos pulled as submodules. On disk, never committed.
+.ext/
+.gitmodules
+# CC0 test art lives on disk + is bundled into web builds locally; not in the source repo.
+assets/
+
+# old git history, backed up before the clean re-init
+.git-old/

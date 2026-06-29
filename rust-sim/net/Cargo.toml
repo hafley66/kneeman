@@ -1,0 +1,11 @@
+[package]
+name = "smash_net"
+version = "0.1.0"
+edition = "2021"
+
+# Rollback glue. ggrs drives the frame loop and calls smash_core::step. matchbox (the WebRTC
+# transport) is added in M3. No godot here. NetInput is the only thing sent over the wire.
+[dependencies]
+smash_core = { path = "../core" }
+ggrs = "0.13"
+serde = { version = "1", features = ["derive"] }

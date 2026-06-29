@@ -1,0 +1,16 @@
+[package]
+name = "smash_sim"
+version = "0.1.0"
+edition = "2021"
+
+# cdylib == the native module Godot loads over GDExtension (like a napi-rs addon).
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+smash_core = { path = "../core" }
+egui = "0.33"
+futures-signals = "0.3"
+gdext-egui = "0.4"
+# godot-rust (gdext). Pin to whatever is current when you build; API shifts across minors.
+godot = "0.4"

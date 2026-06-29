@@ -1,0 +1,13 @@
+[Unit]
+Description=matchbox WebRTC signaling server (platform-fighter netplay)
+After=network.target
+
+[Service]
+Type=simple
+# Bind loopback only; nginx terminates TLS and proxies wss://hafley.codes/ws -> here.
+ExecStart=/root/.cargo/bin/matchbox_server 127.0.0.1:3536
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
