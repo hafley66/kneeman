@@ -301,6 +301,7 @@ pub struct KneeMan {
     tag_p1: Option<Gd<Label>>,          // world-space nametag hovering over P1
     tag_p2: Option<Gd<Label>>,          // world-space nametag hovering over P2
     status: Option<Gd<Label>>,          // screen-space netplay status line (built in ready)
+    hud: [Option<Gd<Label>>; 2],        // bottom damage panel: each fighter's name + % (built in ready)
     netdbg: Mutable<NetDebug>,          // transport snapshot, read by the debug panel
     sig: SigCounts,                     // handshake-frame tallies feeding netdbg
     identity: Mutable<Identity>,        // local player name+color, edited by the panel, persisted
@@ -331,6 +332,7 @@ impl INode2D for KneeMan {
             tag_p1: None,
             tag_p2: None,
             status: None,
+            hud: [None, None],
             netdbg: Mutable::new(NetDebug::default()),
             sig: SigCounts::default(),
             identity: Mutable::new(Identity::default()),
@@ -419,9 +421,19 @@ impl INode2D for KneeMan {
         bg.set_content_margin_all(8.0);
         label.add_theme_stylebox_override("normal", &bg);
         layer.add_child(&label);
+
+        // Bottom damage panel: each fighter's name + %, wearing the player color. Same screen-pinned
+        // CanvasLayer. Positioned/filled every frame in `update_hud` (handles window resize).
+        let hud_p1 = make_hud_label(self.identity.get_cloned().color);
+        let hud_p2 = make_hud_label(p2_identity().color);
+        layer.add_child(&hud_p1);
+        layer.add_child(&hud_p2);
+        self.hud = [Some(hud_p1), Some(hud_p2)];
+
         self.base_mut().add_child(&layer);
         self.status = Some(label);
         self.update_status();
+        self.update_hud();
     }
 
     fn physics_process(&mut self, _delta: f64) {
@@ -437,6 +449,7 @@ impl INode2D for KneeMan {
             Phase::Running => self.step_net(),
         }
         self.update_status();
+        self.update_hud();
         self.publish_netdbg();
         self.sync_identity();
         self.place_tags();
@@ -901,6 +914,24 @@ impl KneeMan {
         }
     }
 
+    /// Bottom damage panel: name + % per fighter, P1 anchored bottom-left, P2 bottom-right. The %
+    /// tints from white toward red as damage climbs (the "about to die" read).
+    fn update_hud(&mut self) {
+        let s = self.state.get();
+        let names = [self.identity.get_cloned().name, p2_identity().name];
+        let view = self.base().get_viewport_rect().size;
+        for k in 0..2 {
+            let Some(mut l) = self.hud[k].clone() else { continue };
+            let pct = s.fighters[k].damage.round() as i32;
+            l.set_text(&format!("{}\n{pct}%", names[k]));
+            let danger = (s.fighters[k].damage / 150.0).clamp(0.0, 1.0);
+            l.add_theme_color_override("font_color", Color::from_rgb(1.0, 1.0 - danger, 1.0 - danger));
+            let y = view.y - 150.0;
+            let x = if k == 0 { 70.0 } else { view.x - 230.0 };
+            l.set_position(Vector2::new(x, y));
+        }
+    }
+
     /// Drive the P1 sprite: clip for the state, flip by facing, and wear the player's color (green
     /// while intangible — the universal "you can't be hit" read).
     fn render_anim(&mut self, f: &Fighter) {
@@ -977,6 +1008,23 @@ fn make_tag(name: &str, color: Color, font_px: i32) -> Gd<Label> {
     l.add_theme_constant_override("outline_size", 6);
     l.add_theme_color_override("font_outline_color", Color::from_rgba(0.05, 0.06, 0.10, 0.92));
     l.set_z_index(100); // above the sprites
+    l
+}
+
+/// A bottom-HUD damage label: big, outlined, on a dark chip so the % reads over the white stage.
+/// Color + text are refreshed every frame in `update_hud`.
+fn make_hud_label(color: Color) -> Gd<Label> {
+    let mut l = Label::new_alloc();
+    l.add_theme_font_size_override("font_size", 38);
+    l.add_theme_color_override("font_color", color);
+    l.add_theme_constant_override("outline_size", 8);
+    l.add_theme_color_override("font_outline_color", Color::from_rgba(0.04, 0.05, 0.09, 0.95));
+    let mut bg = godot::classes::StyleBoxFlat::new_gd();
+    bg.set_bg_color(Color::from_rgba(0.07, 0.09, 0.14, 0.80));
+    bg.set_corner_radius_all(8);
+    bg.set_content_margin_all(10.0);
+    l.add_theme_stylebox_override("normal", &bg);
+    l.set_z_index(100);
     l
 }
 

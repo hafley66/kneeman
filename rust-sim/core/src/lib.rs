@@ -1824,9 +1824,12 @@ fn try_special(n: &mut Fighter) -> bool {
 /// run by whether we're airborne (`ground_plat < 0`). Up-B ends in Helpless if it finishes in the air.
 fn run_special(n: &mut Fighter, slot: usize, i: &InputFrame, t: &Tune) {
     let m = t.specials[slot];
-    if n.frame == m.hit.startup {
+    // Up-B lifts off on frame 0 (instant recovery, no ground-snap); the rest burst at the active
+    // window. The hitbox window (startup..) is independent of this movement timing.
+    let launch_frame = if m.kind == SpecialKind::Rise { 0 } else { m.hit.startup };
+    if n.frame == launch_frame {
         match m.kind {
-            SpecialKind::Punch => n.vel.x = 0.0,
+            SpecialKind::Punch => n.vel.x = 0.0, // planted; vertical handled below (hover if aerial)
             SpecialKind::Lunge => {
                 n.vel = Vector2::new(n.facing * m.move_x, m.move_y);
                 n.ground_plat = -1;
@@ -1840,11 +1843,19 @@ fn run_special(n: &mut Fighter, slot: usize, i: &InputFrame, t: &Tune) {
         }
     }
     if n.ground_plat < 0 {
-        // airborne: a little drift, gravity, terminal fall
-        n.vel.x = move_toward(n.vel.x, i.dir * t.air_speed * 0.6, t.air_accel * DT);
-        n.vel.y += t.gravity * DT;
-        if n.vel.y > t.max_fall {
-            n.vel.y = t.max_fall;
+        match m.kind {
+            // aerial neutral-B HOVERS in place (no snap-to-ground): bleed horizontal, almost no fall.
+            SpecialKind::Punch => {
+                n.vel.x = move_toward(n.vel.x, 0.0, t.air_friction * DT);
+                n.vel.y = move_toward(n.vel.y, 0.0, t.gravity * 0.5 * DT);
+            }
+            _ => {
+                n.vel.x = move_toward(n.vel.x, i.dir * t.air_speed * 0.6, t.air_accel * DT);
+                n.vel.y += t.gravity * DT;
+                if n.vel.y > t.max_fall {
+                    n.vel.y = t.max_fall;
+                }
+            }
         }
     } else {
         // grounded: bleed horizontal to a planted stop
