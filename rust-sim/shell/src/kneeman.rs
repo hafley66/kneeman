@@ -615,17 +615,43 @@ impl KneeMan {
     /// Sample the keyboard into the engine-agnostic `InputFrame`. Associated (no `self`) so the
     /// netplay loop can call it while a session is borrowed.
     fn sample_input() -> InputFrame {
-        let input = Input::singleton();
+        use godot::global::{JoyAxis, JoyButton};
+        let mut input = Input::singleton();
+        // Keyboard movement (the default ui_* actions carry the arrow keys).
+        let mut dir = input.get_axis("ui_left", "ui_right");
+        let mut aim_y = input.get_axis("ui_up", "ui_down"); // -1 up .. +1 down
+        let mut pad_down = false;
+        // Web: the default ui_* movement actions don't carry the pad's stick/dpad, so read the first
+        // connected joypad directly and merge it in (keyboard still works; pad wins when held).
+        if let Some(dev) = input.get_connected_joypads().get(0) {
+            let dev = dev as i32;
+            let dz = 0.2;
+            let sx = input.get_joy_axis(dev, JoyAxis::LEFT_X);
+            let sy = input.get_joy_axis(dev, JoyAxis::LEFT_Y);
+            let dpx = input.is_joy_button_pressed(dev, JoyButton::DPAD_RIGHT) as i32 as f32
+                - input.is_joy_button_pressed(dev, JoyButton::DPAD_LEFT) as i32 as f32;
+            let dpy = input.is_joy_button_pressed(dev, JoyButton::DPAD_DOWN) as i32 as f32
+                - input.is_joy_button_pressed(dev, JoyButton::DPAD_UP) as i32 as f32;
+            let px = if dpx != 0.0 { dpx } else if sx.abs() > dz { sx } else { 0.0 };
+            let py = if dpy != 0.0 { dpy } else if sy.abs() > dz { sy } else { 0.0 };
+            if dir == 0.0 {
+                dir = px;
+            }
+            if aim_y == 0.0 {
+                aim_y = py;
+            }
+            pad_down = py > 0.4;
+        }
         InputFrame {
-            dir: input.get_axis("ui_left", "ui_right"),
-            aim_y: input.get_axis("ui_up", "ui_down"), // -1 up .. +1 down
+            dir,
+            aim_y,
             jump: input.is_action_just_pressed("ui_accept")
                 || input.is_action_just_pressed("ui_up"),
             jump_held: input.is_action_pressed("ui_accept") || input.is_action_pressed("ui_up"),
             shorthop: input.is_action_just_pressed("shorthop"),
             shield_held: input.is_action_pressed("shield"),
             shield_pressed: input.is_action_just_pressed("shield"),
-            down: input.is_action_pressed("ui_down"),
+            down: input.is_action_pressed("ui_down") || pad_down,
             down_pressed: input.is_action_just_pressed("ui_down"),
             attack: input.is_action_just_pressed("attack"),
             attack_held: input.is_action_pressed("attack"),
