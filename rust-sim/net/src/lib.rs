@@ -28,6 +28,7 @@ bitflags! {
         const ATTACK         = 1 << 7;
         const GRAB           = 1 << 8;
         const ATTACK_HELD    = 1 << 9;
+        const SPECIAL        = 1 << 10;
     }
 }
 
@@ -60,6 +61,7 @@ pub fn encode(i: &InputFrame) -> NetInput {
     b.set(Buttons::ATTACK, i.attack);
     b.set(Buttons::GRAB, i.grab);
     b.set(Buttons::ATTACK_HELD, i.attack_held);
+    b.set(Buttons::SPECIAL, i.special);
     NetInput { buttons: b, stick_x: q(i.dir), stick_y: q(i.aim_y) }
 }
 
@@ -79,6 +81,7 @@ pub fn decode(n: NetInput) -> InputFrame {
         attack: b.contains(Buttons::ATTACK),
         attack_held: b.contains(Buttons::ATTACK_HELD),
         grab: b.contains(Buttons::GRAB),
+        special: b.contains(Buttons::SPECIAL),
     }
 }
 
@@ -318,7 +321,7 @@ mod tests {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let r = (*seed >> 33) as u32;
         NetInput {
-            buttons: Buttons::from_bits_truncate((r & 0x3ff) as u16), // 10 button bits now
+            buttons: Buttons::from_bits_truncate((r & 0x7ff) as u16), // 11 button bits now
             stick_x: ((r >> 10) & 0xff) as i8,
             stick_y: ((r >> 18) & 0xff) as i8,
         }
@@ -357,11 +360,13 @@ mod tests {
             attack: true,
             attack_held: true,
             grab: true,
+            special: true,
         };
         let d = decode(encode(&i));
         assert_eq!(d.jump, i.jump);
         assert_eq!(d.attack, i.attack);
         assert_eq!(d.grab, i.grab);
+        assert_eq!(d.special, i.special);
         assert_eq!(d.shield_held, i.shield_held);
         assert_eq!(d.down, i.down);
         assert!((d.dir - 1.0).abs() < 0.02);

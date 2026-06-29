@@ -237,6 +237,17 @@ fn draw_panel(
         egui::CollapsingHeader::new("attack · dash").default_open(false).show(ui, |ui| {
             c |= attack_sliders(ui, &mut t.dash_attack);
         });
+        for (idx, label) in [(0, "neutral-B"), (1, "side-B"), (2, "up-B"), (3, "down-B")] {
+            egui::CollapsingHeader::new(format!("special · {label}")).default_open(false).show(
+                ui,
+                |ui| {
+                    let m = &mut t.specials[idx];
+                    c |= slider(ui, &mut m.move_x, -1500.0..=1500.0, "move_x (forward)");
+                    c |= slider(ui, &mut m.move_y, -2500.0..=1500.0, "move_y (neg=up)");
+                    c |= attack_sliders(ui, &mut m.hit);
+                },
+            );
+        }
         egui::CollapsingHeader::new("knockback").default_open(false).show(ui, |ui| {
             c |= slider(ui, &mut t.di_max_angle, 0.0..=30.0, "di_max_angle° (survival DI)");
         });

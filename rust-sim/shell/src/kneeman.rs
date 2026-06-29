@@ -630,6 +630,7 @@ impl KneeMan {
             attack: input.is_action_just_pressed("attack"),
             attack_held: input.is_action_pressed("attack"),
             grab: input.is_action_just_pressed("grab"),
+            special: input.is_action_just_pressed("special"),
         }
     }
 
@@ -981,6 +982,9 @@ fn clip_for(f: &Fighter) -> &'static str {
         Nair => "nair",
         Dair => "fall",
         DashAttack => "run",
+        SpecialN | SpecialS | SpecialD => "jab", // reuse the swing pose until specials get art
+        SpecialU => "jump",
+        Helpless => "fall",
     }
 }
 

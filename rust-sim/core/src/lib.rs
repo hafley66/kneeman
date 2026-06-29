@@ -111,6 +111,38 @@ pub enum CharState {
     Nair,      // neutral aerial
     Dair,      // down aerial: steep spike, drives the opponent down
     DashAttack,// attack out of dash/run: lunges forward, keeps momentum
+    SpecialN,  // neutral-B
+    SpecialS,  // side-B
+    SpecialU,  // up-B (recovery; ends in Helpless if it finishes airborne)
+    SpecialD,  // down-B
+    Helpless,  // special-fall after an up-B: drift only, no actions until you land/ledge
+}
+
+/// Special states map to a slot in `Tune.specials` (the seed for swappable move loadouts).
+fn special_slot(st: CharState) -> Option<usize> {
+    match st {
+        CharState::SpecialN => Some(0),
+        CharState::SpecialS => Some(1),
+        CharState::SpecialU => Some(2),
+        CharState::SpecialD => Some(3),
+        _ => None,
+    }
+}
+fn is_special(st: CharState) -> bool {
+    special_slot(st).is_some()
+}
+
+/// Which special the stick selects at the press: up / down / side / neutral.
+fn special_dir(aim: Vector2) -> usize {
+    if aim.y <= -0.5 {
+        2 // up
+    } else if aim.y >= 0.5 {
+        3 // down
+    } else if aim.x.abs() >= 0.5 {
+        1 // side
+    } else {
+        0 // neutral
+    }
 }
 
 /// The "next action" a fighter's state machine emits each frame: a pure descriptor of an effect it
@@ -125,7 +157,10 @@ pub enum Act {
 }
 
 fn airborne(st: CharState) -> bool {
-    matches!(st, CharState::Air | CharState::AirDodge | CharState::Nair | CharState::Dair)
+    matches!(
+        st,
+        CharState::Air | CharState::AirDodge | CharState::Nair | CharState::Dair | CharState::Helpless
+    )
 }
 
 fn is_ledge(st: CharState) -> bool {
@@ -134,7 +169,7 @@ fn is_ledge(st: CharState) -> bool {
 
 /// One attack's frame data + hitbox + knockback, in pixel space (prototype values; tune freely).
 /// The hitbox is a circle offset from the fighter (x flipped by facing); active only in its window.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 pub struct AttackData {
     pub startup: i64,  // wind-up frames before the hitbox turns on
     pub active: i64,   // frames the hitbox is live
@@ -239,13 +274,100 @@ impl ItemConfig {
 }
 
 /// The (live) attack definition for a state, if it is one.
+/// How a special moves the fighter while it runs. The hitbox/frames/knockback live in `hit`
+/// (reuses the whole attack pipeline: `attack_for` -> `active_hitbox` -> `resolve_combat`).
+/// This is the seed for swappable move loadouts: a character's 4 B-slots are just `SpecialMove`s.
+#[derive(Copy, Clone, PartialEq)]
+pub enum SpecialKind {
+    Punch, // planted heavy hit (neutral-B): brakes to a stop, no travel
+    Lunge, // forward burst (side-B)
+    Rise,  // upward recovery burst (up-B); ends in Helpless if still airborne
+    Fall,  // downward drive (down-B)
+}
+
+#[derive(Copy, Clone, PartialEq)]
+pub struct SpecialMove {
+    pub kind: SpecialKind,
+    pub hit: AttackData, // frames + hitbox + knockback
+    pub move_x: f32,     // forward-relative horizontal burst at the active window (px/s)
+    pub move_y: f32,     // vertical burst (negative = up) at the active window (px/s)
+}
+
+impl SpecialMove {
+    // Default kit (Falcon-ish): heavy neutral-B punch, a side lunge, a rising recovery, a down drive.
+    const PUNCH: Self = Self {
+        kind: SpecialKind::Punch,
+        hit: AttackData {
+            startup: 14,
+            active: 4,
+            recovery: 26,
+            off: Vector2::new(58.0, -60.0),
+            r: 46.0,
+            damage: 22.0,
+            kb_base: 900.0,
+            kb_scale: 5.0,
+            kb_angle: 38.0,
+        },
+        move_x: 0.0,
+        move_y: 0.0,
+    };
+    const LUNGE: Self = Self {
+        kind: SpecialKind::Lunge,
+        hit: AttackData {
+            startup: 8,
+            active: 6,
+            recovery: 22,
+            off: Vector2::new(60.0, -58.0),
+            r: 42.0,
+            damage: 9.0,
+            kb_base: 520.0,
+            kb_scale: 3.6,
+            kb_angle: 55.0,
+        },
+        move_x: 900.0,
+        move_y: -120.0,
+    };
+    const RISE: Self = Self {
+        kind: SpecialKind::Rise,
+        hit: AttackData {
+            startup: 6,
+            active: 8,
+            recovery: 22,
+            off: Vector2::new(20.0, -90.0),
+            r: 44.0,
+            damage: 7.0,
+            kb_base: 480.0,
+            kb_scale: 3.0,
+            kb_angle: 80.0,
+        },
+        move_x: 380.0,
+        move_y: -1500.0,
+    };
+    const DROP: Self = Self {
+        kind: SpecialKind::Fall,
+        hit: AttackData {
+            startup: 8,
+            active: 10,
+            recovery: 18,
+            off: Vector2::new(24.0, 10.0),
+            r: 44.0,
+            damage: 10.0,
+            kb_base: 460.0,
+            kb_scale: 3.4,
+            kb_angle: -68.0, // downward: a spike
+        },
+        move_x: 220.0,
+        move_y: 700.0,
+    };
+}
+
 pub fn attack_for(t: &Tune, st: CharState) -> Option<AttackData> {
     match st {
         CharState::Jab => Some(t.jab),
         CharState::Nair => Some(t.nair),
         CharState::Dair => Some(t.dair),
         CharState::DashAttack => Some(t.dash_attack),
-        _ => None,
+        _ => special_slot(st).map(|s| t.specials[s].hit),
     }
 }
 
@@ -293,6 +415,7 @@ pub enum Action {
     Aerial,
     Attack,
     Grab,
+    Special,
 }
 
 impl Action {
@@ -306,6 +429,7 @@ impl Action {
             Action::Aerial => "AERIAL",
             Action::Attack => "ATTACK",
             Action::Grab => "GRAB",
+            Action::Special => "SPECIAL",
         }
     }
 
@@ -316,7 +440,8 @@ impl Action {
             | Action::ShortHop
             | Action::AirDodge
             | Action::Aerial
-            | Action::Attack => t.buffer_frames,
+            | Action::Attack
+            | Action::Special => t.buffer_frames,
         }
     }
 }
@@ -332,8 +457,9 @@ enum Lane {
     Aerial,
     Attack,
     Grab,
+    Special,
 }
-const N_LANE: usize = 4;
+const N_LANE: usize = 5;
 
 /// One lane's pending action. `timer == 0` (or `action == None`) means empty; while live, `aim` is
 /// the stick captured at the press and, on the movement lane, refreshed within the window — the
@@ -508,6 +634,11 @@ impl Fighter {
             CharState::Nair => "NAIR",
             CharState::Dair => "DAIR",
             CharState::DashAttack => "DASHATK",
+            CharState::SpecialN => "SPECIAL_N",
+            CharState::SpecialS => "SPECIAL_S",
+            CharState::SpecialU => "SPECIAL_U",
+            CharState::SpecialD => "SPECIAL_D",
+            CharState::Helpless => "HELPLESS",
         }
     }
 }
@@ -659,6 +790,7 @@ pub struct Tune {
     pub autohop_dmg: f32, // damage multiplier for auto-short-hop aerials (jump+attack macro)
     pub di_max_angle: f32, // max degrees the victim's stick can rotate a launch trajectory (survival DI)
     pub coyote_frames: i64, // grace window after walking off an edge to still get a full grounded jump
+    pub specials: [SpecialMove; 4], // B-move loadout, indexed by special_slot (N/Side/Up/Down)
     // items (match settings, not character-derived)
     pub items_on: bool,           // master switch for item spawns
     pub item_spawn_interval: i64, // frames between spawn attempts (0 = off)
@@ -713,6 +845,7 @@ impl Tune {
             autohop_dmg: 0.85, // Ultimate-ish 15% cut on the easy jump+attack aerial
             di_max_angle: 18.0, // ~18 deg of trajectory DI, the survival-DI ceiling
             coyote_frames: 9, // walk off the lip and you keep your real jump for ~9f (forgiving edge grace)
+            specials: [SpecialMove::PUNCH, SpecialMove::LUNGE, SpecialMove::RISE, SpecialMove::DROP],
             items_on: true,
             item_spawn_interval: 480, // ~8s between spawns
             laser: ItemConfig::LASER,
@@ -742,6 +875,7 @@ pub struct InputFrame {
     pub attack: bool,        // attack pressed THIS frame (jab / aerial / pickup / fire)
     pub attack_held: bool,   // attack currently held (full-auto gun fire)
     pub grab: bool,          // grab pressed THIS frame (drop a held item)
+    pub special: bool,       // special (B) pressed THIS frame; stick at press picks N/Side/Up/Down
 }
 
 /// PURE scan step: (state, input, tune) -> next state.
@@ -847,6 +981,9 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
     if i.grab {
         n.record(Lane::Grab, Action::Grab, aim, t);
     }
+    if i.special {
+        n.record(Lane::Special, Action::Special, aim, t);
+    }
     if i.shorthop {
         n.record(Lane::Movement, Action::ShortHop, aim, t);
     } else if i.jump {
@@ -891,7 +1028,9 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
         }
     }
 
-    match n.state {
+    // match on a Copy of the state so arm guards (e.g. try_special) can mutate `n`.
+    let cur_state = n.state;
+    match cur_state {
         CharState::Stand => {
             if !try_ground_action(&mut n, i, atk) {
                 if i.down {
@@ -1071,6 +1210,9 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
                 }
             }
         }
+        CharState::Air if try_special(&mut n) => {
+            // entered a special from the air; the SpecialX arm runs from frame 0 next tick
+        }
         CharState::Air => {
             let want_dodge = n.live(Lane::Movement) == Action::AirDodge;
             let buffered_aerial = n.live(Lane::Aerial) == Action::Aerial;
@@ -1227,6 +1369,18 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
                 n.autohop_aerial = false;
             }
         }
+        CharState::SpecialN => run_special(&mut n, 0, i, t),
+        CharState::SpecialS => run_special(&mut n, 1, i, t),
+        CharState::SpecialU => run_special(&mut n, 2, i, t),
+        CharState::SpecialD => run_special(&mut n, 3, i, t),
+        CharState::Helpless => {
+            // special-fall: drift only, gravity pulls, no actions until you land (integrate -> Landing)
+            air_drift(&mut n, i, t, sgn);
+            n.vel.y += t.gravity * DT;
+            if n.vel.y > t.max_fall {
+                n.vel.y = t.max_fall;
+            }
+        }
     }
 
     // ── integrate + collide ─────────────────────────────────────────────────
@@ -1287,6 +1441,32 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
                     }
                 }
             }
+        }
+    } else if is_special(n.state) {
+        // specials integrate by where they launched: aerial (ground_plat < 0) falls + lands on a
+        // platform top -> Landing; grounded stays pinned (the planted punch). Main floor + soft tops.
+        if n.ground_plat < 0 {
+            n.pos += n.vel * DT;
+            if n.vel.y >= 0.0 {
+                for (idx, p) in PLATFORMS.iter().enumerate() {
+                    let in_x = n.pos.x >= p.left && n.pos.x <= p.right;
+                    let crossed = prev_y <= p.y + 1.0 && n.pos.y >= p.y;
+                    if in_x && crossed && (p.solid || !i.down) {
+                        n.pos.y = p.y;
+                        n.vel.y = 0.0;
+                        n.air_jumps = t.max_air_jumps as u8;
+                        n.air_dodges = t.max_air_dodges as u8;
+                        n.ground_plat = idx as i32;
+                        n.state = CharState::Landing;
+                        break;
+                    }
+                }
+            }
+        } else {
+            let p = PLATFORMS[n.ground_plat.clamp(0, PLATFORMS.len() as i32 - 1) as usize];
+            n.pos.x += n.vel.x * DT;
+            n.pos.y = p.y;
+            n.vel.y = 0.0;
         }
     } else if is_ledge(n.state) {
         // hanging / climbing: position is fixed (set on grab and at climb end)
@@ -1618,9 +1798,75 @@ fn apply_bolt_hit(b: &mut Fighter, bolt: &Item, t: &Tune) {
     b.hitlag = (atk.damage * HITLAG_PER_DMG) as i64 + 2;
 }
 
+/// Consume a buffered special if one is live: pick the slot from the captured stick, enter the
+/// matching state, face the stick on a side-B. Available from every actionable ground/air state.
+fn try_special(n: &mut Fighter) -> bool {
+    if n.live(Lane::Special) != Action::Special {
+        return false;
+    }
+    let aim = n.buf[Lane::Special as usize].aim;
+    n.clear_lane(Lane::Special);
+    let slot = special_dir(aim);
+    if slot == 1 && aim.x != 0.0 {
+        n.facing = sign(aim.x); // side-B turns you toward the stick
+    }
+    n.state = match slot {
+        0 => CharState::SpecialN,
+        1 => CharState::SpecialS,
+        2 => CharState::SpecialU,
+        _ => CharState::SpecialD,
+    };
+    n.attack_hit = false;
+    true
+}
+
+/// Run one frame of a special. The launch burst lands when the active window opens; gravity/friction
+/// run by whether we're airborne (`ground_plat < 0`). Up-B ends in Helpless if it finishes in the air.
+fn run_special(n: &mut Fighter, slot: usize, i: &InputFrame, t: &Tune) {
+    let m = t.specials[slot];
+    if n.frame == m.hit.startup {
+        match m.kind {
+            SpecialKind::Punch => n.vel.x = 0.0,
+            SpecialKind::Lunge => {
+                n.vel = Vector2::new(n.facing * m.move_x, m.move_y);
+                n.ground_plat = -1;
+            }
+            SpecialKind::Rise => {
+                n.vel = Vector2::new(i.dir * m.move_x, m.move_y);
+                n.fast_falling = false;
+                n.ground_plat = -1;
+            }
+            SpecialKind::Fall => n.vel = Vector2::new(n.facing * m.move_x, m.move_y),
+        }
+    }
+    if n.ground_plat < 0 {
+        // airborne: a little drift, gravity, terminal fall
+        n.vel.x = move_toward(n.vel.x, i.dir * t.air_speed * 0.6, t.air_accel * DT);
+        n.vel.y += t.gravity * DT;
+        if n.vel.y > t.max_fall {
+            n.vel.y = t.max_fall;
+        }
+    } else {
+        // grounded: bleed horizontal to a planted stop
+        n.vel.x = move_toward(n.vel.x, 0.0, t.ground_friction * DT);
+    }
+    if n.frame >= m.hit.total() - 1 {
+        n.state = if m.kind == SpecialKind::Rise && n.ground_plat < 0 {
+            CharState::Helpless
+        } else if n.ground_plat < 0 {
+            CharState::Air
+        } else {
+            CharState::Stand
+        };
+    }
+}
+
 /// Jump / shield are available from every actionable ground state; factor them out.
 /// Jump comes from the buffer so a slightly-early press still fires.
 fn try_ground_action(n: &mut Fighter, i: &InputFrame, atk: bool) -> bool {
+    if try_special(n) {
+        return true;
+    }
     if let Some(full) = take_jump(n) {
         n.state = CharState::JumpSquat;
         n.full_hop = full;
@@ -1811,5 +2057,60 @@ mod di_tests {
             cur = step(&cur, [&left, &idle], &t);
         }
         assert!(cur.fighters[0].vel.x < 0.0, "sustained reversal eventually crosses 0 to the left");
+    }
+
+    // Pressing special with the stick up enters up-B, launches the fighter upward, and finishes in
+    // Helpless (special-fall) once it's airborne.
+    #[test]
+    fn up_special_rises_then_helpless() {
+        let t = Tune::from_char(&CharData::KNEEMAN);
+        let mut s = SimState::spawn();
+        let f = &mut s.fighters[0];
+        f.state = CharState::Stand;
+        f.ground_plat = 0;
+        f.pos = Vector2::new(600.0, GROUND_Y);
+        f.vel = Vector2::ZERO;
+        let up_b = InputFrame { special: true, aim_y: -1.0, ..Default::default() };
+        let hold = InputFrame { aim_y: -1.0, ..Default::default() };
+
+        // press frame enters the up-B state
+        let mut cur = step(&s, [&up_b, &Default::default()], &t);
+        assert_eq!(cur.fighters[0].state, CharState::SpecialU, "stick-up special = up-B");
+
+        // run it out: it leaves the ground rising, then becomes Helpless
+        let mut saw_rise = false;
+        let mut saw_helpless = false;
+        for _ in 0..60 {
+            cur = step(&cur, [&hold, &Default::default()], &t);
+            if cur.fighters[0].vel.y < 0.0 {
+                saw_rise = true;
+            }
+            if cur.fighters[0].state == CharState::Helpless {
+                saw_helpless = true;
+                break;
+            }
+        }
+        assert!(saw_rise, "up-B should drive the fighter upward");
+        assert!(saw_helpless, "up-B ends in Helpless while airborne");
+    }
+
+    // Neutral-B from standing enters the planted punch and stays grounded (no launch).
+    #[test]
+    fn neutral_special_is_grounded_punch() {
+        let t = Tune::from_char(&CharData::KNEEMAN);
+        let mut s = SimState::spawn();
+        let f = &mut s.fighters[0];
+        f.state = CharState::Stand;
+        f.ground_plat = 0;
+        f.pos = Vector2::new(600.0, GROUND_Y);
+        let nb = InputFrame { special: true, ..Default::default() };
+        let cur = step(&s, [&nb, &Default::default()], &t);
+        assert_eq!(cur.fighters[0].state, CharState::SpecialN, "neutral stick + special = neutral-B");
+        // a few frames in, still grounded and still in the punch (not launched into the air)
+        let mut c = cur;
+        for _ in 0..6 {
+            c = step(&c, [&Default::default(), &Default::default()], &t);
+        }
+        assert!(c.fighters[0].ground_plat >= 0, "neutral-B stays grounded");
     }
 }
