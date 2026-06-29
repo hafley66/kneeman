@@ -560,7 +560,7 @@ pub struct CharData {
     pub landing_lag: i64,     // est 4
     pub dash_window: i64,     // est 12 (dash-dance window; dash -> run after this)
     pub pivot_frames: i64,    // ult 1
-    pub dash_pivot_keep: f32, // 0..1 fraction of the dash burst kept when reversing (1=free flip)
+    pub dash_turn_accel: f32, // accel that fights your own momentum when reversing a dash/run/skid
     pub dashstop_friction: f32, // braking friction when a dash/run slides to a stop (Skid)
     pub spotdodge_frames: i64,// est 22
     pub roll_frames: i64,     // est 22
@@ -600,7 +600,7 @@ impl CharData {
         landing_lag: 4,
         dash_window: 12,
         pivot_frames: 1,
-        dash_pivot_keep: 0.35, // reversing kills most momentum; dash dancing now costs speed
+        dash_turn_accel: 0.50, // reversal brake: bleeds old momentum through 0, no instant flip
         dashstop_friction: 0.30, // grippier than ground_friction (0.22) so a dash brakes hard
         spotdodge_frames: 22,
         roll_frames: 22,
@@ -643,7 +643,7 @@ pub struct Tune {
     pub landing_lag: i64,
     pub dash_window: i64,
     pub pivot_frames: i64,
-    pub dash_pivot_keep: f32,
+    pub dash_turn_accel: f32,
     pub dashstop_friction: f32,
     pub spotdodge_frames: i64,
     pub roll_frames: i64,
@@ -697,7 +697,7 @@ impl Tune {
             landing_lag: c.landing_lag,
             dash_window: c.dash_window,
             pivot_frames: c.pivot_frames,
-            dash_pivot_keep: c.dash_pivot_keep, // unitless ratio, no space conversion
+            dash_turn_accel: acc(c.dash_turn_accel), // an acceleration, like ground_accel
             dashstop_friction: acc(c.dashstop_friction),
             spotdodge_frames: c.spotdodge_frames,
             roll_frames: c.roll_frames,
@@ -925,15 +925,18 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
         CharState::Dash => {
             if !try_ground_action(&mut n, i, atk) {
                 if sgn != 0.0 && sgn != n.facing && mag >= DASH_THRESH {
-                    // dash-dance: flip and re-burst, restart the dash window. The reversal keeps only
-                    // `dash_pivot_keep` of the burst (vs the full instant flip), so it costs momentum.
+                    // dash-dance: flip facing + restart the window, but DON'T teleport velocity.
+                    // Old momentum bleeds across 0 in the accel branch below, so a fast wrong-way
+                    // flick costs distance/time. No more instant free reversal.
                     n.facing = sgn;
-                    n.vel.x = sgn * t.dash_init * t.dash_pivot_keep;
                     force_reset = true;
                 } else if mag < WALK_THRESH {
                     n.state = CharState::Skid; // release mid-dash -> slide to a stop (dashstop)
                 } else {
-                    n.vel.x = move_toward(n.vel.x, n.facing * t.run_speed, t.ground_accel * DT);
+                    // fighting your own momentum (vel still points the old way) brakes at
+                    // dash_turn_accel; once vel agrees with facing, normal dash accel toward run.
+                    let a = if sign(n.vel.x) == -n.facing { t.dash_turn_accel } else { t.ground_accel };
+                    n.vel.x = move_toward(n.vel.x, n.facing * t.run_speed, a * DT);
                     if n.frame >= t.dash_window {
                         n.state = CharState::Run;
                     }
@@ -954,7 +957,9 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
             if !try_ground_action(&mut n, i, atk) && n.frame >= t.pivot_frames {
                 n.facing = -n.facing;
                 if sgn != 0.0 && mag >= DASH_THRESH {
-                    n.vel.x = n.facing * t.dash_init * t.dash_pivot_keep;
+                    // standing pivot already bled momentum to ~0 over pivot_frames, so this is a
+                    // fresh dash from rest: full initial burst, same as dashing from neutral.
+                    n.vel.x = n.facing * t.dash_init;
                     n.state = CharState::Dash;
                 } else if sgn != 0.0 && mag >= WALK_THRESH {
                     n.state = CharState::Walk;
@@ -966,8 +971,10 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], i: &InputFrame, t: &Tune)
         CharState::Skid => {
             if !try_ground_action(&mut n, i, atk) {
                 if sgn != 0.0 && sgn != n.facing && mag >= DASH_THRESH {
-                    n.facing = sgn; // pivot out of the skid
-                    n.vel.x = sgn * t.dash_init * t.dash_pivot_keep;
+                    // pivot out of the skid: flip into Dash and let it bleed the leftover braking
+                    // momentum through 0 at dash_turn_accel (no teleport). The state change resets
+                    // the dash window.
+                    n.facing = sgn;
                     n.state = CharState::Dash;
                 } else {
                     n.vel.x = move_toward(n.vel.x, 0.0, t.dashstop_friction * DT);
@@ -1776,5 +1783,33 @@ mod di_tests {
         let expect = t.airjump_v + t.gravity * DT;
         assert!((g.vel.y - expect).abs() < 1e-3, "no coyote -> air jump velocity");
         assert_eq!(g.air_jumps, 0, "air jump is consumed");
+    }
+
+    // Reversing a dash flips facing immediately but must NOT teleport velocity: the old momentum
+    // bleeds through 0 at dash_turn_accel over a few frames (continuous, Melee-style).
+    #[test]
+    fn dash_reversal_keeps_momentum_then_crosses() {
+        let t = Tune::from_char(&CharData::KNEEMAN);
+        let mut s = SimState::spawn();
+        let f = &mut s.fighters[0];
+        f.state = CharState::Dash;
+        f.facing = 1.0;
+        f.ground_plat = 0;
+        f.pos = Vector2::new(600.0, GROUND_Y); // mid main floor, won't walk off
+        f.vel = Vector2::new(t.run_speed, 0.0); // moving right at run speed
+        let left = InputFrame { dir: -1.0, ..Default::default() };
+        let idle = InputFrame::default();
+
+        // frame 1: facing flips, but velocity is still rightward (no instant reversal).
+        let s1 = step(&s, [&left, &idle], &t);
+        assert_eq!(s1.fighters[0].facing, -1.0, "facing flips on the reversal frame");
+        assert!(s1.fighters[0].vel.x > 0.0, "velocity must NOT teleport to the new direction");
+
+        // hold left a few more frames: momentum bleeds through 0 and goes negative.
+        let mut cur = s1;
+        for _ in 0..8 {
+            cur = step(&cur, [&left, &idle], &t);
+        }
+        assert!(cur.fighters[0].vel.x < 0.0, "sustained reversal eventually crosses 0 to the left");
     }
 }

@@ -196,7 +196,7 @@ fn draw_panel(
             c |= slider(ui, &mut t.ground_accel, 200.0..=8000.0, "ground_accel");
             c |= slider(ui, &mut t.ground_friction, 100.0..=8000.0, "ground_friction");
             c |= slider(ui, &mut t.dashstop_friction, 100.0..=8000.0, "dashstop_friction");
-            c |= slider(ui, &mut t.dash_pivot_keep, 0.0..=1.0, "dash_pivot_keep (1=free dashdance)");
+            c |= slider(ui, &mut t.dash_turn_accel, 100.0..=12000.0, "dash_turn_accel (reversal brake)");
         });
         egui::CollapsingHeader::new("jump").default_open(false).show(ui, |ui| {
             c |= slider(ui, &mut t.fullhop_v, -2500.0..=-100.0, "fullhop_v");
