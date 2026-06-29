@@ -1,0 +1,10 @@
+# Emscripten link flags for the Godot web export (Phase 1, see GODOT_WEB.md). Target-scoped, so
+# desktop builds (`just rust`) are untouched. Build with:
+#   source ~/emsdk/emsdk_env.sh
+#   cargo +nightly build -p smash_sim --target wasm32-unknown-emscripten -Zbuild-std=std,panic_abort
+[target.wasm32-unknown-emscripten]
+rustflags = [
+    "-Clink-args=-sSIDE_MODULE=2",
+    "-Ctarget-feature=-crt-static",
+    "-Zlink-native-libraries=no",
+]

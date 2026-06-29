@@ -13,4 +13,5 @@ egui = "0.33"
 futures-signals = "0.3"
 gdext-egui = "0.4"
 # godot-rust (gdext). Pin to whatever is current when you build; API shifts across minors.
-godot = "0.4"
+# experimental-wasm(+nothreads) enables the Godot web export path (no-op on desktop). See GODOT_WEB.md.
+godot = { version = "0.4", features = ["experimental-wasm", "experimental-wasm-nothreads"] }
