@@ -83,8 +83,16 @@ pub fn decode(n: NetInput) -> InputFrame {
     }
 }
 
+/// Peer address type. With the `matchbox` feature this is matchbox's `PeerId` (real P2P); without
+/// it (the SyncTest / default build) it is a plain `usize`, since SyncTest only uses local players
+/// and never touches the address.
+#[cfg(feature = "matchbox")]
+pub type PeerAddr = matchbox_socket::PeerId;
+#[cfg(not(feature = "matchbox"))]
+pub type PeerAddr = usize;
+
 /// ggrs session config: what travels (NetInput), what gets snapshotted (SimState), how peers are
-/// addressed (matchbox PeerId in M3 — for SyncTest the address type is unused, so any Hash+Eq).
+/// addressed (PeerAddr).
 #[derive(Debug)]
 pub struct GgrsConfig;
 
@@ -92,7 +100,7 @@ impl Config for GgrsConfig {
     type Input = NetInput;
     type InputPredictor = PredictRepeatLast;
     type State = SimState;
-    type Address = usize; // placeholder; becomes matchbox::PeerId for real P2P
+    type Address = PeerAddr;
 }
 
 /// Deterministic checksum over the whole state. ggrs compares these across rollbacks to catch
@@ -163,6 +171,77 @@ impl Game {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// matchbox transport (M3). Only the WebRTC glue. matchbox's own `ggrs` feature pins ggrs 0.11, so
+// we take its RAW channel and implement ggrs 0.13's `NonBlockingSocket` ourselves (the pattern the
+// ggrs 0.13 docs spell out). The browser app (web crate) drives the message loop + frame loop.
+// ---------------------------------------------------------------------------------------------
+#[cfg(feature = "matchbox")]
+pub mod transport {
+    use super::GgrsConfig;
+    use ggrs::{Message, NonBlockingSocket, SessionBuilder};
+    // Re-export the ggrs + matchbox types a frontend names, so it only needs to depend on smash_net.
+    pub use ggrs::{GgrsError, P2PSession, PlayerType, SessionState};
+    pub use matchbox_socket::{MessageLoopFuture, PeerId, PeerState, WebRtcChannel, WebRtcSocket};
+    use matchbox_socket::ChannelConfig;
+
+    /// Wraps a matchbox channel so ggrs can send/receive its `Message`s over WebRTC. bincode for
+    /// the wire; an unreliable+unordered channel (ggrs has its own reliability layer).
+    pub struct Socket(pub WebRtcChannel);
+
+    impl NonBlockingSocket<PeerId> for Socket {
+        fn send_to(&mut self, msg: &Message, addr: &PeerId) {
+            let bytes = bincode::serialize(msg).expect("serialize ggrs message");
+            self.0.send(bytes.into_boxed_slice(), *addr);
+        }
+
+        fn receive_all_messages(&mut self) -> Vec<(PeerId, Message)> {
+            self.0
+                .receive()
+                .into_iter()
+                .filter_map(|(peer, packet)| bincode::deserialize(&packet).ok().map(|m| (peer, m)))
+                .collect()
+        }
+    }
+
+    /// Open the matchbox socket for a room. Returns the socket (poll `update_peers` each frame) and
+    /// the message-loop future the caller MUST drive (`spawn_local` on wasm).
+    pub fn connect(room_url: &str) -> (WebRtcSocket, MessageLoopFuture) {
+        WebRtcSocket::builder(room_url)
+            .add_channel(ChannelConfig::unreliable())
+            .build()
+    }
+
+    /// Replicates matchbox's `players()` (which lives behind its ggrs-0.11 feature) for ggrs 0.13:
+    /// our id plus every connected peer, sorted for a stable handle order across both peers.
+    pub fn players(socket: &mut WebRtcSocket) -> Vec<PlayerType<PeerId>> {
+        let Some(me) = socket.id() else {
+            return vec![PlayerType::Local];
+        };
+        let mut ids: Vec<PeerId> = socket.connected_peers().chain(std::iter::once(me)).collect();
+        ids.sort();
+        ids.into_iter()
+            .map(|id| if id == me { PlayerType::Local } else { PlayerType::Remote(id) })
+            .collect()
+    }
+
+    /// Build the rollback session once `players()` reports everyone. Handle = index in the sorted
+    /// player list (identical on both peers). `input_delay` frames trade latency for fewer rollbacks.
+    pub fn start_session(
+        players: Vec<PlayerType<PeerId>>,
+        channel: WebRtcChannel,
+        input_delay: usize,
+    ) -> Result<P2PSession<GgrsConfig>, ggrs::GgrsError> {
+        let mut builder = SessionBuilder::<GgrsConfig>::new()
+            .with_num_players(players.len())?
+            .with_input_delay(input_delay);
+        for (handle, player) in players.into_iter().enumerate() {
+            builder = builder.add_player(player, handle)?;
+        }
+        builder.start_p2p_session(Socket(channel))
     }
 }
 

@@ -60,10 +60,11 @@ net-test:
 
 vps := "root@hafley.codes"
 
-# upload the nginx snippet + systemd unit, then (idempotently) install/start matchbox
+# upload the nginx snippets + systemd unit, then (idempotently) install/start matchbox + nginx
 vps-deploy:
     ssh {{vps}} 'mkdir -p /etc/nginx/snippets'
     scp deploy/nginx/matchbox-ws.conf {{vps}}:/etc/nginx/snippets/matchbox-ws.conf
+    scp deploy/nginx/web.conf {{vps}}:/etc/nginx/snippets/web.conf
     scp deploy/systemd/matchbox.service {{vps}}:/etc/systemd/system/matchbox.service
     ssh {{vps}} 'bash -s' < deploy/setup-vps.sh
 
@@ -74,6 +75,26 @@ vps-logs:
 # restart + status
 vps-restart:
     ssh {{vps}} 'systemctl restart matchbox && systemctl --no-pager status matchbox'
+
+# --- web frontend (wasm + canvas, via trunk) ---
+
+# signaling room URL baked into the wasm build (override: `just matchbox_url=... web`)
+matchbox_url := "wss://hafley.codes/ws?next=2"
+
+# build the browser client to web/dist (release, asset URLs under /play/)
+web:
+    cd {{proj}}/web && MATCHBOX_URL="{{matchbox_url}}" trunk build --release --public-url /play/
+
+# local dev: serve at http://localhost:8080 with autoreload. Open two tabs to pair.
+# Override the signaling target at runtime via the page query `?url=ws://localhost:3536/x?next=2`.
+web-dev:
+    cd {{proj}}/web && trunk serve --open
+
+# build + push web/dist to the VPS (/var/www/smash), then reload nginx. Run `vps-deploy` once first.
+web-deploy: web
+    rsync -az --delete {{proj}}/web/dist/ {{vps}}:/var/www/smash/
+    ssh {{vps}} 'nginx -t && systemctl reload nginx'
+    @echo "live at https://hafley.codes/play/"
 
 # --- submodules / assets ---
 

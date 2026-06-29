@@ -1,0 +1,41 @@
+[package]
+name = "smash_web"
+version = "0.1.0"
+edition = "2021"
+
+# Browser frontend. wasm + canvas: samples the keyboard, runs the ggrs rollback loop over a
+# matchbox WebRTC channel, renders the pure sim to a 2D canvas. Built by trunk (`just web`).
+# Standalone crate (NOT a rust-sim workspace member) so `just rust` stays lean.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+smash_core = { path = "../rust-sim/core" }
+smash_net = { path = "../rust-sim/net", features = ["wasm"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+log = "0.4"
+console_log = "1"
+console_error_panic_hook = "0.1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "Window",
+  "Document",
+  "Element",
+  "HtmlElement",
+  "HtmlCanvasElement",
+  "CanvasRenderingContext2d",
+  "KeyboardEvent",
+  "EventTarget",
+  "Location",
+  "UrlSearchParams",
+  "Performance",
+]
+
+# Smaller, faster wasm. trunk uses the release profile for `trunk build --release`.
+[profile.release]
+opt-level = "s"
+lto = true

@@ -3,9 +3,20 @@ name = "smash_net"
 version = "0.1.0"
 edition = "2021"
 
-# Rollback glue. ggrs drives the frame loop and calls smash_core::step. matchbox (the WebRTC
-# transport) is added in M3. No godot here. NetInput is the only thing sent over the wire.
+# Rollback glue. ggrs drives the frame loop and calls smash_core::step. The SyncTest (default
+# features) needs neither matchbox nor a browser. The `matchbox` feature adds the WebRTC P2P
+# transport: we use matchbox's RAW channel and implement ggrs 0.13's NonBlockingSocket ourselves
+# (matchbox's own `ggrs` feature is pinned to ggrs 0.11, so we skip it). `wasm` layers on the
+# browser bits ggrs needs. NetInput is the only thing sent over the wire.
 [dependencies]
 smash_core = { path = "../core" }
 ggrs = "0.13"
 serde = { version = "1", features = ["derive"] }
+matchbox_socket = { version = "0.14", optional = true }
+bincode = { version = "1.3", optional = true }
+
+[features]
+# WebRTC transport (works native + wasm at the type level; running native needs a runtime).
+matchbox = ["dep:matchbox_socket", "dep:bincode"]
+# Browser build: matchbox + the getrandom/instant shims ggrs needs under wasm.
+wasm = ["matchbox", "ggrs/wasm-bindgen"]

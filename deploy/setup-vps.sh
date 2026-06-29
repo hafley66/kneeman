@@ -13,11 +13,16 @@ if [ ! -x "$HOME/.cargo/bin/matchbox_server" ]; then
   cargo install matchbox_server
 fi
 
-# 2. nginx — include the /ws reverse-proxy snippet inside the 443 server block (once).
+# 2. nginx — include the /ws proxy + /play static snippets inside the 443 server block (once each).
 SITE=/etc/nginx/sites-enabled/default
+ANCHOR='/server_name www.hafley.codes hafley.codes; # managed by Certbot/'
 if ! grep -q 'snippets/matchbox-ws.conf' "$SITE"; then
-  sed -i '/server_name www.hafley.codes hafley.codes; # managed by Certbot/a\    include snippets/matchbox-ws.conf;' "$SITE"
+  sed -i "${ANCHOR}a\\    include snippets/matchbox-ws.conf;" "$SITE"
 fi
+if ! grep -q 'snippets/web.conf' "$SITE"; then
+  sed -i "${ANCHOR}a\\    include snippets/web.conf;" "$SITE"
+fi
+mkdir -p /var/www/smash
 
 # 3. systemd — load + enable + start the service.
 systemctl daemon-reload
@@ -27,4 +32,4 @@ systemctl enable --now matchbox
 nginx -t
 systemctl reload nginx
 
-echo "OK: matchbox on 127.0.0.1:3536, proxied at wss://hafley.codes/ws"
+echo "OK: matchbox on 127.0.0.1:3536 (wss://hafley.codes/ws), game served at /play/ from /var/www/smash"

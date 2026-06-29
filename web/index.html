@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>platform fighter — netplay</title>
+  <link data-trunk rel="rust" data-wasm-opt="s" />
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 12px;
+      background: #07080d; color: #c7d2e0;
+      font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    h1 { font-size: 16px; font-weight: 600; margin: 0; color: #9fb3c8; }
+    #game { background: #0d0f17; border: 1px solid #1d2740; border-radius: 6px; }
+    #status { white-space: pre-wrap; text-align: center; min-height: 2.5em; color: #6f7f99; }
+    #help { color: #4a5878; font-size: 12px; }
+    a { color: #5ad1ff; }
+  </style>
+</head>
+<body>
+  <h1>platform fighter — rollback netplay</h1>
+  <canvas id="game" width="640" height="470"></canvas>
+  <div id="status">loading…</div>
+  <div id="help">
+    move WASD / arrows · jump Space · attack J · shield Shift · short-hop C
+    &nbsp;—&nbsp; open this page in a second tab to pair
+  </div>
+</body>
+</html>
