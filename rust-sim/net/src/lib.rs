@@ -9,6 +9,7 @@
 
 use bitflags::bitflags;
 use ggrs::{Config, GgrsRequest, PlayerType, PredictRepeatLast, SessionBuilder, SyncTestSession};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use smash_core::{step, InputFrame, SimState, Tune};
 
@@ -93,17 +94,71 @@ pub type PeerAddr = matchbox_socket::PeerId;
 #[cfg(not(feature = "matchbox"))]
 pub type PeerAddr = usize;
 
-/// ggrs session config: what travels (NetInput), what gets snapshotted (SimState), how peers are
-/// addressed (PeerAddr).
-#[derive(Debug)]
-pub struct GgrsConfig;
+/// The game-specific half of a rollback session, so the machinery below (`Game`, `GgrsConfig`,
+/// `GgrsNetplay`, `start_p2p_n`) is generic and lifts into ANOTHER prototype unchanged: a new game
+/// implements this once and gets the whole rollback layer. `State`/`Input` carry ggrs's bounds (the
+/// snapshot is `Clone`; the wire input is `Copy + Default + serde`). `advance` is the deterministic
+/// step both peers run on decoded inputs. See plans/netplay-as-crate.md.
+pub trait RollbackSim: 'static {
+    /// Rolled-back snapshot. Cheap to clone (Copy in practice) so saves don't allocate.
+    type State: Clone + Send + Sync;
+    /// One player's input on the wire (what ggrs transmits + predicts).
+    type Input: Copy + Clone + PartialEq + Default + Serialize + DeserializeOwned + Send + Sync;
+    /// Locked per-match config both peers share (e.g. tuning); never diverges mid-match.
+    type Config: Clone;
+    /// Fresh state for a new match.
+    fn initial(cfg: &Self::Config) -> Self::State;
+    /// Deterministic advance: same `(state, inputs, cfg)` -> same next state on every peer.
+    fn advance(state: &Self::State, inputs: &[Self::Input], cfg: &Self::Config) -> Self::State;
+    /// Determinism checksum ggrs compares across rollbacks.
+    fn checksum(state: &Self::State) -> u128;
+}
 
-impl Config for GgrsConfig {
-    type Input = NetInput;
+/// ggrs session config, generic over the game via [`RollbackSim`]: what travels (`S::Input`), what
+/// gets snapshotted (`S::State`), how peers are addressed (`PeerAddr`).
+pub struct GgrsConfig<S: RollbackSim>(std::marker::PhantomData<S>);
+
+impl<S: RollbackSim> Config for GgrsConfig<S> {
+    type Input = S::Input;
     type InputPredictor = PredictRepeatLast;
-    type State = SimState;
+    type State = S::State;
     type Address = PeerAddr;
 }
+
+// ggrs needs Config: Debug (for GgrsEvent's derive). PhantomData can't derive it generically without
+// S: Debug, so write it by hand — the config carries no data to print.
+impl<S: RollbackSim> std::fmt::Debug for GgrsConfig<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GgrsConfig")
+    }
+}
+
+/// This game (Smash) as a [`RollbackSim`]. Keeps the wire format (`NetInput`/`encode`/`decode`), the
+/// pure `step`, and the field-fold `checksum` game-specific; everything else in this crate is generic.
+pub struct Smash;
+
+impl RollbackSim for Smash {
+    type State = SimState;
+    type Input = NetInput;
+    type Config = Tune;
+    fn initial(_cfg: &Tune) -> SimState {
+        SimState::spawn()
+    }
+    fn advance(state: &SimState, inputs: &[NetInput], cfg: &Tune) -> SimState {
+        // wire -> sim input (both peers decode identically), then the pure step over N players.
+        let decoded: Vec<InputFrame> = inputs.iter().map(|n| decode(*n)).collect();
+        let refs: Vec<&InputFrame> = decoded.iter().collect();
+        step(state, &refs, cfg)
+    }
+    fn checksum(state: &SimState) -> u128 {
+        checksum(state)
+    }
+}
+
+/// Concrete instantiations for this game, so the shell names short aliases instead of `<Smash>`.
+pub type SmashConfig = GgrsConfig<Smash>;
+pub type SmashGame = Game<Smash>;
+pub type SmashNetplay = GgrsNetplay<Smash>;
 
 /// Deterministic checksum over the whole state. ggrs compares these across rollbacks to catch
 /// non-determinism. Folds every field's raw bits (floats via `to_bits`) through FNV-1a.
@@ -163,42 +218,40 @@ pub fn checksum(s: &SimState) -> u128 {
     h as u128
 }
 
-/// The frontend-agnostic game wrapper ggrs drives. Holds the authoritative state + the locked
-/// Tune (both peers MUST share the same Tune or they desync — lock it at match start). Apply the
-/// requests ggrs returns from `advance_frame`.
-pub struct Game {
-    pub state: SimState,
-    pub tune: Tune,
+/// The frontend-agnostic game wrapper ggrs drives, generic over the game via [`RollbackSim`]. Holds
+/// the authoritative state + the locked config (both peers MUST share it or they desync — lock it at
+/// match start). Apply the requests ggrs returns from `advance_frame`.
+pub struct Game<S: RollbackSim> {
+    pub state: S::State,
+    pub cfg: S::Config,
 }
 
-impl Game {
-    /// Two-player match (the historical default).
-    pub fn new(tune: Tune) -> Self {
-        Self::new_n(tune, 2)
+impl<S: RollbackSim> Game<S> {
+    /// Fresh match from the locked config.
+    pub fn new(cfg: S::Config) -> Self {
+        Self { state: S::initial(&cfg), cfg }
     }
 
-    /// `players`-fighter match (clamped to the sim's `MAX_PLAYERS`). Both peers MUST pass the same
-    /// count or they spawn different-sized states and desync.
-    pub fn new_n(tune: Tune, players: usize) -> Self {
-        Self { state: SimState::spawn_n(players), tune }
+    /// Resume from a given snapshot (reconnect: both peers rebuild from the same state).
+    pub fn from_state(state: S::State, cfg: S::Config) -> Self {
+        Self { state, cfg }
     }
 
-    /// Service one batch of ggrs requests: save (clone state into the cell), load (restore),
-    /// advance (decode every player's input by handle, call the pure step). Player count comes from
+    /// Service one batch of ggrs requests: save (clone state into the cell), load (restore), advance
+    /// (every player's input by handle -> the deterministic `S::advance`). Player count comes from
     /// ggrs (`inputs.len()` == the session's num_players), so this is arity-agnostic.
-    pub fn handle(&mut self, requests: Vec<GgrsRequest<GgrsConfig>>) {
+    pub fn handle(&mut self, requests: Vec<GgrsRequest<GgrsConfig<S>>>) {
         for req in requests {
             match req {
                 GgrsRequest::SaveGameState { cell, frame } => {
-                    cell.save(frame, Some(self.state), Some(checksum(&self.state)));
+                    cell.save(frame, Some(self.state.clone()), Some(S::checksum(&self.state)));
                 }
                 GgrsRequest::LoadGameState { cell, .. } => {
                     self.state = cell.load().expect("ggrs load on a saved frame");
                 }
                 GgrsRequest::AdvanceFrame { inputs } => {
-                    let decoded: Vec<InputFrame> = inputs.iter().map(|(ni, _)| decode(*ni)).collect();
-                    let refs: Vec<&InputFrame> = decoded.iter().collect();
-                    self.state = step(&self.state, &refs, &self.tune);
+                    let wires: Vec<S::Input> = inputs.iter().map(|(i, _)| *i).collect();
+                    self.state = S::advance(&self.state, &wires, &self.cfg);
                 }
             }
         }
@@ -221,32 +274,39 @@ pub enum Advance {
 /// be a second impl, swapped in without touching the shell. The transport (mesh vs central relay)
 /// is a lower seam — ggrs's `NonBlockingSocket` — and does not surface here. See plans/n-player.md.
 pub trait Netplay {
+    /// The rolled-back state the caller renders.
+    type State;
+    /// This peer's local input per frame (the wire form).
+    type Input;
     /// Pump the transport + drain session events (must run every frame).
     fn poll(&mut self);
     /// True once the session is synchronized and actually stepping.
     fn running(&self) -> bool;
     /// Feed this peer's local input, advance one frame, and apply the resulting rollback requests.
-    fn advance(&mut self, local: NetInput) -> Advance;
+    fn advance(&mut self, local: Self::Input) -> Advance;
     /// The latest authoritative state to render.
-    fn state(&self) -> &SimState;
+    fn state(&self) -> &Self::State;
 }
 
-/// Rollback-p2p netplay over ggrs. Owns the session + the authoritative [`Game`] for the match's
-/// lifetime (created when the data channel opens, dropped on reset/reconnect).
-pub struct GgrsNetplay {
-    session: P2PSession<GgrsConfig>,
-    game: Game,
+/// Rollback-p2p netplay over ggrs, generic over the game. Owns the session + the authoritative
+/// [`Game`] for the match's lifetime (created when the data channel opens, dropped on reset/reconnect).
+pub struct GgrsNetplay<S: RollbackSim> {
+    session: P2PSession<GgrsConfig<S>>,
+    game: Game<S>,
     local_handle: usize,
     peer_gone: bool,
 }
 
-impl GgrsNetplay {
-    pub fn new(session: P2PSession<GgrsConfig>, game: Game, local_handle: usize) -> Self {
+impl<S: RollbackSim> GgrsNetplay<S> {
+    pub fn new(session: P2PSession<GgrsConfig<S>>, game: Game<S>, local_handle: usize) -> Self {
         Self { session, game, local_handle, peer_gone: false }
     }
 }
 
-impl Netplay for GgrsNetplay {
+impl<S: RollbackSim> Netplay for GgrsNetplay<S> {
+    type State = S::State;
+    type Input = S::Input;
+
     fn poll(&mut self) {
         self.session.poll_remote_clients();
         for ev in self.session.events() {
@@ -260,7 +320,7 @@ impl Netplay for GgrsNetplay {
         self.session.current_state() == SessionState::Running
     }
 
-    fn advance(&mut self, local: NetInput) -> Advance {
+    fn advance(&mut self, local: S::Input) -> Advance {
         if self.peer_gone {
             return Advance::PeerGone;
         }
@@ -280,7 +340,7 @@ impl Netplay for GgrsNetplay {
         }
     }
 
-    fn state(&self) -> &SimState {
+    fn state(&self) -> &S::State {
         &self.game.state
     }
 }
@@ -295,32 +355,34 @@ pub use ggrs::{GgrsError, GgrsEvent, Message, NonBlockingSocket, P2PSession, Ses
 /// FIXED so both peers agree: handle 0 = host, handle 1 = guest. `local_handle` says which one this
 /// peer is; `remote_addr` is the address the socket tags inbound packets with (host sees the guest
 /// as `remote_addr`, guest sees the host). `input_delay` frames trade latency for fewer rollbacks.
-pub fn start_p2p<S>(
+pub fn start_p2p<Sim, Sock>(
     local_handle: usize,
     remote_addr: PeerAddr,
-    socket: S,
+    socket: Sock,
     input_delay: usize,
-) -> Result<P2PSession<GgrsConfig>, GgrsError>
+) -> Result<P2PSession<GgrsConfig<Sim>>, GgrsError>
 where
-    S: NonBlockingSocket<PeerAddr> + 'static,
+    Sim: RollbackSim,
+    Sock: NonBlockingSocket<PeerAddr> + 'static,
 {
-    start_p2p_n(local_handle, &[remote_addr; 2], socket, input_delay)
+    start_p2p_n::<Sim, Sock>(local_handle, &[remote_addr; 2], socket, input_delay)
 }
 
 /// N-player rollback session. `addrs[h]` is the transport address ggrs tags handle `h`'s packets
 /// with; the entry at `local_handle` is ignored (that handle is us, played locally). `num_players`
 /// = `addrs.len()`. The socket is the transport — a p2p mesh or a central relay, both just impls of
 /// `NonBlockingSocket`. Both peers MUST build the same `addrs` order so handles agree.
-pub fn start_p2p_n<S>(
+pub fn start_p2p_n<Sim, Sock>(
     local_handle: usize,
     addrs: &[PeerAddr],
-    socket: S,
+    socket: Sock,
     input_delay: usize,
-) -> Result<P2PSession<GgrsConfig>, GgrsError>
+) -> Result<P2PSession<GgrsConfig<Sim>>, GgrsError>
 where
-    S: NonBlockingSocket<PeerAddr> + 'static,
+    Sim: RollbackSim,
+    Sock: NonBlockingSocket<PeerAddr> + 'static,
 {
-    let mut b = SessionBuilder::<GgrsConfig>::new()
+    let mut b = SessionBuilder::<GgrsConfig<Sim>>::new()
         .with_num_players(addrs.len())?
         .with_input_delay(input_delay);
     for (handle, &addr) in addrs.iter().enumerate() {
@@ -341,7 +403,7 @@ where
 // ---------------------------------------------------------------------------------------------
 #[cfg(feature = "matchbox")]
 pub mod transport {
-    use super::GgrsConfig;
+    use super::SmashConfig;
     use ggrs::{Message, NonBlockingSocket, SessionBuilder};
     // Re-export the ggrs + matchbox types a frontend names, so it only needs to depend on smash_net.
     pub use ggrs::{GgrsError, P2PSession, PlayerType, SessionState};
@@ -394,8 +456,8 @@ pub mod transport {
         players: Vec<PlayerType<PeerId>>,
         channel: WebRtcChannel,
         input_delay: usize,
-    ) -> Result<P2PSession<GgrsConfig>, ggrs::GgrsError> {
-        let mut builder = SessionBuilder::<GgrsConfig>::new()
+    ) -> Result<P2PSession<SmashConfig>, ggrs::GgrsError> {
+        let mut builder = SessionBuilder::<SmashConfig>::new()
             .with_num_players(players.len())?
             .with_input_delay(input_delay);
         for (handle, player) in players.into_iter().enumerate() {
@@ -407,8 +469,8 @@ pub mod transport {
 
 /// Build a 2-player SyncTest session (both players local, rolls back `check_distance` frames each
 /// step and checksums). This is the determinism harness, not real networking.
-pub fn synctest_session(check_distance: usize) -> SyncTestSession<GgrsConfig> {
-    SessionBuilder::<GgrsConfig>::new()
+pub fn synctest_session(check_distance: usize) -> SyncTestSession<SmashConfig> {
+    SessionBuilder::<SmashConfig>::new()
         .with_num_players(2)
         .expect("2 players")
         .with_check_distance(check_distance)

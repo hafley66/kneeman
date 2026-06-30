@@ -14,7 +14,7 @@ use godot::tools::try_load;
 
 use crate::rtc::{self, Role, RtcSocket};
 use crate::sim::{self, CharState, Fighter, InputFrame, SimState, Tune};
-use smash_net::{encode, start_p2p, Advance, Game, GgrsNetplay, Netplay};
+use smash_net::{encode, start_p2p, Advance, GgrsNetplay, NetInput, Netplay, Smash, SmashGame};
 
 /// Netplay lifecycle. Offline = local single-player (default). Signaling = dialing the relay +
 /// doing the WebRTC handshake; still renders local play so the page isn't frozen. Running = ggrs
@@ -651,7 +651,7 @@ pub struct KneeMan {
     ws: Option<Gd<WebSocketPeer>>,             // signaling socket to the relay
     pc: Option<Gd<WebRtcPeerConnection>>,      // the P2P connection
     channel: Option<Gd<WebRtcDataChannel>>,    // negotiated data channel ggrs rides
-    net: Option<Box<dyn Netplay>>,             // active session behind the model-agnostic seam (rollback today)
+    net: Option<Box<dyn Netplay<State = SimState, Input = NetInput>>>, // model-agnostic session seam (rollback today)
     room: Option<Room>,                        // match's room identity; survives a drop so we can rejoin
     resume_snapshot: Option<SimState>,         // sim state captured at a drop, to resume the rebuilt session from
     got_resume: bool,                          // guest: received the host's resume snapshot this reconnect
@@ -1566,13 +1566,13 @@ impl KneeMan {
         let (local_handle, remote) = role.handles();
         let Some(channel) = self.channel.clone() else { return };
         let socket = RtcSocket { channel, remote };
-        match start_p2p(local_handle, remote, socket, rtc::INPUT_DELAY) {
+        match start_p2p::<Smash, _>(local_handle, remote, socket, rtc::INPUT_DELAY) {
             Ok(session) => {
                 // Resume from the agreed snapshot on a reconnect; spawn fresh on a first match. Both
                 // peers reach this with the SAME snapshot (the host's), so frame 0 of the rebuilt
                 // session is identical and ggrs stays in sync.
                 let state = self.resume_snapshot.unwrap_or_else(SimState::spawn);
-                let game = Game { state, tune: self.tune.get() };
+                let game = SmashGame::from_state(state, self.tune.get());
                 self.net = Some(Box::new(GgrsNetplay::new(session, game, local_handle)));
                 self.state.set(state);
                 self.local_handle = local_handle;

@@ -15,7 +15,7 @@ use smash_core::{
     active_hitbox, ecb_verts, hurtbox, step, Fighter, InputFrame, SimState, Tune, PLATFORMS,
 };
 use smash_net::transport::{self, P2PSession, SessionState, WebRtcSocket};
-use smash_net::{encode, Game, GgrsConfig};
+use smash_net::{encode, SmashConfig, SmashGame};
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -82,6 +82,9 @@ impl Keys {
             down: dn,
             down_pressed: any_hit(&["KeyS", "ArrowDown"]),
             attack: any_hit(&["KeyJ", "KeyF"]),
+            attack_held: any_held(&["KeyJ", "KeyF"]),
+            grab: any_hit(&["KeyK"]),
+            special: any_hit(&["KeyH"]),
         };
         self.edges.clear();
         frame
@@ -103,8 +106,8 @@ fn clear_edges(i: &mut InputFrame) {
 struct App {
     solo: bool,
     socket: Option<WebRtcSocket>,
-    session: Option<P2PSession<GgrsConfig>>,
-    game: Game,
+    session: Option<P2PSession<SmashConfig>>,
+    game: SmashGame,
     keys: Rc<RefCell<Keys>>,
     ctx: CanvasRenderingContext2d,
     status: HtmlElement,
@@ -165,7 +168,7 @@ pub fn start() {
         solo,
         socket,
         session: None,
-        game: Game::new(Tune::default()),
+        game: SmashGame::new(Tune::default()),
         keys,
         ctx,
         status,
@@ -290,7 +293,7 @@ fn step_solo(app: &mut App) {
     let idle = InputFrame::default();
     let mut first = true;
     while app.acc >= STEP {
-        app.game.state = step(&app.game.state, [&input, &idle], &app.game.tune);
+        app.game.state = step(&app.game.state, &[&input, &idle], &app.game.cfg);
         app.acc -= STEP;
         if first {
             clear_edges(&mut input); // a press counts for one frame only
@@ -365,9 +368,9 @@ fn render(app: &App) {
             .as_ref()
             .and_then(|sess| sess.local_player_handles().first().copied())
     };
-    let colors = ["#5ad1ff", "#ff7a7a"];
-    for (i, f) in s.fighters.iter().enumerate() {
-        draw_fighter(ctx, f, colors[i], local == Some(i), &app.game.tune);
+    let colors = ["#5ad1ff", "#ff7a7a", "#9affc0", "#ffd166"];
+    for (i, f) in s.fighters.iter().take(s.active as usize).enumerate() {
+        draw_fighter(ctx, f, colors[i], local == Some(i), &app.game.cfg);
     }
 
     // HUD: both damage percentages.
