@@ -4,11 +4,10 @@ use godot::classes::web_rtc_peer_connection::{ConnectionState, GatheringState, S
 use godot::classes::web_socket_peer::State as WsState;
 use godot::classes::{
     AnimatedSprite2D, AtlasTexture, Button, Camera2D, CanvasLayer, ColorRect, FileAccess, Gradient,
-    GradientTexture2D, HttpRequest, INode2D, Input, InputEvent, InputEventKey, InputEventScreenDrag,
+    GradientTexture2D, HttpRequest, INode2D, Input, InputEvent, InputEventScreenDrag,
     InputEventScreenTouch, Json, Label, Node2D, Panel, Polygon2D, SpriteFrames, StyleBoxFlat,
     Texture2D, TextureRect, WebRtcDataChannel, WebRtcPeerConnection, WebSocketPeer,
 };
-use godot::global::Key;
 use godot::prelude::*;
 use godot::tools::try_load;
 
@@ -646,9 +645,8 @@ pub struct KneeMan {
     quad_labels: Vec<Gd<Label>>,        // wedge letter labels (same order)
     shorthop_panel: Option<Gd<Panel>>,  // rectangle under the bottom tip
     shorthop_label: Option<Gd<Label>>,
-    menu_btn: Option<Gd<Button>>,       // bottom-center MENU tab: opens debug panel + pauses
+    menu_btn: Option<Gd<Button>>,       // bottom-center MENU tab: opens the XP pause menu
     debug_ui: Option<Gd<crate::ui::debug::DebugUi>>, // sibling egui panel, toggled by the MENU button
-    paused: bool,                       // MENU pause: freeze the sim while the panel is open
     netdbg: Mutable<NetDebug>,          // transport snapshot, read by the debug panel
     sig: SigCounts,                     // handshake-frame tallies feeding netdbg
     identity: Mutable<Identity>,        // local player name+color, edited by the panel, persisted
@@ -673,6 +671,7 @@ pub struct KneeMan {
     http: Option<Gd<HttpRequest>>,             // refetches the relay /status on refocus to spot a stale build
     peer_build: Option<String>,                // opponent's build hash from the SDP handshake (None until traded)
     stale_build: bool,                         // our wasm is older than the live server build -> reload
+    peer_identity: Option<Identity>,           // remote player's chosen name+color from the SDP handshake
 }
 
 #[godot_api]
@@ -700,7 +699,6 @@ impl INode2D for KneeMan {
             shorthop_label: None,
             menu_btn: None,
             debug_ui: None,
-            paused: false,
             netdbg: Mutable::new(NetDebug::default()),
             sig: SigCounts::default(),
             identity: Mutable::new(Identity::default()),
@@ -721,6 +719,7 @@ impl INode2D for KneeMan {
             http: None,
             peer_build: None,
             stale_build: false,
+            peer_identity: None,
         }
     }
 
@@ -868,7 +867,8 @@ impl INode2D for KneeMan {
     fn physics_process(&mut self, _delta: f64) {
         // MENU pause freezes the sim locally. Netplay (Running) keeps advancing so ggrs
         // doesn't stall the session; a synced pause needs a dedicated pause-input.
-        if self.paused && self.phase != Phase::Running {
+        let menu_open = self.debug_ui.as_ref().map(|d| d.bind().is_menu_open()).unwrap_or(false);
+        if menu_open && self.phase != Phase::Running {
             self.update_status();
             return;
         }
@@ -980,12 +980,6 @@ impl INode2D for KneeMan {
             }
             return;
         }
-        // Escape toggles the MENU (pause + debug panel), same as the on-screen ☰ tab.
-        if let Ok(key) = event.try_cast::<InputEventKey>() {
-            if key.is_pressed() && !key.is_echo() && key.get_keycode() == Key::ESCAPE {
-                self.on_menu();
-            }
-        }
     }
 
     /// Debug overlay: each fighter's ECB (cyan), hurtbox (yellow), and active hitbox (red).
@@ -1067,7 +1061,15 @@ impl INode2D for KneeMan {
         let hit_col = Color::from_rgba(0.95, 0.25, 0.25, 0.45);
         for f in &s.fighters[..active] {
             // ECB diamond: the actual collision shape — bottom vert = feet, side verts = walls.
-            let v = sim::ecb_verts(f.pos);
+            // On a ledge hang the sim pins pos.x to the wall line itself, so a symmetric diamond
+            // straddles the wall (half buried in the stage). Shift it outward (away from facing,
+            // i.e. the open side the body hangs on) by ECB_HALF_W so the inner vert meets the lip.
+            let draw_pos = if matches!(f.state, CharState::LedgeHold | CharState::LedgeClimb) {
+                f.pos - sim::Vector2::new(f.facing * sim::ECB_HALF_W, 0.0)
+            } else {
+                f.pos
+            };
+            let v = sim::ecb_verts(draw_pos);
             for k in 0..4 {
                 let a = gv(v[k]) - origin;
                 let b = gv(v[(k + 1) % 4]) - origin;
@@ -1173,6 +1175,9 @@ impl KneeMan {
         d.set("kind", sdp_type); // "offer" | "answer"
         d.set("sdp", sdp);
         d.set("hash", rtc::BUILD_HASH); // peer flags a version mismatch from this
+        let id = self.identity.get_cloned();
+        d.set("pname", GString::from(&id.name));
+        d.set("pcolor", id.color.to_html()); // "#rrggbbaa" hex; parsed in note_peer_identity
         if let Some(mut ws) = self.ws.clone() {
             ws.send_text(&rtc::to_json(&d));
         }
@@ -1186,12 +1191,11 @@ impl KneeMan {
         }
     }
 
-    /// MENU tab handler: toggle pause + the debug panel together.
+    /// MENU tab handler: toggle the XP pause menu (same effect as pressing Escape).
     #[func]
     fn on_menu(&mut self) {
-        self.paused = !self.paused;
         if let Some(dbg) = self.debug_ui.as_mut() {
-            dbg.bind_mut().set_open(self.paused);
+            dbg.bind_mut().open_pause_menu();
         }
     }
 
@@ -1247,6 +1251,17 @@ impl KneeMan {
         if !hash.is_empty() && hash != "unknown" {
             self.peer_build = Some(hash);
         }
+    }
+
+    /// Record the opponent's chosen name+color from the SDP handshake dict ("pname"/"pcolor").
+    /// Cosmetic only — never touches SimState or NetInput; cannot affect the checksum.
+    fn note_peer_identity(&mut self, name: String, color_html: String) {
+        if name.is_empty() {
+            return; // old client didn't send identity; leave peer_identity None
+        }
+        let color = Color::from_html(color_html.as_str())
+            .unwrap_or_else(|| slot_color(1 - self.local_handle.min(1)));
+        self.peer_identity = Some(Identity { name, color, font_px: 32 });
     }
 
     /// Hand out the shared cells (clones point at the same BehaviorSubject).
@@ -1474,6 +1489,7 @@ impl KneeMan {
             "offer" => {
                 self.sig.offer_in += 1;
                 self.note_peer_build(rtc::dget_str(&d, "hash"));
+                self.note_peer_identity(rtc::dget_str(&d, "pname"), rtc::dget_str(&d, "pcolor"));
                 let sdp = rtc::dget_str(&d, "sdp");
                 if let Some(mut pc) = self.pc.clone() {
                     pc.set_remote_description("offer", &sdp);
@@ -1483,6 +1499,7 @@ impl KneeMan {
             "answer" => {
                 self.sig.answer_in += 1;
                 self.note_peer_build(rtc::dget_str(&d, "hash"));
+                self.note_peer_identity(rtc::dget_str(&d, "pname"), rtc::dget_str(&d, "pcolor"));
                 let sdp = rtc::dget_str(&d, "sdp");
                 if let Some(mut pc) = self.pc.clone() {
                     pc.set_remote_description("answer", &sdp);
@@ -1955,15 +1972,29 @@ impl KneeMan {
         }
     }
 
-    /// Nametag/HUD text for fighter `idx`: slot 0 is the live local identity name, the rest are "Pn".
+    /// Nametag/HUD text for fighter `idx`. In netplay the local fighter is `local_handle` (0 for
+    /// host, 1 for guest), not always slot 0. The remote slot uses `peer_identity` if received, else
+    /// falls back to the generic "Pn" label. Cosmetic only.
     fn player_name(&self, idx: usize) -> String {
-        if idx == 0 { self.identity.get_cloned().name } else { slot_name(idx) }
+        if idx == self.local_handle {
+            self.identity.get_cloned().name
+        } else if idx == 1 - self.local_handle {
+            self.peer_identity.as_ref().map(|id| id.name.clone()).unwrap_or_else(|| slot_name(idx))
+        } else {
+            slot_name(idx)
+        }
     }
 
-    /// Slot color for fighter `idx`: slot 0 wears the live local identity color; the rest take the
-    /// fixed slot palette. Cosmetic only (never folded into the netplay checksum).
+    /// Slot color for fighter `idx`. Local fighter wears the live identity color; the remote slot
+    /// wears `peer_identity.color` if received, else the fixed slot palette. Cosmetic only.
     fn slot_tint(&self, idx: usize) -> Color {
-        if idx == 0 { self.identity.get_cloned().color } else { slot_color(idx) }
+        if idx == self.local_handle {
+            self.identity.get_cloned().color
+        } else if idx == 1 - self.local_handle {
+            self.peer_identity.as_ref().map(|id| id.color).unwrap_or_else(|| slot_color(idx))
+        } else {
+            slot_color(idx)
+        }
     }
 
     /// Drive every live fighter's sprite, hiding the dormant slots (>= active). Slot 0 is the node's
@@ -2007,10 +2038,11 @@ impl KneeMan {
             return;
         }
         save_identity(&id);
-        // Slot 0's tag wears the local name + color; every tag shares the local player's font size.
+        // Local fighter's tag wears the live name + color; every tag shares the local player's font size.
+        let local = self.local_handle;
         for (k, tag) in self.tags.iter().enumerate() {
             let Some(mut tag) = tag.clone() else { continue };
-            if k == 0 {
+            if k == local {
                 tag.set_text(&id.name);
                 tag.add_theme_color_override("font_color", id.color);
             }
@@ -2040,6 +2072,8 @@ impl KneeMan {
     }
 
     /// Hover each live fighter's nametag a fixed height over its head; hide the dormant slots.
+    /// Refreshes text and color every frame so the peer's tag shows their name+color as soon as
+    /// `peer_identity` arrives from the SDP handshake (no separate change-detection needed).
     fn place_tags(&mut self) {
         let s = self.state.get();
         let active = s.active as usize;
@@ -2050,6 +2084,8 @@ impl KneeMan {
                 continue;
             }
             tag.set_visible(true);
+            tag.set_text(&self.player_name(k));
+            tag.add_theme_color_override("font_color", self.slot_tint(k));
             place_tag(&mut tag, s.fighters[k].pos);
         }
         self.place_edge_tags();

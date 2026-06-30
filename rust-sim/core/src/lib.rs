@@ -556,6 +556,8 @@ pub struct Tune {
     pub items_on: bool,           // master switch for item spawns
     pub item_spawn_interval: i64, // frames between spawn attempts (0 = off)
     pub one_item_at_a_time: bool, // only ever one pickup on the field (projectiles don't count)
+    pub pickup_reach: f32,        // forward cone length: capsule extends this far ahead of the body
+    pub pickup_r: f32,            // capsule radius for the pickup zone (in addition to the item's ITEM_R)
     pub spawn_iframes: i64,       // respawn invulnerability window (frames)
     pub knockback_mult: f32,      // global launch-speed multiplier (>1 = everything flies further)
     // knockback model (community / Project-M formula; see `knockback_units`). NOT the Melee decomp.
@@ -645,6 +647,8 @@ impl Tune {
             items_on: true,
             item_spawn_interval: 1200, // ~20s between spawns (one item at a time, so keep it rare)
             one_item_at_a_time: true,
+            pickup_reach: 100.0, // forward cone: capsule extends ~100px ahead (PM/Ult generous feel)
+            pickup_r: 50.0,      // capsule radius: items within ~50px of the line segment are grabbed
             spawn_iframes: 120, // ~2s of respawn invulnerability
             knockback_mult: 1.4, // everything flies ~40% further (kills happen, kill moves matter)
             weight: 104.0,       // Falcon/KneeMan-ish; lighter = flies further (the PM combo weight)
@@ -956,7 +960,7 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], paths: &[InkPath; MAX_DRA
     //   holding: grab=drop, attack(held)=fire (full-auto, weaker when held not freshly tapped)
     //   empty + grounded over an item: attack=pickup; else attack=jab/aerial as normal
     let holding = n.holding >= 0;
-    let pickup_target = if holding { None } else { nearest_pickup(&n, items) };
+    let pickup_target = if holding { None } else { nearest_pickup(&n, items, t) };
     let grab = n.live(Lane::Grab) == Action::Grab;
     let mut act = Act::None;
     let held_pen = holding && items[n.holding as usize].kind.is_pen();
@@ -1544,7 +1548,11 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], paths: &[InkPath; MAX_DRA
         // from under us (no spanning segment), fall.
         let p = paths[n.ground_ink as usize];
         n.pos.x += n.vel.x * DT;
-        let drop = !p.props.solid && i.down && !matches!(n.state, CharState::JumpSquat | CharState::Dtilt);
+        // deliberate "down, down" drop: require a fresh Down press while ALREADY crouching
+        // (prev==Crouch). The entry tap that caused Stand->Crouch has prev=Stand, so it never
+        // drops. JumpSquat/Dtilt are implicitly excluded because n.state must be Crouch.
+        let drop = !p.props.solid && i.down_pressed
+            && n.state == CharState::Crouch && prev == CharState::Crouch;
         match (drop, ink_floor_y_at(&p, n.pos.x)) {
             (false, Some(y)) => {
                 n.pos.y = y;
@@ -1560,10 +1568,10 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], paths: &[InkPath; MAX_DRA
         // grounded: pinned to its platform, no vertical motion
         let p = PLATFORMS[n.ground_plat.clamp(0, PLATFORMS.len() as i32 - 1) as usize];
         n.pos.x += n.vel.x * DT;
-        if !p.solid && i.down && !matches!(n.state, CharState::JumpSquat | CharState::Dtilt) {
-            // drop through the soft platform we're standing on (but not mid-jumpsquat: the down there
-            // is a wavedash aim and we're committed to the jump; nor mid-dtilt: down+attack is the
-            // pothole, not a drop command)
+        if !p.solid && i.down_pressed && n.state == CharState::Crouch && prev == CharState::Crouch {
+            // deliberate "down, down" drop: a fresh Down press while ALREADY crouching (prev==Crouch).
+            // The entry tap that caused Stand->Crouch has prev=Stand so it never drops.
+            // JumpSquat/Dtilt are implicitly excluded because n.state must be Crouch.
             n.state = CharState::Air;
             n.ground_plat = -1;
             n.coyote = t.coyote_frames as u8;
@@ -1714,7 +1722,7 @@ fn apply_act(n: &mut SimState, idx: usize, act: Act, t: &Tune) {
         Act::None => {}
         Act::Fire { auto } => fire_gun(n, idx, auto, t),
         Act::Drop => drop_item(n, idx),
-        Act::Pickup => pickup_item(n, idx),
+        Act::Pickup => pickup_item(n, idx, t),
         // node-laying needs the raw stick (cursor/ruler aim), which apply_act doesn't have — it runs
         // in `update_paths`. Act::Draw exists only so `advance` suppressed the jab; nothing to do here.
         Act::Draw => {}

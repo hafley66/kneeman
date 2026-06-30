@@ -6,7 +6,7 @@ use futures_signals::signal::Mutable;
 
 use crate::kneeman::{Identity, KneeMan, NetDebug};
 use crate::sim::{Action, AttackData, Fighter, Hitbox, SimState, Tune};
-use crate::ui::menu::router::{Intent, MenuCells, Router};
+use crate::ui::menu::router::{Intent, MenuCells, Route, Router};
 use crate::ui::themes::{dark, xp::Xp, Theme};
 
 /// Which group of collapsers the panel is showing. Persisted on the node so it survives the
@@ -175,6 +175,19 @@ impl DebugUi {
     #[func]
     fn is_open(&self) -> bool {
         self.show
+    }
+
+    /// Whether the XP pause menu is currently showing (route is not Closed).
+    /// KneeMan reads this each frame to decide whether to freeze the sim.
+    pub fn is_menu_open(&self) -> bool {
+        !matches!(self.router.location().base, Route::Closed)
+    }
+
+    /// Queue an Esc intent for the menu router: from in-game (Closed) this opens the pause
+    /// menu (Home); from inside the menu it backs out one level. Deferred to process() like
+    /// menu_esc, so egui is not poked mid-input.
+    pub fn open_pause_menu(&mut self) {
+        self.menu_esc = true;
     }
 
     /// Kick off a GET of the relay's /status page (the server-status tab's refresh button).
@@ -363,6 +376,10 @@ fn draw_panel(
             c |= islider(ui, &mut t.buffer_frames, 0..=20, "buffer_frames");
             c |= islider(ui, &mut t.max_air_jumps, 0..=5, "max_air_jumps");
             c |= islider(ui, &mut t.max_air_dodges, 0..=5, "max_air_dodges");
+        });
+        egui::CollapsingHeader::new("items · pickup").default_open(false).show(ui, |ui| {
+            c |= slider(ui, &mut t.pickup_reach, 20.0..=300.0, "pickup reach (px forward)");
+            c |= slider(ui, &mut t.pickup_r, 10.0..=150.0, "pickup radius (px capsule)");
         });
         egui::CollapsingHeader::new("items · laser").default_open(false).show(ui, |ui| {
             c |= ui.checkbox(&mut t.items_on, "items on").changed();

@@ -120,8 +120,11 @@ impl AttackData {
             Hitbox { id: 1, start: 9, len: 2, off: Vector2::new(48.0, -64.0), r: 32.0,
                 damage: 3.0, angle: 80.0, bkb: 8.0, kbg: 0.0, set_kb: 7.0,
                 transcendent: false, refresh: 0 },
+            // launcher: pops near-vertical so a 0% triple-jab leaves the victim above you, in range
+            // to follow up with a rising aerial (the sex-kick juggle). Low growth keeps it a true
+            // combo at low %, not a blow-away.
             Hitbox { id: 2, start: 15, len: 3, off: Vector2::new(54.0, -60.0), r: 36.0,
-                damage: 6.0, angle: 40.0, bkb: 24.0, kbg: 52.0, set_kb: 0.0,
+                damage: 6.0, angle: 78.0, bkb: 30.0, kbg: 40.0, set_kb: 0.0,
                 transcendent: false, refresh: 0 },
             Hitbox::NONE,
         ],
@@ -143,28 +146,34 @@ impl AttackData {
         ],
         nbox: 2,
     };
-    // Knee Man's famous aerial stomp (Captain-Falcon-flavored): three timed hitboxes on one drop.
-    // Hit the early window and you spike hard (lowest id ⇒ wins); whiff it and you catch the weak
-    // drag-down linger, then the move recovers into a late upward knee pop. Aerial ⇒ transcendent.
+    // Knee Man's aerial stomp (Captain-Falcon-flavored): contraction startup, then the foot sweeps
+    // DOWN through space. Three sequential id:0 spike boxes track the foot from tucked (small +y,
+    // near waist) to fully extended (large +y, well below body), each shifted further down-and-out
+    // than the last. The victim connects with ONE stomp — hitstun carries them clear before the next
+    // window opens. Miss the spike timing entirely and the late id:1 sourspot pops them up-and-away.
+    // Aerial ⇒ transcendent.
     pub(crate) const DAIR: Self = Self {
         startup: 6,
-        recovery: 6,
+        recovery: 8,
         boxes: [
-            // the STOMP: deep meteor spike, tiny window.
-            Hitbox { id: 0, start: 6, len: 3, off: Vector2::new(8.0, 30.0), r: 44.0,
-                damage: 12.0, angle: -85.0, bkb: 18.0, kbg: 34.0, set_kb: 0.0,
+            // foot at tuck-exit: spike opens, near waist height.
+            Hitbox { id: 0, start: 6, len: 2, off: Vector2::new(10.0, 5.0), r: 36.0,
+                damage: 12.0, angle: -80.0, bkb: 18.0, kbg: 36.0, set_kb: 0.0,
                 transcendent: true, refresh: 0 },
-            // drag-down linger: weak set-kb that pulls them with you (combo glue).
-            Hitbox { id: 1, start: 9, len: 4, off: Vector2::new(14.0, 10.0), r: 40.0,
-                damage: 4.0, angle: 20.0, bkb: 8.0, kbg: 0.0, set_kb: 5.0,
+            // foot mid-extension: same id, next window, driven further down-and-out.
+            Hitbox { id: 0, start: 8, len: 2, off: Vector2::new(14.0, 38.0), r: 38.0,
+                damage: 12.0, angle: -80.0, bkb: 18.0, kbg: 36.0, set_kb: 0.0,
                 transcendent: true, refresh: 0 },
-            // the knee pop on the way out: an upward launcher.
-            Hitbox { id: 2, start: 20, len: 4, off: Vector2::new(20.0, -50.0), r: 46.0,
-                damage: 9.0, angle: 60.0, bkb: 16.0, kbg: 44.0, set_kb: 0.0,
+            // foot near full extension: spike closes out.
+            Hitbox { id: 0, start: 10, len: 2, off: Vector2::new(18.0, 66.0), r: 40.0,
+                damage: 12.0, angle: -80.0, bkb: 18.0, kbg: 36.0, set_kb: 0.0,
                 transcendent: true, refresh: 0 },
-            Hitbox::NONE,
+            // sourspot tail: foot fully extended, sends up-and-away on whiffed spike timing.
+            Hitbox { id: 1, start: 12, len: 5, off: Vector2::new(20.0, 74.0), r: 36.0,
+                damage: 6.0, angle: 60.0, bkb: 10.0, kbg: 22.0, set_kb: 0.0,
+                transcendent: true, refresh: 0 },
         ],
-        nbox: 3,
+        nbox: 4,
     };
     pub(crate) const DASH_ATTACK: Self = Self::one(
         8, 38,

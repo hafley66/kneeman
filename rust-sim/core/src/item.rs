@@ -257,15 +257,27 @@ pub fn clear_items(n: &mut SimState) {
     }
 }
 
-/// Nearest unowned ground gun overlapping a grounded, actionable fighter (the pickup the attack
-/// button claims instead of jabbing). None in the air / during hitstun so attack stays an aerial.
-pub(crate) fn nearest_pickup(f: &Fighter, items: &[Item; MAX_ITEMS]) -> Option<usize> {
+/// True if point `c` lies within `r` of the segment `a`→`b` (capsule overlap test).
+#[inline]
+fn seg_circle_hit(a: Vector2, b: Vector2, c: Vector2, r: f32) -> bool {
+    (c - crate::geo::closest_on_seg(c, a, b)).length() <= r
+}
+
+/// Nearest unowned ground pickup (gun OR pen) reachable by a grounded, actionable fighter via a
+/// forward capsule (PM/Ultimate feel: generous cone ahead of the body, not just a tight circle at
+/// the feet). None in the air / during hitstun so attack stays an aerial.
+pub(crate) fn nearest_pickup(f: &Fighter, items: &[Item; MAX_ITEMS], t: &Tune) -> Option<usize> {
     if airborne(f.state) || f.hitstun != 0 || f.hitlag != 0 {
         return None;
     }
-    let (bc, br) = hurtbox(f);
+    let (bc, _br) = hurtbox(f);
+    let facing = Vector2::new(f.facing, 0.0);
+    let end = bc + facing * t.pickup_reach;
     items.iter().position(|it| {
-        it.active() && it.owner < 0 && it.kind.is_gun() && (it.pos - bc).length() <= br + ITEM_R
+        it.active()
+            && it.owner < 0
+            && it.kind.is_held_tool()
+            && seg_circle_hit(bc, end, it.pos, t.pickup_r + ITEM_R)
     })
 }
 
@@ -324,10 +336,10 @@ pub(crate) fn drop_item(n: &mut SimState, idx: usize) {
     n.fighters[idx].holding = -1;
 }
 
-/// Pickup intent: claim the nearest overlapping unowned ground item.
-pub(crate) fn pickup_item(n: &mut SimState, idx: usize) {
+/// Pickup intent: claim the nearest reachable unowned ground item.
+pub(crate) fn pickup_item(n: &mut SimState, idx: usize, t: &Tune) {
     let f = n.fighters[idx];
-    if let Some(k) = nearest_pickup(&f, &n.items) {
+    if let Some(k) = nearest_pickup(&f, &n.items, t) {
         n.items[k].owner = idx as i8;
         n.fighters[idx].holding = k as i8;
     }
