@@ -14,7 +14,7 @@ use godot::tools::try_load;
 
 use crate::rtc::{self, Role, RtcSocket};
 use crate::sim::{self, CharState, Fighter, InputFrame, SimState, Tune};
-use smash_net::{encode, start_p2p, Game, GgrsConfig, GgrsError, GgrsEvent, P2PSession, SessionState};
+use smash_net::{encode, start_p2p, Advance, Game, GgrsNetplay, Netplay};
 
 /// Netplay lifecycle. Offline = local single-player (default). Signaling = dialing the relay +
 /// doing the WebRTC handshake; still renders local play so the page isn't frozen. Running = ggrs
@@ -651,8 +651,7 @@ pub struct KneeMan {
     ws: Option<Gd<WebSocketPeer>>,             // signaling socket to the relay
     pc: Option<Gd<WebRtcPeerConnection>>,      // the P2P connection
     channel: Option<Gd<WebRtcDataChannel>>,    // negotiated data channel ggrs rides
-    session: Option<P2PSession<GgrsConfig>>,   // rollback session (once the channel opens)
-    game: Option<Game>,                        // ggrs-authoritative sim state during a match
+    net: Option<Box<dyn Netplay>>,             // active session behind the model-agnostic seam (rollback today)
     room: Option<Room>,                        // match's room identity; survives a drop so we can rejoin
     resume_snapshot: Option<SimState>,         // sim state captured at a drop, to resume the rebuilt session from
     got_resume: bool,                          // guest: received the host's resume snapshot this reconnect
@@ -703,8 +702,7 @@ impl INode2D for KneeMan {
             ws: None,
             pc: None,
             channel: None,
-            session: None,
-            game: None,
+            net: None,
             room: None,
             resume_snapshot: None,
             got_resume: false,
@@ -1328,43 +1326,22 @@ impl KneeMan {
         // Transport-level drop: ICE failed or the data channel closed. ggrs also reports the peer
         // gone (its packets stopped) via a Disconnected event. Either one opens the reconnect window.
         let mut peer_gone = self.transport_dropped();
-        let requests = {
-            let Some(session) = self.session.as_mut() else { return };
-            session.poll_remote_clients();
-            for ev in session.events() {
-                if matches!(ev, GgrsEvent::Disconnected { .. }) {
+        {
+            let Some(net) = self.net.as_mut() else { return };
+            net.poll(); // pump transport + drain session events (may flag a peer drop)
+            if !peer_gone {
+                let local = encode(&Self::sample_input());
+                if net.advance(local) == Advance::PeerGone {
                     peer_gone = true;
                 }
             }
-            if peer_gone {
-                None
-            } else if session.current_state() != SessionState::Running {
-                None // still synchronizing with the peer; hold the last rendered frame
-            } else {
-                let net = encode(&Self::sample_input());
-                if session.add_local_input(self.local_handle, net).is_err() {
-                    None
-                } else {
-                    match session.advance_frame() {
-                        Ok(reqs) => Some(reqs),
-                        Err(GgrsError::PredictionThreshold) => None, // too far ahead; skip a frame
-                        Err(e) => {
-                            godot_error!("netplay: advance_frame: {e:?}");
-                            None
-                        }
-                    }
-                }
-            }
-        };
+        }
         if peer_gone {
             self.begin_reconnect();
             return;
         }
-        if let (Some(reqs), Some(game)) = (requests, self.game.as_mut()) {
-            game.handle(reqs);
-        }
-        if let Some(game) = self.game.as_ref() {
-            self.state.set(game.state);
+        if let Some(net) = self.net.as_ref() {
+            self.state.set(*net.state()); // mirror the authoritative frame for rendering
         }
         let s = self.state.get();
         self.base_mut().set_position(gv(s.fighters[0].pos));
@@ -1451,7 +1428,7 @@ impl KneeMan {
             pc.poll();
         }
         if let Some(ch) = self.channel.clone() {
-            if ch.get_ready_state() == ChannelState::OPEN && self.session.is_none() {
+            if ch.get_ready_state() == ChannelState::OPEN && self.net.is_none() {
                 // On reconnect the guest must hold until the host's resume snapshot lands, or the two
                 // rebuilt sessions would start from different states. First match (or host) has nothing
                 // to wait for.
@@ -1591,12 +1568,12 @@ impl KneeMan {
         let socket = RtcSocket { channel, remote };
         match start_p2p(local_handle, remote, socket, rtc::INPUT_DELAY) {
             Ok(session) => {
-                self.session = Some(session);
                 // Resume from the agreed snapshot on a reconnect; spawn fresh on a first match. Both
                 // peers reach this with the SAME snapshot (the host's), so frame 0 of the rebuilt
                 // session is identical and ggrs stays in sync.
                 let state = self.resume_snapshot.unwrap_or_else(SimState::spawn);
-                self.game = Some(Game { state, tune: self.tune.get() });
+                let game = Game { state, tune: self.tune.get() };
+                self.net = Some(Box::new(GgrsNetplay::new(session, game, local_handle)));
                 self.state.set(state);
                 self.local_handle = local_handle;
                 self.phase = Phase::Running;
@@ -1614,8 +1591,7 @@ impl KneeMan {
 
     /// Tear down all networking and return to single-player. Frees the room ("turn off").
     fn reset_offline(&mut self) {
-        self.session = None;
-        self.game = None;
+        self.net = None;
         self.channel = None;
         self.pc = None;
         if let Some(mut ws) = self.ws.take() {
@@ -1659,13 +1635,12 @@ impl KneeMan {
         // Capture the latest sim state so the rebuilt session resumes here instead of from spawn.
         // Both peers capture; the new host's snapshot wins (it ships it over the relay).
         self.resume_snapshot = self
-            .game
+            .net
             .as_ref()
-            .map(|g| g.state)
+            .map(|n| *n.state())
             .or_else(|| Some(self.state.get()));
         self.got_resume = false;
-        self.session = None;
-        self.game = None;
+        self.net = None;
         self.channel = None;
         self.pc = None;
         if let Some(mut ws) = self.ws.take() {
