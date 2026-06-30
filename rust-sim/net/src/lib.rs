@@ -172,12 +172,20 @@ pub struct Game {
 }
 
 impl Game {
+    /// Two-player match (the historical default).
     pub fn new(tune: Tune) -> Self {
-        Self { state: SimState::spawn(), tune }
+        Self::new_n(tune, 2)
+    }
+
+    /// `players`-fighter match (clamped to the sim's `MAX_PLAYERS`). Both peers MUST pass the same
+    /// count or they spawn different-sized states and desync.
+    pub fn new_n(tune: Tune, players: usize) -> Self {
+        Self { state: SimState::spawn_n(players), tune }
     }
 
     /// Service one batch of ggrs requests: save (clone state into the cell), load (restore),
-    /// advance (decode both inputs, call the pure step).
+    /// advance (decode every player's input by handle, call the pure step). Player count comes from
+    /// ggrs (`inputs.len()` == the session's num_players), so this is arity-agnostic.
     pub fn handle(&mut self, requests: Vec<GgrsRequest<GgrsConfig>>) {
         for req in requests {
             match req {
@@ -188,12 +196,92 @@ impl Game {
                     self.state = cell.load().expect("ggrs load on a saved frame");
                 }
                 GgrsRequest::AdvanceFrame { inputs } => {
-                    let i0 = decode(inputs[0].0);
-                    let i1 = decode(inputs[1].0);
-                    self.state = step(&self.state, &[&i0, &i1], &self.tune);
+                    let decoded: Vec<InputFrame> = inputs.iter().map(|(ni, _)| decode(*ni)).collect();
+                    let refs: Vec<&InputFrame> = decoded.iter().collect();
+                    self.state = step(&self.state, &refs, &self.tune);
                 }
             }
         }
+    }
+}
+
+/// One frame's result from driving a netplayed session forward.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Advance {
+    /// Nothing advanced this frame (still synchronizing, or ggrs is too far ahead to predict).
+    Stalled,
+    /// The authoritative state moved one frame (read it via [`Netplay::state`]).
+    Stepped,
+    /// A peer dropped — the caller should open its reconnect window.
+    PeerGone,
+}
+
+/// The shell-facing netplay seam: drive a networked match without knowing the model underneath.
+/// [`GgrsNetplay`] is the rollback-p2p impl used today; a future server-authoritative client would
+/// be a second impl, swapped in without touching the shell. The transport (mesh vs central relay)
+/// is a lower seam — ggrs's `NonBlockingSocket` — and does not surface here. See plans/n-player.md.
+pub trait Netplay {
+    /// Pump the transport + drain session events (must run every frame).
+    fn poll(&mut self);
+    /// True once the session is synchronized and actually stepping.
+    fn running(&self) -> bool;
+    /// Feed this peer's local input, advance one frame, and apply the resulting rollback requests.
+    fn advance(&mut self, local: NetInput) -> Advance;
+    /// The latest authoritative state to render.
+    fn state(&self) -> &SimState;
+}
+
+/// Rollback-p2p netplay over ggrs. Owns the session + the authoritative [`Game`] for the match's
+/// lifetime (created when the data channel opens, dropped on reset/reconnect).
+pub struct GgrsNetplay {
+    session: P2PSession<GgrsConfig>,
+    game: Game,
+    local_handle: usize,
+    peer_gone: bool,
+}
+
+impl GgrsNetplay {
+    pub fn new(session: P2PSession<GgrsConfig>, game: Game, local_handle: usize) -> Self {
+        Self { session, game, local_handle, peer_gone: false }
+    }
+}
+
+impl Netplay for GgrsNetplay {
+    fn poll(&mut self) {
+        self.session.poll_remote_clients();
+        for ev in self.session.events() {
+            if matches!(ev, GgrsEvent::Disconnected { .. }) {
+                self.peer_gone = true;
+            }
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.session.current_state() == SessionState::Running
+    }
+
+    fn advance(&mut self, local: NetInput) -> Advance {
+        if self.peer_gone {
+            return Advance::PeerGone;
+        }
+        if !self.running() {
+            return Advance::Stalled; // still synchronizing; hold the last rendered frame
+        }
+        if self.session.add_local_input(self.local_handle, local).is_err() {
+            return Advance::Stalled;
+        }
+        match self.session.advance_frame() {
+            Ok(reqs) => {
+                self.game.handle(reqs);
+                Advance::Stepped
+            }
+            Err(GgrsError::PredictionThreshold) => Advance::Stalled, // too far ahead; skip a frame
+            Err(_) => Advance::Stalled,
+        }
+    }
+
+    fn state(&self) -> &SimState {
+        &self.game.state
     }
 }
 
@@ -216,14 +304,30 @@ pub fn start_p2p<S>(
 where
     S: NonBlockingSocket<PeerAddr> + 'static,
 {
+    start_p2p_n(local_handle, &[remote_addr; 2], socket, input_delay)
+}
+
+/// N-player rollback session. `addrs[h]` is the transport address ggrs tags handle `h`'s packets
+/// with; the entry at `local_handle` is ignored (that handle is us, played locally). `num_players`
+/// = `addrs.len()`. The socket is the transport — a p2p mesh or a central relay, both just impls of
+/// `NonBlockingSocket`. Both peers MUST build the same `addrs` order so handles agree.
+pub fn start_p2p_n<S>(
+    local_handle: usize,
+    addrs: &[PeerAddr],
+    socket: S,
+    input_delay: usize,
+) -> Result<P2PSession<GgrsConfig>, GgrsError>
+where
+    S: NonBlockingSocket<PeerAddr> + 'static,
+{
     let mut b = SessionBuilder::<GgrsConfig>::new()
-        .with_num_players(2)?
+        .with_num_players(addrs.len())?
         .with_input_delay(input_delay);
-    for handle in 0..2 {
+    for (handle, &addr) in addrs.iter().enumerate() {
         let player = if handle == local_handle {
             PlayerType::Local
         } else {
-            PlayerType::Remote(remote_addr)
+            PlayerType::Remote(addr)
         };
         b = b.add_player(player, handle)?;
     }
