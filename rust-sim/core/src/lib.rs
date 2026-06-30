@@ -359,6 +359,10 @@ pub struct SpecialMove {
     pub hit: AttackData, // frames + hitbox + knockback
     pub move_x: f32,     // forward-relative horizontal burst at the active window (px/s)
     pub move_y: f32,     // vertical burst (negative = up) at the active window (px/s)
+    // While airborne and running this move, gravity does not pull: the fighter holds its burst
+    // velocity (Ness/Lucas-style floaty up-B). Off => normal gravity + air drift, so the move arcs
+    // and the fighter falls. No move "air-stalls" implicitly anymore; it's opt-in per loadout slot.
+    pub no_gravity: bool,
 }
 
 impl SpecialMove {
@@ -376,8 +380,11 @@ impl SpecialMove {
             kb_scale: 5.0,
             kb_angle: 38.0,
         },
-        move_x: 0.0,
-        move_y: 0.0,
+        // Falcon-punch surge: lunge forward into the hit, not a mid-air hover. Grounded, friction
+        // bleeds it to the planted step; aerial, gravity arcs him down after the lunge.
+        move_x: 380.0,
+        move_y: -60.0,
+        no_gravity: false,
     };
     const LUNGE: Self = Self {
         kind: SpecialKind::Lunge,
@@ -394,6 +401,7 @@ impl SpecialMove {
         },
         move_x: 900.0,
         move_y: -120.0,
+        no_gravity: false,
     };
     const RISE: Self = Self {
         kind: SpecialKind::Rise,
@@ -410,6 +418,7 @@ impl SpecialMove {
         },
         move_x: 380.0,
         move_y: -1500.0,
+        no_gravity: false,
     };
     const DROP: Self = Self {
         kind: SpecialKind::Fall,
@@ -426,6 +435,7 @@ impl SpecialMove {
         },
         move_x: 220.0,
         move_y: 700.0,
+        no_gravity: false,
     };
 }
 
@@ -2312,8 +2322,10 @@ fn run_special(n: &mut Fighter, slot: usize, i: &InputFrame, t: &Tune) {
     // window. The hitbox window (startup..) is independent of this movement timing.
     let launch_frame = if m.kind == SpecialKind::Rise { 0 } else { m.hit.startup };
     if n.frame == launch_frame {
+        // Every kind fires its impulse vector (facing-relative, or stick-relative for the recovery).
+        // Punch/Lunge/Fall drive along facing; Rise aims with the stick. Lunge/Rise leave the ground.
         match m.kind {
-            SpecialKind::Punch => n.vel.x = 0.0, // planted; vertical handled below (hover if aerial)
+            SpecialKind::Punch => n.vel = Vector2::new(n.facing * m.move_x, m.move_y),
             SpecialKind::Lunge => {
                 n.vel = Vector2::new(n.facing * m.move_x, m.move_y);
                 n.ground_plat = -1;
@@ -2327,18 +2339,15 @@ fn run_special(n: &mut Fighter, slot: usize, i: &InputFrame, t: &Tune) {
         }
     }
     if n.ground_plat < 0 {
-        match m.kind {
-            // aerial neutral-B HOVERS in place (no snap-to-ground): bleed horizontal, almost no fall.
-            SpecialKind::Punch => {
-                n.vel.x = move_toward(n.vel.x, 0.0, t.air_friction * DT);
-                n.vel.y = move_toward(n.vel.y, 0.0, t.gravity * 0.5 * DT);
-            }
-            _ => {
-                n.vel.x = move_toward(n.vel.x, i.dir * t.air_speed * 0.6, t.air_accel * DT);
-                n.vel.y += t.gravity * DT;
-                if n.vel.y > t.max_fall {
-                    n.vel.y = t.max_fall;
-                }
+        if m.no_gravity {
+            // floaty move (e.g. a PSI recovery): hold the burst, only bleed horizontal slowly. No
+            // gravity, so it hangs instead of arcing — the opt-in air-stall, never the default.
+            n.vel.x = move_toward(n.vel.x, 0.0, t.air_friction * DT);
+        } else {
+            n.vel.x = move_toward(n.vel.x, i.dir * t.air_speed * 0.6, t.air_accel * DT);
+            n.vel.y += t.gravity * DT;
+            if n.vel.y > t.max_fall {
+                n.vel.y = t.max_fall;
             }
         }
     } else {
@@ -2758,6 +2767,67 @@ mod di_tests {
         let c = step(&s, [&idle, &idle], &t);
         assert_eq!(c.fighters[0].state, CharState::Knockdown, "missed tech -> floored");
         assert!(!c.fighters[0].tumble, "tumble cleared on knockdown");
+    }
+
+    #[test]
+    fn launched_victim_falls_back_to_ground() {
+        // A fighter popped up with hitstun must arc back down under gravity, not hover. Regression
+        // for the "opponent floats after a hit" bug.
+        let t = Tune::from_char(&CharData::KNEEMAN);
+        let mut s = SimState::spawn();
+        let f = &mut s.fighters[0];
+        f.state = CharState::Air;
+        f.ground_plat = -1;
+        f.pos = Vector2::new(600.0, GROUND_Y);
+        f.vel = Vector2::new(0.0, -900.0); // straight up (won't blast off the top: apex ~95px)
+        f.hitstun = 24;
+        let idle = InputFrame::default();
+        let mut c = s;
+        let apex = {
+            let mut hi = c.fighters[0].pos.y;
+            for _ in 0..120 {
+                c = step(&c, [&idle, &idle], &t);
+                hi = hi.min(c.fighters[0].pos.y); // smaller y = higher
+            }
+            hi
+        };
+        assert!(apex < GROUND_Y - 50.0, "victim actually rose off the launch");
+        assert!(
+            c.fighters[0].pos.y >= GROUND_Y - 1.0,
+            "victim fell back to the floor (no hover): y={}",
+            c.fighters[0].pos.y
+        );
+    }
+
+    #[test]
+    fn aerial_neutral_b_does_not_air_stall() {
+        // Neutral-B in the air must impulse + fall, not hover in place. Regression for Falcon-B
+        // hovering; also pins the forward impulse direction.
+        let t = Tune::from_char(&CharData::KNEEMAN);
+        let mut s = SimState::spawn();
+        let f = &mut s.fighters[0];
+        f.state = CharState::SpecialN;
+        f.frame = 0;
+        f.ground_plat = -1; // airborne
+        f.facing = 1.0;
+        f.pos = Vector2::new(600.0, GROUND_Y - 600.0); // high up, room to fall
+        f.vel = Vector2::ZERO;
+        let idle = InputFrame::default();
+        let start_y = f.pos.y;
+        let mut c = s;
+        // run past the launch frame (Punch startup) plus a bit
+        for _ in 0..30 {
+            c = step(&c, [&idle, &idle], &t);
+        }
+        assert!(
+            c.fighters[0].pos.y > start_y + 100.0,
+            "aerial neutral-B descends instead of hovering: dy={}",
+            c.fighters[0].pos.y - start_y
+        );
+        assert!(
+            c.fighters[0].vel.x.abs() > 1.0 || c.fighters[0].pos.x > 600.0,
+            "neutral-B carries a forward impulse, not a planted stall"
+        );
     }
 
     #[test]

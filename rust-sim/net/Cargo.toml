@@ -14,10 +14,10 @@ ggrs = "0.13"
 serde = { version = "1", features = ["derive"] }
 bitflags = { version = "2", features = ["serde"] }
 matchbox_socket = { version = "0.14", optional = true }
-bincode = { version = "1.3", optional = true }
+bincode = "1.3" # wire (de)serialization + replay-log fixtures; small + pure, used by every build
 
 [features]
 # WebRTC transport (works native + wasm at the type level; running native needs a runtime).
-matchbox = ["dep:matchbox_socket", "dep:bincode"]
+matchbox = ["dep:matchbox_socket"]
 # Browser build: matchbox + the getrandom/instant shims ggrs needs under wasm.
 wasm = ["matchbox", "ggrs/wasm-bindgen"]

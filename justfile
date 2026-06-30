@@ -46,6 +46,11 @@ rust: && import
 import:
     {{godot}} --headless --editor --quit --path {{proj}}
 
+# fetch + convert sprite packs listed in tools/packs.toml -> assets/ + roster.json, then reimport
+# so the new art lands in the .pck. Edit tools/packs.toml, run this, launch. See tools/packs.toml.
+packs: && import
+    python3 {{proj}}/tools/fetch_packs.py
+
 rust-release:
     cd {{proj}}/rust-sim && cargo build --release
 
@@ -72,10 +77,33 @@ vps-deploy:
     rsync -az --delete --exclude target signaling/ {{vps}}:/root/smash-signaling-src/
     ssh {{vps}} 'bash -s' < deploy/setup-vps.sh
 
-# rebuild + restart just the WebRTC signaling relay (no full setup rerun). Run `vps-deploy` once first.
-signaling-deploy:
-    rsync -az --delete --exclude target signaling/ {{vps}}:/root/smash-signaling-src/
-    ssh {{vps}} 'source $HOME/.cargo/env && cargo install --path /root/smash-signaling-src --force && systemctl restart smash-signaling && systemctl --no-pager status smash-signaling | head -4'
+# VAPID contact, embedded in the signed push JWT. Override: `just vapid_subject=mailto:you@x.com vapid-keygen`
+vapid_subject := "mailto:hafley66@gmail.com"
+
+# Generate the VAPID keypair ON the VPS (idempotent — never overwrites an existing key) and write the
+# systemd EnvironmentFile. The private key never leaves the box and is not in the repo; the matching
+# public key is derived by the relay at boot and served from /vapid. Run once, then `signaling-deploy`.
+vapid-keygen:
+    ssh {{vps}} 'set -e; install -d -m700 /etc/smash-signaling; \
+      KEY=/etc/smash-signaling/vapid.pem; \
+      [ -f $KEY ] || openssl ecparam -genkey -name prime256v1 -noout -out $KEY; \
+      chmod 600 $KEY; \
+      printf "VAPID_PRIVATE_PEM=%s\nVAPID_SUBJECT=%s\n" $KEY "{{vapid_subject}}" > /etc/smash-signaling.env; \
+      echo "vapid env written:"; cat /etc/smash-signaling.env'
+
+# fully static x86_64 linux build of the relay, cross-compiled from this mac via zig (no Docker, no
+# libssl on the box). musl => statically linked, runs on the ancient VPS with zero shared-lib deps.
+# Setup once: `brew install zig && cargo install cargo-zigbuild && rustup target add x86_64-unknown-linux-musl`
+signaling-bin:
+    cd {{proj}}/signaling && cargo zigbuild --release --target x86_64-unknown-linux-musl
+
+# deploy the relay by shipping the PREBUILT static binary — the 1-core/1GB box never compiles rust.
+# Also refreshes the nginx push routes + systemd unit so /vapid + /subscribe + the EnvironmentFile land.
+signaling-deploy: signaling-bin
+    scp {{proj}}/signaling/target/x86_64-unknown-linux-musl/release/smash-signaling {{vps}}:/root/.cargo/bin/smash-signaling.new
+    scp deploy/nginx/rtc.conf {{vps}}:/etc/nginx/snippets/rtc.conf
+    scp deploy/systemd/smash-signaling.service {{vps}}:/etc/systemd/system/smash-signaling.service
+    ssh {{vps}} 'mv /root/.cargo/bin/smash-signaling.new /root/.cargo/bin/smash-signaling && systemctl daemon-reload && nginx -t && systemctl reload nginx && systemctl restart smash-signaling && systemctl --no-pager status smash-signaling | head -4'
 
 # tail the live signaling relay log (connect / matched / disconnect lines)
 signaling-logs:
@@ -119,10 +147,12 @@ godot-wasm:
       GODOT4_BIN="{{godot45}}" cargo +nightly build -p smash_sim -Zbuild-std \
       --target wasm32-unknown-emscripten --release
 
-# export the Godot "Web" preset to build/web (runs the 4.5 editor headless)
+# export the Godot "Web" preset to build/web (runs the 4.5 editor headless), then drop in the push
+# service worker + opt-in script (head_include loads push.js; sw.js registers at the /game/ scope)
 godot-export: godot-wasm
     cd {{proj}} && mkdir -p build/web && source ~/emsdk/emsdk_env.sh && \
       "{{godot45}}" --headless --path . --export-release "Web" build/web/index.html
+    cp {{proj}}/deploy/web/sw.js {{proj}}/deploy/web/push.js {{proj}}/build/web/
 
 # push build/web to the VPS (/var/www/smash-godot), reload nginx. Run `vps-deploy` once first.
 godot-deploy: godot-export

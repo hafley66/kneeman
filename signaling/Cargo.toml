@@ -16,6 +16,14 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+web-push = { version = "0.11.0", default-features = false, features = ["hyper-client"] }
+# web-push's hyper-client uses hyper-tls -> openssl-sys. Vendor openssl so the binary builds on any
+# box without libssl-dev installed (build-time needs only a C compiler + perl, which the rust
+# toolchain box already has). Keeps the artifact host-agnostic.
+openssl = { version = "0.10", features = ["vendored"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+base64 = "0.22"
 
 [profile.release]
 opt-level = "s"

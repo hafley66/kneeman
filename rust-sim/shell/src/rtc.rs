@@ -19,6 +19,10 @@ use smash_net::{Message, NonBlockingSocket};
 /// the VPS loopback. The relay pairs two dialers and forwards their SDP/ICE.
 pub const SIGNALING_URL: &str = "wss://hafley.codes/rtc";
 
+/// The relay's plain-HTTP status page (same host/route as `SIGNALING_URL`; the relay serves JSON
+/// when a request arrives without the WebSocket upgrade header). The debug panel fetches this.
+pub const STATUS_URL: &str = "https://hafley.codes/rtc";
+
 /// Frames of input delay fed to ggrs. Higher = fewer rollbacks but more felt latency. 2 is a sane
 /// LAN/decent-connection default.
 pub const INPUT_DELAY: usize = 2;

@@ -1,0 +1,51 @@
+# Sprite-pack shopping list. Each [[pack]] becomes ONE character appended to the in-game roster
+# (after the built-in frog + zombie). Run `just packs` to fetch, convert, and rebuild
+# assets/roster.json. The game reads that JSON at boot, so a new character is: add a block here,
+# run `just packs`, launch. Art is never folded into the netplay checksum, so this can't desync.
+#
+# Sources you can point at:
+#   url  = "https://.../whatever.zip"   download a zip, or...
+#   url  = "https://.../sheet.png"      a single sheet, or...
+#   path = "/abs/path/to/folder"        a local dir (e.g. a Steam Workshop char folder)
+#
+# kind:
+#   "rivals_strip"  inputs are <clip>_strip<N>.png (frame count from the filename). Rivals of
+#                   Aether / GameMaker exports are already this shape -- zero hand-tuning.
+#                   Plain <clip>.png with no _stripN is treated as a single frame.
+#   "grid"          one big sheet sliced col x row; each ROW is one clip. Needs cols, rows,
+#                   rows_order (the clip name for each row, top to bottom). This is the shape most
+#                   The Spriters Resource rips come in; we reflow each row into a strip.
+#
+# Optional per-pack overrides (auto-derived if omitted):
+#   scale     = 1.0      node scale; default makes the idle cell ~140px tall
+#   offset_y  = -60.0    sprite y-offset in cell px so the feet sit on the position
+#   [pack.fps]           per-clip playback fps (defaults by clip name)
+#     idle = 8
+#     run  = 16
+
+# --- examples (commented; fill in real urls/paths, then `just packs`) -------------------------
+
+# [[pack]]
+# name = "zetterburn"
+# path = "/Users/chrishafley/Library/Application Support/Steam/steamapps/workshop/content/383980/123456789"
+# kind = "rivals_strip"
+
+# [[pack]]
+# name = "clairen"
+# url  = "https://www.spriters-resource.com/.../clairen_sheet.png"
+# kind = "grid"
+# cols = 8
+# rows = 6
+# rows_order = ["idle", "walk", "jump", "fall", "jab", "nair"]
+
+# --- smoke-test packs (single-frame static images, just to exercise the pipeline) -------------
+
+[[pack]]
+name = "kermit"
+url  = "https://dinopixel.com/preload/0123/Kermit-The-Frog.png"
+kind = "rivals_strip"
+
+[[pack]]
+name = "obama"
+url  = "https://dinopixel.com/preload/0724/obama.png"
+kind = "rivals_strip"

@@ -141,6 +141,11 @@ pub fn checksum(s: &SimState) -> u128 {
         fold(f.hitstun as u64);
         fold(f.holding as u64);
         fold(f.coyote as u64);
+        fold(f.invuln as u64);
+        fold(f.grab_link as u64);
+        fold(f.grab_timer as u64);
+        fold(f.tech_buf as u64);
+        fold(f.tumble as u64);
     }
     fold(s.tick);
     fold(s.rng);
@@ -196,7 +201,7 @@ impl Game {
 /// `smash_net` (plus `ggrs` itself for the `NonBlockingSocket` trait it implements). Available on
 /// every build — NOT gated on the matchbox feature, since the Godot WebRTC transport lives in the
 /// shell and supplies its own socket.
-pub use ggrs::{GgrsError, Message, NonBlockingSocket, P2PSession, SessionState};
+pub use ggrs::{GgrsError, GgrsEvent, Message, NonBlockingSocket, P2PSession, SessionState};
 
 /// Build a 2-player rollback session over a caller-supplied socket (the transport). Handle order is
 /// FIXED so both peers agree: handle 0 = host, handle 1 = guest. `local_handle` says which one this
@@ -311,9 +316,60 @@ pub fn synctest_session(check_distance: usize) -> SyncTestSession<GgrsConfig> {
         .expect("synctest session")
 }
 
+/// Input capture + deterministic replay. A live session dumps an `InputLog` (both peers' wire
+/// inputs, one entry per frame); replaying it through the pure sim reproduces the match exactly.
+/// Used for regression fixtures and as a second determinism check alongside the SyncTest.
+pub mod replay {
+    use super::{checksum, decode, step, NetInput, SimState, Tune};
+    use serde::{Deserialize, Serialize};
+
+    /// A recorded match: both players' wire inputs per frame. Serializable (bincode) so a captured
+    /// session can be saved to bytes and replayed later without the engine or transport.
+    #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct InputLog {
+        pub frames: Vec<(NetInput, NetInput)>,
+    }
+
+    impl InputLog {
+        /// Append one frame of both peers' inputs (the shell calls this each tick to capture).
+        pub fn push(&mut self, p0: NetInput, p1: NetInput) {
+            self.frames.push((p0, p1));
+        }
+        pub fn len(&self) -> usize {
+            self.frames.len()
+        }
+        pub fn is_empty(&self) -> bool {
+            self.frames.is_empty()
+        }
+        /// Serialize to a compact byte blob (a fixture file or a network/debug dump).
+        pub fn to_bytes(&self) -> Vec<u8> {
+            bincode::serialize(self).expect("serialize input log")
+        }
+        /// Reload a captured log; `None` if the bytes aren't a valid log.
+        pub fn from_bytes(b: &[u8]) -> Option<Self> {
+            bincode::deserialize(b).ok()
+        }
+    }
+
+    /// Replay a log through the pure sim from spawn, returning the per-frame state checksums. Pure
+    /// and deterministic: the same log + Tune yields the same checksum stream on every run/machine.
+    pub fn replay(log: &InputLog, tune: &Tune) -> Vec<u128> {
+        let mut s = SimState::spawn();
+        let mut out = Vec::with_capacity(log.frames.len());
+        for &(p0, p1) in &log.frames {
+            let i0 = decode(p0);
+            let i1 = decode(p1);
+            s = step(&s, [&i0, &i1], tune);
+            out.push(checksum(&s));
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay::{replay, InputLog};
 
     /// Deterministic pseudo-random input stream so the sim visits many states (move, jump, dash,
     /// shield, attack, dodge) under rollback. Same seed -> same stream on both "peers".
@@ -343,6 +399,65 @@ mod tests {
                 .unwrap_or_else(|e| panic!("desync at frame {frame}: {e:?}"));
             game.handle(requests);
         }
+    }
+
+    /// Build a deterministic two-player input log (the "captured session" fixture).
+    fn fixture_log(frames: usize) -> InputLog {
+        let mut log = InputLog::default();
+        let mut s0 = 0xfeed_face_u64;
+        let mut s1 = 0x0bad_c0de_u64;
+        for _ in 0..frames {
+            log.push(gen_input(&mut s0), gen_input(&mut s1));
+        }
+        log
+    }
+
+    #[test]
+    fn replay_is_deterministic_across_runs() {
+        let t = Tune::default();
+        let log = fixture_log(900);
+        let a = replay(&log, &t);
+        let b = replay(&log, &t);
+        assert_eq!(a, b, "same log + tune must replay to the same checksum stream");
+        assert_eq!(a.len(), 900);
+    }
+
+    #[test]
+    fn fixture_survives_serialize_roundtrip_and_replays_identically() {
+        let t = Tune::default();
+        let log = fixture_log(600);
+        // serialize the captured log to bytes and reload it (a fixture file would do the same).
+        let bytes = log.to_bytes();
+        let reloaded = InputLog::from_bytes(&bytes).expect("reload captured log");
+        assert!(reloaded == log, "log survives a bincode round-trip"); // InputLog has no Debug
+        assert_eq!(
+            replay(&log, &t),
+            replay(&reloaded, &t),
+            "the reloaded fixture replays to the identical state stream",
+        );
+    }
+
+    #[test]
+    fn pure_replay_matches_the_ggrs_handler() {
+        // The rollback handler (Game::handle) and a straight pure replay must agree frame-for-frame,
+        // so the SyncTest path and offline play can never diverge.
+        let t = Tune::default();
+        let log = fixture_log(500);
+        let pure = replay(&log, &t);
+
+        let mut sess = synctest_session(2);
+        let mut game = Game::new(t);
+        let mut handler = Vec::with_capacity(log.frames.len());
+        for (frame, &(p0, p1)) in log.frames.iter().enumerate() {
+            sess.add_local_input(0, p0).expect("p0 input");
+            sess.add_local_input(1, p1).expect("p1 input");
+            let requests = sess
+                .advance_frame()
+                .unwrap_or_else(|e| panic!("desync at frame {frame}: {e:?}"));
+            game.handle(requests);
+            handler.push(checksum(&game.state));
+        }
+        assert_eq!(pure, handler, "pure replay and the ggrs handler must produce identical states");
     }
 
     #[test]

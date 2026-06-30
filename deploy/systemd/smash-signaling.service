@@ -9,6 +9,13 @@ Type=simple
 ExecStart=/root/.cargo/bin/smash-signaling
 Restart=on-failure
 RestartSec=2
+# All push/runtime config is env-driven (12-factor). The file is optional (leading '-'): with no
+# VAPID_PRIVATE_PEM the relay still runs, push just no-ops. `just vapid-keygen` writes the key + this
+# env file. StateDirectory gives /var/lib/smash-signaling for the subscription store (SUBS_PATH
+# defaults to ./subscriptions.json, resolved against WorkingDirectory).
+EnvironmentFile=-/etc/smash-signaling.env
+WorkingDirectory=/var/lib/smash-signaling
+StateDirectory=smash-signaling
 
 [Install]
 WantedBy=multi-user.target

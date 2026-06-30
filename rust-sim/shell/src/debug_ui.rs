@@ -1,4 +1,4 @@
-use godot::classes::{Camera2D, INode, InputEvent, InputEventKey, Node};
+use godot::classes::{Camera2D, HttpRequest, INode, InputEvent, InputEventKey, Node};
 use godot::global::Key;
 use godot::prelude::*;
 
@@ -18,6 +18,7 @@ enum Tab {
     Net,
     Identity,
     Gamepad,
+    Server,
 }
 
 /// Hosts the egui bridge and draws "our stuff" panel by reading/writing the KneeMan
@@ -33,6 +34,8 @@ pub struct DebugUi {
     camera: Option<Gd<Camera2D>>,
     show: bool,
     tab: Tab,
+    http: Option<Gd<HttpRequest>>,    // fetches the relay's /status JSON
+    server_status: Mutable<String>,   // latest status body (or a fetching/error message)
 }
 
 #[godot_api]
@@ -46,6 +49,8 @@ impl INode for DebugUi {
             camera: None,
             show: false, // start hidden; Cmd+Shift+J toggles
             tab: Tab::default(),
+            http: None,
+            server_status: Mutable::new(String::from("(not fetched)")),
         }
     }
 
@@ -66,6 +71,13 @@ impl INode for DebugUi {
             .base()
             .get_node_or_null("../Camera2D")
             .and_then(|n| n.try_cast::<Camera2D>().ok());
+
+        // HTTP client for the server-status tab. Web export routes this through the browser fetch.
+        let mut http = HttpRequest::new_alloc();
+        let cb = self.to_gd();
+        http.connect("request_completed", &Callable::from_object_method(&cb, "on_status"));
+        self.base_mut().add_child(&http);
+        self.http = Some(http);
     }
 
     fn input(&mut self, event: Gd<InputEvent>) {
@@ -75,6 +87,7 @@ impl INode for DebugUi {
         if !key.is_pressed() || key.is_echo() {
             return;
         }
+        // (set_open + is_open below give the on-screen MENU button the same control as backtick.)
         // Backtick toggles with no modifier — the web build can't use Cmd+Shift+J (Chrome eats it
         // as the devtools shortcut), and ` triggers no default browser action over the canvas.
         if key.get_keycode() == Key::QUOTELEFT {
@@ -103,19 +116,60 @@ impl INode for DebugUi {
         }
         let ctx = bridge.bind().current_frame().clone();
         // grab the shared BehaviorSubjects (cheap clones of the same cells)
-        let (state_cell, tune_cell, net_cell, identity_cell) = {
+        let (state_cell, tune_cell, net_cell, identity_cell, charsel_cell) = {
             let f = fighter.bind();
-            (f.state_cell(), f.tune_cell(), f.net_cell(), f.identity_cell())
+            (f.state_cell(), f.tune_cell(), f.net_cell(), f.identity_cell(), f.charsel_cell())
         };
+        let mut want_status = false;
         draw_panel(
             &ctx,
             &state_cell,
             &tune_cell,
             &net_cell,
             &identity_cell,
+            &charsel_cell,
             self.camera.clone(),
             &mut self.tab,
+            &self.server_status,
+            &mut want_status,
         );
+        if want_status {
+            self.fetch_status();
+        }
+    }
+}
+
+#[godot_api]
+impl DebugUi {
+    /// Show/hide the panel from outside (the on-screen MENU button drives this).
+    #[func]
+    pub fn set_open(&mut self, open: bool) {
+        self.show = open;
+    }
+
+    /// Whether the panel is currently open (the MENU button toggles off this).
+    #[func]
+    fn is_open(&self) -> bool {
+        self.show
+    }
+
+    /// Kick off a GET of the relay's /status page (the server-status tab's refresh button).
+    #[func]
+    fn fetch_status(&mut self) {
+        if let Some(http) = self.http.as_mut() {
+            self.server_status.set(String::from("fetching…"));
+            let _ = http.request(crate::rtc::STATUS_URL);
+        }
+    }
+
+    /// HttpRequest completion: stash the body (or an error) for the tab to render.
+    #[func]
+    fn on_status(&mut self, _result: i64, code: i64, _headers: PackedStringArray, body: PackedByteArray) {
+        if code != 200 {
+            self.server_status.set(format!("request failed (HTTP {code})"));
+            return;
+        }
+        self.server_status.set(body.get_string_from_utf8().to_string());
     }
 }
 
@@ -126,8 +180,11 @@ fn draw_panel(
     tune_cell: &Mutable<Tune>,
     net_cell: &Mutable<NetDebug>,
     identity_cell: &Mutable<Identity>,
+    charsel_cell: &Mutable<[i64; 2]>,
     camera: Option<Gd<Camera2D>>,
     tab: &mut Tab,
+    server_status: &Mutable<String>,
+    want_status: &mut bool,
 ) {
     let s = state_cell.get();
     let mut t = tune_cell.get();
@@ -141,6 +198,7 @@ fn draw_panel(
           ui.selectable_value(tab, Tab::Net, "net");
           ui.selectable_value(tab, Tab::Identity, "identity");
           ui.selectable_value(tab, Tab::Gamepad, "pad");
+          ui.selectable_value(tab, Tab::Server, "server");
       });
       ui.separator();
       egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
@@ -267,6 +325,7 @@ fn draw_panel(
         });
         egui::CollapsingHeader::new("items · laser").default_open(false).show(ui, |ui| {
             c |= ui.checkbox(&mut t.items_on, "items on").changed();
+            c |= ui.checkbox(&mut t.one_item_at_a_time, "one item at a time").changed();
             c |= islider(ui, &mut t.item_spawn_interval, 60..=1800, "spawn interval (f)");
             c |= slider(ui, &mut t.laser.spawn_weight, 0.0..=10.0, "spawn weight");
             c |= islider(ui, &mut t.laser.ammo, 1..=99, "ammo / gun");
@@ -278,13 +337,30 @@ fn draw_panel(
             c |= attack_sliders(ui, &mut t.laser.hit);
         });
 
+        egui::CollapsingHeader::new("items · bomb (red gun)").default_open(false).show(ui, |ui| {
+            c |= slider(ui, &mut t.bomb.spawn_weight, 0.0..=10.0, "spawn weight");
+            c |= islider(ui, &mut t.bomb.ammo, 1..=20, "ammo / gun");
+            c |= islider(ui, &mut t.bomb.cooldown, 1..=90, "shot cooldown (f)");
+            c |= slider(ui, &mut t.bomb.speed, 200.0..=2000.0, "lob speed");
+            c |= slider(ui, &mut t.bomb.proj_gravity, 0.0..=6000.0, "lob gravity");
+            c |= islider(ui, &mut t.bomb.range, 20..=300, "fuse (f)");
+            c |= slider(ui, &mut t.bomb.blast_r, 40.0..=400.0, "blast radius");
+            c |= attack_sliders(ui, &mut t.bomb.hit);
+        });
+
+        egui::CollapsingHeader::new("rules · kills + spawn").default_open(false).show(ui, |ui| {
+            c |= slider(ui, &mut t.knockback_mult, 0.5..=3.0, "knockback x (fly more)");
+            c |= islider(ui, &mut t.spawn_iframes, 0..=300, "spawn i-frames (f)");
+        });
+
         if c {
             tune_cell.set(t);
         }
         }
         Tab::Net => net_card(ui, &net_cell.get()),
-        Tab::Identity => identity_card(ui, identity_cell),
+        Tab::Identity => identity_card(ui, identity_cell, charsel_cell),
         Tab::Gamepad => gamepad_card(ui),
+        Tab::Server => server_card(ui, server_status, want_status),
         }
 
         ui.add_space(8.0);
@@ -324,10 +400,100 @@ fn net_card(ui: &mut egui::Ui, n: &NetDebug) {
     });
 }
 
+/// Server-status tab: a refresh button that fetches the relay's /status JSON, plus the raw body
+/// (build hash/time, uptime, connected/pending, each client's name + color). `want_status` is set
+/// when the button is clicked; `process` actuates the fetch (egui can't call Godot mid-draw).
+fn server_card(ui: &mut egui::Ui, status: &Mutable<String>, want_status: &mut bool) {
+    ui.horizontal(|ui| {
+        if ui.button("⟳ refresh").clicked() {
+            *want_status = true;
+        }
+        ui.label(egui::RichText::new(crate::rtc::STATUS_URL).color(theme::MUTED));
+    });
+    ui.add_space(6.0);
+    let body = status.get_cloned();
+    theme::card(ui, |ui| {
+        for (k, v) in pretty_status(&body) {
+            theme::stat(ui, &k, v);
+        }
+    });
+    ui.add_space(6.0);
+    ui.collapsing("raw json", |ui| {
+        ui.add(egui::Label::new(egui::RichText::new(&body).monospace()).wrap());
+    });
+}
+
+/// Best-effort flatten of the /status JSON into label rows. No serde in the shell, so this is a
+/// forgiving hand parse: top-level "key": value pairs become rows, and the "clients" array is
+/// summarized as one row per entry. Falls back to a single "status" row on anything unexpected.
+fn pretty_status(body: &str) -> Vec<(String, String)> {
+    let trimmed = body.trim();
+    if !trimmed.starts_with('{') {
+        return vec![("status".to_string(), trimmed.to_string())];
+    }
+    let mut rows = Vec::new();
+    // pull the clients array out first so its commas don't confuse the scalar split.
+    let (head, clients) = match trimmed.find("\"clients\"") {
+        Some(i) => (&trimmed[..i], &trimmed[i..]),
+        None => (trimmed, ""),
+    };
+    for field in head.trim_matches(|c| c == '{' || c == ',' || c == '}').split(',') {
+        let Some((k, v)) = field.split_once(':') else { continue };
+        let k = k.trim().trim_matches('"');
+        let v = v.trim().trim_matches('"');
+        if !k.is_empty() {
+            rows.push((k.to_string(), v.to_string()));
+        }
+    }
+    if !clients.is_empty() {
+        let n = clients.matches('{').count();
+        rows.push(("clients".to_string(), n.to_string()));
+        // surface each client's name (and color if present) as its own row.
+        for (idx, chunk) in clients.split('{').skip(1).enumerate() {
+            let name = json_field(chunk, "name").unwrap_or_else(|| "?".to_string());
+            let color = json_field(chunk, "color").unwrap_or_default();
+            rows.push((format!("  [{idx}]"), format!("{name} {color}").trim().to_string()));
+        }
+    }
+    rows
+}
+
+/// Tiny scalar field extractor: returns the string after `"key":` up to the next comma/brace.
+fn json_field(chunk: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let i = chunk.find(&pat)? + pat.len();
+    let rest = chunk[i..].trim_start().strip_prefix(':')?.trim_start();
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    Some(rest[..end].trim().trim_matches('"').to_string())
+}
+
 /// Player identity: name + color the sprite and nametag wear. Edits write back to the shared cell;
 /// KneeMan persists them to localStorage (web) and refreshes the tag. The color is godot-side RGBA;
 /// the picker works in RGB and rebuilds the color on change.
-fn identity_card(ui: &mut egui::Ui, cell: &Mutable<Identity>) {
+/// One "◀ name ▶" character cycle for a fighter slot. Writes the picked roster index into the
+/// shared charsel cell; KneeMan::sync_charsel applies it to the live sprite next frame. Roster
+/// names come from kneeman::roster_names (built-ins + assets/roster.json), so new packs show up here.
+fn char_row(ui: &mut egui::Ui, label: &str, slot: usize, charsel: &Mutable<[i64; 2]>) {
+    let names = crate::kneeman::roster_names();
+    let n = names.len().max(1) as i64;
+    let mut sel = charsel.get_cloned();
+    let cur = sel[slot].rem_euclid(n);
+    ui.horizontal(|ui| {
+        ui.colored_label(theme::MUTED, label);
+        if ui.small_button("◀").clicked() {
+            sel[slot] = (cur - 1).rem_euclid(n);
+            charsel.set(sel);
+        }
+        let name = names.get(cur as usize).map(String::as_str).unwrap_or("?");
+        ui.label(egui::RichText::new(name).strong());
+        if ui.small_button("▶").clicked() {
+            sel[slot] = (cur + 1).rem_euclid(n);
+            charsel.set(sel);
+        }
+    });
+}
+
+fn identity_card(ui: &mut egui::Ui, cell: &Mutable<Identity>, charsel: &Mutable<[i64; 2]>) {
     let mut id = cell.get_cloned();
     let mut changed = false;
     theme::card(ui, |ui| {
@@ -340,6 +506,8 @@ fn identity_card(ui: &mut egui::Ui, cell: &Mutable<Identity>) {
                 .response;
             changed |= resp.changed();
         });
+        char_row(ui, "P1 char", 0, charsel);
+        char_row(ui, "P2 char", 1, charsel);
         ui.horizontal(|ui| {
             ui.colored_label(theme::MUTED, "color");
             let mut rgb = [id.color.r, id.color.g, id.color.b];

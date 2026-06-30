@@ -27,3 +27,9 @@ assets/
 signaling/target/
 rust-sim/vendor/*/target/
 **/target/
+
+# --- tooling scratch (asset-fetcher venv + downloaded-pack cache) ---
+tools/.venv/
+tools/.cache/
+**/.venv/
+__pycache__/
