@@ -271,6 +271,7 @@ fn frog() -> Character {
             clip("jab", &["hit"], 7, 20.0, false),
             clip("nair", &["double_jump"], 6, 18.0, true),
             clip("dtilt", &["hit"], 7, 26.0, false), // pothole swing reuses the punch sheet, one-shot
+            clip("dair", &["hit"], 7, 26.0, false), // the stomp: reuse the swing sheet (per-box scrub replays it)
             clip("wallbounce", &["fall"], 1, 1.0, false), // wall hit: a single frozen frame, tilted in render
         ],
     }
@@ -654,6 +655,7 @@ pub struct KneeMan {
     saved_identity: Identity,           // last value written to localStorage (change detection)
     charsel: Mutable<[i64; 2]>,         // P1/P2 roster pick, written by the menu, applied live
     characters: [usize; sim::MAX_PLAYERS], // per-fighter index into ROSTER; charsel drives slots 0..2
+    base_scale: [f32; sim::MAX_PLAYERS],   // each sprite's resting scale (impact-pop multiplies it)
 
     // --- netplay (Godot WebRTC). All None/Offline until the player taps the status chip to join. ---
     phase: Phase,
@@ -705,6 +707,7 @@ impl INode2D for KneeMan {
             saved_identity: Identity::default(),
             charsel: Mutable::new([0, 1]),
             characters: [0, 1, 0, 1], // default: frog/zombie alternating; charsel overrides slots 0..2
+            base_scale: [1.0; sim::MAX_PLAYERS],
             phase: Phase::Offline,
             role: None,
             local_handle: 0,
@@ -761,6 +764,7 @@ impl INode2D for KneeMan {
             };
             if let Some(mut a) = sprite {
                 apply_character(&mut a, c);
+                self.base_scale[k] = c.scale;
                 // World-space siblings (slots 1..) add deferred: during ready() the parent is still
                 // "busy setting up children", so an immediate add_child is rejected. The tag is a
                 // world-space sibling for every slot.
@@ -1992,6 +1996,7 @@ impl KneeMan {
         sync_attack_frame(&mut a, f, &self.tune.get());
         a.set_flip_h(f.facing < 0.0); // frog faces right by default
         a.set_rotation(wall_tilt(f));
+        a.set_scale(Vector2::splat(self.base_scale[idx] * impact_pop(f))); // squash-pop on a connect
         a.set_modulate(sprite_tint(f, self.slot_tint(idx)));
     }
 
@@ -2029,6 +2034,7 @@ impl KneeMan {
             let c = &roster[idx];
             if let Some(mut a) = self.sprites[slot].clone() {
                 apply_character(&mut a, c);
+                self.base_scale[slot] = c.scale;
             }
         }
     }
@@ -2097,13 +2103,25 @@ impl KneeMan {
 
 /// The sprite's modulate: hit flash > intangible green > the player's color.
 fn sprite_tint(f: &Fighter, color: Color) -> Color {
-    if f.hitstun > 0 {
-        Color::from_rgb(1.0, 0.95, 0.55) // hit flash
+    if f.hitlag > 0 {
+        Color::from_rgb(1.0, 1.0, 1.0) // impact freeze: blow out to white (the hit "pop")
+    } else if f.hitstun > 0 {
+        Color::from_rgb(1.0, 0.95, 0.55) // hit flash while launched
     } else if f.intangible {
         Color::from_rgb(0.30, 0.95, 0.40)
     } else {
         color
     }
+}
+
+/// Impact squash-pop: on a connect both fighters freeze (`hitlag`) and we briefly scale the sprite up,
+/// easing back as the freeze decays — the classic platform-fighter "pop". 1.0 (no change) otherwise.
+/// Pure function of sim state, so it stays rollback-consistent.
+fn impact_pop(f: &Fighter) -> f32 {
+    if f.hitlag <= 0 {
+        return 1.0;
+    }
+    1.0 + 0.20 * (f.hitlag as f32 / 8.0).min(1.0)
 }
 
 /// A world-space nametag: small, the player's color, with a dark outline so it reads over the
@@ -2188,7 +2206,7 @@ fn clip_for(f: &Fighter) -> &'static str {
         Jab => "jab",
         Dtilt => "dtilt",
         Nair => "nair",
-        Dair => "fall",
+        Dair => "dair",
         DashAttack => "run",
         Grab | GrabHold => "jab",   // reach / hold reuse the swing pose
         Grabbed => "skid",          // held: a stumbled pose
@@ -2216,7 +2234,7 @@ fn clip_for(f: &Fighter) -> &'static str {
 /// `clip_for` (adding a state there with a new clip name means adding it here).
 const ALL_CLIPS: &[&str] = &[
     "idle", "walk", "run", "skid", "crouch", "jump", "fall", "hang", "climb", "jab", "nair", "dtilt",
-    "wallbounce",
+    "dair", "wallbounce",
 ];
 
 /// Where a missing clip falls back to. `clip_for` names a rich set of poses; a character need only
@@ -2274,8 +2292,19 @@ fn sync_attack_frame(a: &mut Gd<AnimatedSprite2D>, f: &Fighter, t: &Tune) {
     if n <= 1 {
         return; // a single-pose clip has nothing to step through
     }
-    let total = atk.total().max(1);
-    let idx = ((f.frame * n as i64) / total).clamp(0, n as i64 - 1);
+    // Scrub the swing across the CURRENT live hitbox window, so a multi-box move replays the
+    // animation once PER box: the 3-punch jab throws three visible punches, the stomp swings on each
+    // of its three timed boxes. Before the first box: hold the wind-up frame; between/after boxes:
+    // hold the last frame (the recoil) until the next box opens.
+    let last = n as i64 - 1;
+    let idx = if let Some(hb) = atk.box_at(f.frame) {
+        let local = f.frame - hb.start; // 0..len within this box's own window
+        ((local * n as i64) / hb.len.max(1)).clamp(0, last)
+    } else if f.frame < atk.startup {
+        0
+    } else {
+        last
+    };
     a.set_frame(idx as i32);
 }
 
