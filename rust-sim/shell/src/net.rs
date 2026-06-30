@@ -1,0 +1,140 @@
+//! Stateless netplay support: the `SimState` snapshot codec (bincode + base64 via Marshalls), room-
+//! code minting, the monotonic clock, the transport-state name formatters, and `NetDebug` -- the
+//! read-only snapshot the debug panel renders. The live transport state machine (`Phase`, `Room`,
+//! `SigCounts`) stays on the `KneeMan` node; this module is only the parts with no node coupling.
+
+use godot::classes::web_rtc_data_channel::ChannelState;
+use godot::classes::web_rtc_peer_connection::{ConnectionState, GatheringState, SignalingState};
+use godot::classes::web_socket_peer::State as WsState;
+use godot::prelude::*;
+
+use crate::sim::SimState;
+
+/// Monotonic ms clock (Godot's, so it works the same on native + the emscripten web build).
+pub(crate) fn now_ms() -> u64 {
+    godot::classes::Time::singleton().get_ticks_msec()
+}
+
+/// Mint a private room code for reconnect. Only the host calls this, once, so it just needs to be
+/// unlikely to collide with another pair's room at the same instant: microsecond clock xor'd with a
+/// hash of the host's name. Both peers then share THIS code (host sends it over the relay).
+pub(crate) fn mint_room_code(name: &str) -> String {
+    let t = godot::classes::Time::singleton().get_ticks_usec();
+    let salt = name.bytes().fold(0u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
+    format!("rm{:x}", t ^ salt.rotate_left(17))
+}
+
+/// Serialize a sim snapshot for the signaling channel: bincode bytes (same wire as ggrs messages),
+/// base64'd via Godot's Marshalls so it rides inside a JSON text frame.
+pub(crate) fn encode_state(s: &SimState) -> GString {
+    let bytes = bincode::serialize(s).expect("serialize SimState snapshot");
+    godot::classes::Marshalls::singleton().raw_to_base64(&PackedByteArray::from(bytes.as_slice()))
+}
+
+/// Inverse of `encode_state`. `None` if the base64/bincode doesn't decode (malformed frame), so the
+/// guest keeps waiting for a good one rather than resuming from garbage.
+pub(crate) fn decode_state(b64: &str) -> Option<SimState> {
+    let raw = godot::classes::Marshalls::singleton().base64_to_raw(b64);
+    bincode::deserialize::<SimState>(raw.as_slice()).ok()
+}
+
+/// Read-only snapshot of the netplay transport machine for the debug panel. Every field is a
+/// `&'static str` (Copy) so it rides a `Mutable` cheaply; the human names are resolved in the shell
+/// (here) where the godot WebRTC enums are in scope. Counts are (sent, received) for each handshake
+/// frame kind so a stall shows where it stuck (offer out but no answer in = guest/relay drop, etc).
+#[derive(Clone, Copy)]
+pub struct NetDebug {
+    pub phase: &'static str,
+    pub role: &'static str,
+    pub handle: usize,
+    pub ws: &'static str,      // signaling socket
+    pub conn: &'static str,    // RTCPeerConnection.connectionState
+    pub gather: &'static str,  // ICE gathering
+    pub signal: &'static str,  // SDP signaling
+    pub channel: &'static str, // ggrs data channel
+    pub offer: (u32, u32),
+    pub answer: (u32, u32),
+    pub ice: (u32, u32),
+}
+
+impl Default for NetDebug {
+    fn default() -> Self {
+        Self {
+            phase: "offline",
+            role: "—",
+            handle: 0,
+            ws: "—",
+            conn: "—",
+            gather: "—",
+            signal: "—",
+            channel: "—",
+            offer: (0, 0),
+            answer: (0, 0),
+            ice: (0, 0),
+        }
+    }
+}
+
+// --- transport-state names for the debug panel. gdext models these as newtype structs (not real
+// enums), so resolve by `==` rather than match patterns. ----------------------------------------
+pub(crate) fn ws_name(s: WsState) -> &'static str {
+    if s == WsState::CONNECTING {
+        "connecting"
+    } else if s == WsState::OPEN {
+        "open"
+    } else if s == WsState::CLOSING {
+        "closing"
+    } else {
+        "closed"
+    }
+}
+pub(crate) fn chan_name(s: ChannelState) -> &'static str {
+    if s == ChannelState::CONNECTING {
+        "connecting"
+    } else if s == ChannelState::OPEN {
+        "open"
+    } else if s == ChannelState::CLOSING {
+        "closing"
+    } else {
+        "closed"
+    }
+}
+pub(crate) fn conn_name(s: ConnectionState) -> &'static str {
+    if s == ConnectionState::NEW {
+        "new"
+    } else if s == ConnectionState::CONNECTING {
+        "connecting"
+    } else if s == ConnectionState::CONNECTED {
+        "connected"
+    } else if s == ConnectionState::DISCONNECTED {
+        "disconnected"
+    } else if s == ConnectionState::FAILED {
+        "failed"
+    } else {
+        "closed"
+    }
+}
+pub(crate) fn gather_name(s: GatheringState) -> &'static str {
+    if s == GatheringState::NEW {
+        "new"
+    } else if s == GatheringState::GATHERING {
+        "gathering"
+    } else {
+        "complete"
+    }
+}
+pub(crate) fn signal_name(s: SignalingState) -> &'static str {
+    if s == SignalingState::STABLE {
+        "stable"
+    } else if s == SignalingState::HAVE_LOCAL_OFFER {
+        "have-local-offer"
+    } else if s == SignalingState::HAVE_REMOTE_OFFER {
+        "have-remote-offer"
+    } else if s == SignalingState::HAVE_LOCAL_PRANSWER {
+        "have-local-pranswer"
+    } else if s == SignalingState::HAVE_REMOTE_PRANSWER {
+        "have-remote-pranswer"
+    } else {
+        "closed"
+    }
+}

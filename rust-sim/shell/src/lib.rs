@@ -3,6 +3,10 @@ use godot::prelude::*;
 mod ui; // egui debug panel + XP menu nav system + themes (builds on wasm via patched gdext-egui)
 mod controls; // sole device->InputFrame boundary (GameAction universe)
 mod kneeman; // impure shell: input -> step -> publish -> render
+mod roster; // character roster: built-ins + assets/roster.json loader (pure data, lifted from kneeman)
+mod sprite; // sprite/label render helpers: tint, tags, AnimatedSprite2D clip + SpriteFrames machinery
+mod identity; // local player identity: name/color + per-slot defaults + user://identity.cfg persistence
+mod net; // stateless netplay support: snapshot codec, room codes, transport-state names, NetDebug DTO
 mod grid; // training-room grid backdrop
 mod rtc; // Godot WebRTC netplay transport (ggrs over a browser data channel)
 

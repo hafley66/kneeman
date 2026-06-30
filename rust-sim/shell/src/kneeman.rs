@@ -1,18 +1,27 @@
 use futures_signals::signal::Mutable;
 use godot::classes::web_rtc_data_channel::ChannelState;
-use godot::classes::web_rtc_peer_connection::{ConnectionState, GatheringState, SignalingState};
+use godot::classes::web_rtc_peer_connection::ConnectionState;
 use godot::classes::web_socket_peer::State as WsState;
 use godot::classes::{
-    AnimatedSprite2D, AtlasTexture, Button, Camera2D, CanvasLayer, ColorRect, FileAccess, Gradient,
-    GradientTexture2D, HttpRequest, INode2D, Input, InputEvent, InputEventScreenDrag,
-    InputEventScreenTouch, Json, Label, Node2D, Panel, Polygon2D, SpriteFrames, StyleBoxFlat,
-    Texture2D, TextureRect, WebRtcDataChannel, WebRtcPeerConnection, WebSocketPeer,
+    AnimatedSprite2D, Button, Camera2D, CanvasLayer, ColorRect, Gradient, GradientTexture2D,
+    HttpRequest, INode2D, Input, InputEvent, InputEventScreenDrag, InputEventScreenTouch, Label,
+    Node2D, Panel, Polygon2D, StyleBoxFlat, TextureRect, WebRtcDataChannel, WebRtcPeerConnection,
+    WebSocketPeer,
 };
 use godot::prelude::*;
-use godot::tools::try_load;
 
+use crate::identity::{load_identity, save_identity, slot_color, slot_name, Identity};
+use crate::net::{
+    chan_name, conn_name, decode_state, encode_state, gather_name, mint_room_code, now_ms,
+    signal_name, ws_name, NetDebug,
+};
+use crate::roster::roster;
 use crate::rtc::{self, Role, RtcSocket};
 use crate::sim::{self, CharState, Fighter, InputFrame, SimState, Tune};
+use crate::sprite::{
+    apply_character, clip_for, impact_pop, make_edge_tag, make_hud_label, make_tag, place_tag,
+    resolve_clip, sprite_tint, sync_attack_frame, wall_tilt,
+};
 use smash_net::{encode, start_p2p, Advance, GgrsNetplay, NetInput, Netplay, Smash, SmashGame};
 
 /// Netplay lifecycle. Offline = local single-player (default). Signaling = dialing the relay +
@@ -40,70 +49,6 @@ struct Room {
     deadline_ms: Option<u64>,
 }
 
-/// Monotonic ms clock (Godot's, so it works the same on native + the emscripten web build).
-fn now_ms() -> u64 {
-    godot::classes::Time::singleton().get_ticks_msec()
-}
-
-/// Mint a private room code for reconnect. Only the host calls this, once, so it just needs to be
-/// unlikely to collide with another pair's room at the same instant: microsecond clock xor'd with a
-/// hash of the host's name. Both peers then share THIS code (host sends it over the relay).
-fn mint_room_code(name: &str) -> String {
-    let t = godot::classes::Time::singleton().get_ticks_usec();
-    let salt = name.bytes().fold(0u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
-    format!("rm{:x}", t ^ salt.rotate_left(17))
-}
-
-/// Serialize a sim snapshot for the signaling channel: bincode bytes (same wire as ggrs messages),
-/// base64'd via Godot's Marshalls so it rides inside a JSON text frame.
-fn encode_state(s: &SimState) -> GString {
-    let bytes = bincode::serialize(s).expect("serialize SimState snapshot");
-    godot::classes::Marshalls::singleton().raw_to_base64(&PackedByteArray::from(bytes.as_slice()))
-}
-
-/// Inverse of `encode_state`. `None` if the base64/bincode doesn't decode (malformed frame), so the
-/// guest keeps waiting for a good one rather than resuming from garbage.
-fn decode_state(b64: &str) -> Option<SimState> {
-    let raw = godot::classes::Marshalls::singleton().base64_to_raw(b64);
-    bincode::deserialize::<SimState>(raw.as_slice()).ok()
-}
-
-/// Read-only snapshot of the netplay transport machine for the debug panel. Every field is a
-/// `&'static str` (Copy) so it rides a `Mutable` cheaply; the human names are resolved in the shell
-/// (here) where the godot WebRTC enums are in scope. Counts are (sent, received) for each handshake
-/// frame kind so a stall shows where it stuck (offer out but no answer in = guest/relay drop, etc).
-#[derive(Clone, Copy)]
-pub struct NetDebug {
-    pub phase: &'static str,
-    pub role: &'static str,
-    pub handle: usize,
-    pub ws: &'static str,      // signaling socket
-    pub conn: &'static str,    // RTCPeerConnection.connectionState
-    pub gather: &'static str,  // ICE gathering
-    pub signal: &'static str,  // SDP signaling
-    pub channel: &'static str, // ggrs data channel
-    pub offer: (u32, u32),
-    pub answer: (u32, u32),
-    pub ice: (u32, u32),
-}
-
-impl Default for NetDebug {
-    fn default() -> Self {
-        Self {
-            phase: "offline",
-            role: "—",
-            handle: 0,
-            ws: "—",
-            conn: "—",
-            gather: "—",
-            signal: "—",
-            channel: "—",
-            offer: (0, 0),
-            answer: (0, 0),
-            ice: (0, 0),
-        }
-    }
-}
 
 /// Signaling-frame tallies kept on the node; folded into `NetDebug` each frame.
 #[derive(Default, Clone, Copy)]
@@ -116,274 +61,11 @@ struct SigCounts {
     ice_in: u32,
 }
 
-/// Local player presentation: the nametag text + color the sprite and tag wear. NOT sim state
-/// (purely cosmetic, never rolled back). Lives on the node as a `Mutable` so the debug panel's
-/// Identity tab edits it and the renderer reads it. Persisted to/from browser localStorage on the
-/// web build; defaults on desktop.
-#[derive(Clone, PartialEq)]
-pub struct Identity {
-    pub name: String,
-    pub color: Color,
-    pub font_px: i32, // nametag font size (HUD-wide; both tags share the local player's setting)
-}
 
-impl Default for Identity {
-    fn default() -> Self {
-        Self { name: "Player".into(), color: Color::from_rgb(0.35, 0.75, 1.0), font_px: 32 }
-    }
-}
-
-/// Presentation color for a non-local fighter (slot 0 wears the local identity color instead).
-/// Cosmetic only — never folded into the netplay checksum, so it can never desync a session.
-fn slot_color(idx: usize) -> Color {
-    match idx {
-        1 => Color::from_rgb(1.0, 0.55, 0.35),  // orange
-        2 => Color::from_rgb(0.45, 0.92, 0.50), // green
-        3 => Color::from_rgb(0.80, 0.55, 0.95), // purple
-        _ => Color::from_rgb(0.35, 0.75, 1.0),  // blue (slot-0 fallback)
-    }
-}
-
-/// Nametag text for a non-local fighter ("P2".."P4"); slot 0 wears the local identity name.
-fn slot_name(idx: usize) -> String {
-    format!("P{}", idx + 1)
-}
-
-/// Cap the name length and trim; cosmetic only (the tag and the saved file both show this).
-fn sanitize_name(s: &str) -> String {
-    let t: String = s.chars().take(16).collect();
-    let t = t.trim();
-    if t.is_empty() { "Player".into() } else { t.to_string() }
-}
-
-/// Identity persistence. `user://` is Godot's per-user store: a real file on native, IndexedDB on
-/// the web export — Godot bridges the platform difference, so one code path covers both (no
-/// `JavaScriptBridge`, no platform `cfg`). `ConfigFile` serializes Variants, so the `Color` round-
-/// trips natively without any hex conversion.
-const IDENTITY_PATH: &str = "user://identity.cfg";
-
-fn load_identity() -> Identity {
-    let mut id = Identity::default();
-    let mut cfg = godot::classes::ConfigFile::new_gd();
-    if cfg.load(IDENTITY_PATH) != godot::global::Error::OK {
-        return id;
-    }
-    if let Ok(g) = cfg.get_value("player", "name").try_to::<GString>() {
-        let s = g.to_string();
-        if !s.is_empty() {
-            id.name = sanitize_name(&s);
-        }
-    }
-    if let Ok(c) = cfg.get_value("player", "color").try_to::<Color>() {
-        id.color = c;
-    }
-    if let Ok(px) = cfg.get_value("player", "font_px").try_to::<i64>() {
-        id.font_px = (px as i32).clamp(10, 96);
-    }
-    id
-}
-
-fn save_identity(id: &Identity) {
-    let mut cfg = godot::classes::ConfigFile::new_gd();
-    let _ = cfg.load(IDENTITY_PATH); // keep any other keys already on disk
-    cfg.set_value("player", "name", &GString::from(sanitize_name(&id.name).as_str()).to_variant());
-    cfg.set_value("player", "color", &id.color.to_variant());
-    cfg.set_value("player", "font_px", &(id.font_px as i64).to_variant());
-    cfg.save(IDENTITY_PATH);
-}
-
-// Character roster. Cosmetic only -- a character's art is never folded into smash_net::checksum,
-// so adding or reordering the roster cannot desync a netplay session. Each fighter slot holds an
-// index into the roster (KneeMan::characters); char-select (later) just writes those indices.
-//
-// The roster is two built-ins (frog/zombie) followed by whatever `assets/roster.json` declares.
-// That JSON is written by `tools/fetch_packs.py`, which fetches + converts sprite packs and drops
-// `<clip>_strip<N>.png` files into `assets/<dir>/`. So adding a character is: edit tools/packs.toml,
-// run `just packs`. The runtime never hardcodes a fetched character.
-struct Character {
-    dir: String,      // asset subdir under res://assets/
-    scale: f32,       // node scale so the art lands ~140px tall (near the ECB height)
-    offset_y: f32,    // sprite offset (texture px) so the feet sit on pos
-    sheet: Sheet,     // how this character's PNGs are laid out on disk
-    clips: Vec<Clip>, // one per CharState clip name (see clip_for)
-}
-
-/// How a character's frames are stored.
-enum Sheet {
-    /// One horizontal strip per clip, sliced into `frames` cells. `frame_px` is the cell width; 0
-    /// means "derive from texture width / frame count" (the fetch script leaves it 0). Cell height
-    /// is the full strip height, so non-square Rivals frames slice correctly. File = `<file>.png`.
-    Strip { frame_px: f32 },
-    /// One whole PNG per pose, named `<prefix>_<file>.png`. Each entry in `clip.files` is one frame.
-    Poses { prefix: String },
-}
-
-/// One animation clip. For Strip, `files` holds the single strip name and `frames` is the cell
-/// count; for Poses, `files` is the per-frame pose list and `frames` is ignored.
-struct Clip {
-    name: String,
-    files: Vec<String>,
-    frames: i32,
-    fps: f64,
-    looped: bool,
-}
-
-fn clip(name: &str, files: &[&str], frames: i32, fps: f64, looped: bool) -> Clip {
-    Clip {
-        name: name.to_string(),
-        files: files.iter().map(|s| s.to_string()).collect(),
-        frames,
-        fps,
-        looped,
-    }
-}
-
-/// Display names for the roster, in index order (the menu char-select labels each pick with these).
-pub(crate) fn roster_names() -> Vec<String> {
-    roster().into_iter().map(|c| c.dir).collect()
-}
-
-/// The live roster: the two built-ins, then any characters declared in `assets/roster.json`.
-fn roster() -> Vec<Character> {
-    let mut v = vec![frog(), zombie()];
-    v.extend(load_roster_json());
-    v
-}
-
-/// P1 default: the Kenney/PixelFrog ninja frog (32px strips). CC0 placeholder art.
-fn frog() -> Character {
-    Character {
-        dir: "pixelfrog/ninjafrog".to_string(),
-        scale: 4.4, // 32px art -> ~140px tall, matching the ECB body
-        offset_y: -12.0,
-        sheet: Sheet::Strip { frame_px: 32.0 },
-        clips: vec![
-            clip("idle", &["idle"], 11, 14.0, true),
-            clip("walk", &["run"], 12, 14.0, true),
-            clip("run", &["run"], 12, 20.0, true),
-            clip("crouch", &["fall"], 1, 1.0, false),
-            clip("skid", &["fall"], 1, 1.0, false),
-            clip("jump", &["jump"], 1, 1.0, false),
-            clip("fall", &["fall"], 1, 1.0, false),
-            clip("hang", &["wall_jump"], 5, 12.0, true),
-            clip("climb", &["double_jump"], 6, 14.0, true),
-            clip("jab", &["hit"], 7, 20.0, false),
-            clip("nair", &["double_jump"], 6, 18.0, true),
-            clip("dtilt", &["hit"], 7, 26.0, false), // pothole swing reuses the punch sheet, one-shot
-            clip("dair", &["hit"], 7, 26.0, false), // the stomp: reuse the swing sheet (per-box scrub replays it)
-            clip("wallbounce", &["fall"], 1, 1.0, false), // wall hit: a single frozen frame, tilted in render
-        ],
-    }
-}
-
-/// P2 default: the Kenney zombie (single-pose PNGs). Different silhouette from the frog.
-fn zombie() -> Character {
-    Character {
-        dir: "kenney/zombie".to_string(),
-        scale: 1.27, // 110px art -> ~140px tall, matching the ECB body
-        offset_y: -55.0,
-        sheet: Sheet::Poses { prefix: "zombie".to_string() },
-        clips: vec![
-            clip("idle", &["idle"], 1, 1.0, false),
-            clip("walk", &["walk1", "walk2"], 2, 8.0, true),
-            clip("run", &["walk1", "walk2"], 2, 13.0, true),
-            clip("skid", &["skid"], 1, 1.0, false),
-            clip("crouch", &["duck"], 1, 1.0, false),
-            clip("jump", &["jump"], 1, 1.0, false),
-            clip("fall", &["fall"], 1, 1.0, false),
-            clip("hang", &["hang"], 1, 1.0, false),
-            clip("climb", &["climb1", "climb2"], 2, 8.0, true),
-            clip("jab", &["action1"], 1, 1.0, false),
-            clip("nair", &["kick"], 1, 1.0, false),
-            clip("dtilt", &["duck"], 1, 1.0, false),     // pothole reuses the duck pose
-            clip("wallbounce", &["hurt"], 1, 1.0, false), // wall hit reuses the hurt pose
-        ],
-    }
-}
-
-/// Parse `res://assets/roster.json` (written by `tools/fetch_packs.py`) into extra characters.
-/// Missing file or malformed JSON yields an empty list -- the built-ins always work, so a bad
-/// roster never bricks the game. Schema (per character):
-/// `{ "dir","scale","offset_y","sheet":"strip"|"poses","prefix"?,"frame_px"?,
-///    "clips":[{ "name","files":[..],"frames","fps","loop" }] }`
-fn load_roster_json() -> Vec<Character> {
-    let path = "res://assets/roster.json";
-    if !FileAccess::file_exists(path) {
-        return Vec::new();
-    }
-    let Some(text) = FileAccess::open(path, godot::classes::file_access::ModeFlags::READ)
-        .map(|f| f.get_as_text().to_string())
-    else {
-        return Vec::new();
-    };
-    let parsed = Json::parse_string(text.as_str());
-    let Ok(root) = parsed.try_to::<Dictionary>() else {
-        return Vec::new();
-    };
-    let Some(list) = root.get("characters").and_then(|v| v.try_to::<VariantArray>().ok()) else {
-        return Vec::new();
-    };
-    list.iter_shared()
-        .filter_map(|v| v.try_to::<Dictionary>().ok())
-        .filter_map(parse_character)
-        .collect()
-}
-
-/// One character dict -> Character. Returns None on a missing required field so one bad entry is
-/// skipped rather than poisoning the whole roster.
-fn parse_character(d: Dictionary) -> Option<Character> {
-    let dir = jstr(&d, "dir")?;
-    let scale = jnum(&d, "scale").unwrap_or(1.0) as f32;
-    let offset_y = jnum(&d, "offset_y").unwrap_or(0.0) as f32;
-    let sheet = match jstr(&d, "sheet").as_deref() {
-        Some("poses") => Sheet::Poses { prefix: jstr(&d, "prefix").unwrap_or_default() },
-        _ => Sheet::Strip { frame_px: jnum(&d, "frame_px").unwrap_or(0.0) as f32 },
-    };
-    let clips = d
-        .get("clips")
-        .and_then(|v| v.try_to::<VariantArray>().ok())
-        .map(|arr| {
-            arr.iter_shared()
-                .filter_map(|c| c.try_to::<Dictionary>().ok())
-                .filter_map(parse_clip)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if clips.is_empty() {
-        return None;
-    }
-    Some(Character { dir, scale, offset_y, sheet, clips })
-}
-
-fn parse_clip(d: Dictionary) -> Option<Clip> {
-    let name = jstr(&d, "name")?;
-    let files = d
-        .get("files")
-        .and_then(|v| v.try_to::<VariantArray>().ok())
-        .map(|arr| arr.iter_shared().filter_map(|f| f.try_to::<GString>().ok().map(|g| g.to_string())).collect())
-        .unwrap_or_else(|| vec![name.clone()]);
-    Some(Clip {
-        name,
-        files,
-        frames: jnum(&d, "frames").unwrap_or(1.0) as i32,
-        fps: jnum(&d, "fps").unwrap_or(12.0),
-        looped: d.get("loop").and_then(|v| v.try_to::<bool>().ok()).unwrap_or(false),
-    })
-}
-
-/// Read a string field from a Json-parsed Dictionary.
-fn jstr(d: &Dictionary, key: &str) -> Option<String> {
-    d.get(key).and_then(|v| v.try_to::<GString>().ok()).map(|g| g.to_string())
-}
-
-/// Read a number field (Json numbers come back as f64).
-fn jnum(d: &Dictionary, key: &str) -> Option<f64> {
-    d.get(key).and_then(|v| v.try_to::<f64>().ok())
-}
 
 /// Boundary: the pure sim speaks glam::Vec2; Godot wants its own Vector2. Convert on the way out.
 #[inline]
-fn gv(v: sim::Vector2) -> Vector2 {
+pub(crate) fn gv(v: sim::Vector2) -> Vector2 {
     Vector2::new(v.x, v.y)
 }
 
@@ -553,69 +235,6 @@ thread_local! {
     static TOUCH_STICK_ZONE_X: std::cell::Cell<f32> = const { std::cell::Cell::new(736.0) };
 }
 
-// --- transport-state names for the debug panel. gdext models these as newtype structs (not real
-// enums), so resolve by `==` rather than match patterns. ----------------------------------------
-fn ws_name(s: WsState) -> &'static str {
-    if s == WsState::CONNECTING {
-        "connecting"
-    } else if s == WsState::OPEN {
-        "open"
-    } else if s == WsState::CLOSING {
-        "closing"
-    } else {
-        "closed"
-    }
-}
-fn chan_name(s: ChannelState) -> &'static str {
-    if s == ChannelState::CONNECTING {
-        "connecting"
-    } else if s == ChannelState::OPEN {
-        "open"
-    } else if s == ChannelState::CLOSING {
-        "closing"
-    } else {
-        "closed"
-    }
-}
-fn conn_name(s: ConnectionState) -> &'static str {
-    if s == ConnectionState::NEW {
-        "new"
-    } else if s == ConnectionState::CONNECTING {
-        "connecting"
-    } else if s == ConnectionState::CONNECTED {
-        "connected"
-    } else if s == ConnectionState::DISCONNECTED {
-        "disconnected"
-    } else if s == ConnectionState::FAILED {
-        "failed"
-    } else {
-        "closed"
-    }
-}
-fn gather_name(s: GatheringState) -> &'static str {
-    if s == GatheringState::NEW {
-        "new"
-    } else if s == GatheringState::GATHERING {
-        "gathering"
-    } else {
-        "complete"
-    }
-}
-fn signal_name(s: SignalingState) -> &'static str {
-    if s == SignalingState::STABLE {
-        "stable"
-    } else if s == SignalingState::HAVE_LOCAL_OFFER {
-        "have-local-offer"
-    } else if s == SignalingState::HAVE_REMOTE_OFFER {
-        "have-remote-offer"
-    } else if s == SignalingState::HAVE_LOCAL_PRANSWER {
-        "have-local-pranswer"
-    } else if s == SignalingState::HAVE_REMOTE_PRANSWER {
-        "have-remote-pranswer"
-    } else {
-        "closed"
-    }
-}
 
 /// KneeMan: the impure SHELL around the pure sim.
 /// Owns the BehaviorSubjects (state + tune). Each tick: sample input -> pure step ->
@@ -627,6 +246,7 @@ pub struct KneeMan {
     base: Base<Node2D>,
     state: Mutable<SimState>, // source of truth, observed everywhere
     tune: Mutable<Tune>,      // live config, written by egui
+    gizmos: Mutable<bool>,    // debug overlay toggle: draw ECB/hurtbox/hitbox boxes (panel checkbox)
     // Per-fighter render slots, indexed 0..active. `sprites[0]` is the node's own "Anim" child
     // (positioned via the node); `sprites[1..]` are world-space siblings positioned each frame.
     sprites: [Option<Gd<AnimatedSprite2D>>; sim::MAX_PLAYERS], // driven by CharState per fighter
@@ -681,6 +301,7 @@ impl INode2D for KneeMan {
             base,
             state: Mutable::new(SimState::spawn()),
             tune: Mutable::new(Tune::default()),
+            gizmos: Mutable::new(false),
             sprites: Default::default(),
             dummy: None,
             tags: Default::default(),
@@ -1056,6 +677,9 @@ impl INode2D for KneeMan {
             }
         }
 
+        // ECB / hurtbox / hitbox boxes: opt-in debug overlay, gated by the panel's "show hitboxes"
+        // checkbox (the `gizmos` cell). Off by default; the items/ink/juice below always draw.
+        if self.gizmos.get() {
         let ecb = Color::from_rgba(0.20, 0.85, 0.95, 0.85);
         let hurt_col = Color::from_rgba(0.95, 0.85, 0.20, 0.30);
         let hit_col = Color::from_rgba(0.95, 0.25, 0.25, 0.45);
@@ -1086,6 +710,7 @@ impl INode2D for KneeMan {
                 self.base_mut().draw_circle(c, hr, hit_col);
             }
         }
+        } // end gizmos overlay
 
         // items + projectiles (debug shapes for now; model_id -> sprite is the later polish)
         for it in &s.items {
@@ -1271,6 +896,10 @@ impl KneeMan {
 
     pub fn tune_cell(&self) -> Mutable<Tune> {
         self.tune.clone()
+    }
+
+    pub fn gizmos_cell(&self) -> Mutable<bool> {
+        self.gizmos.clone()
     }
 
     pub fn net_cell(&self) -> Mutable<NetDebug> {
@@ -2137,314 +1766,3 @@ impl KneeMan {
     }
 }
 
-/// The sprite's modulate: hit flash > intangible green > the player's color.
-fn sprite_tint(f: &Fighter, color: Color) -> Color {
-    if f.hitlag > 0 {
-        Color::from_rgb(1.0, 1.0, 1.0) // impact freeze: blow out to white (the hit "pop")
-    } else if f.hitstun > 0 {
-        Color::from_rgb(1.0, 0.95, 0.55) // hit flash while launched
-    } else if f.intangible {
-        Color::from_rgb(0.30, 0.95, 0.40)
-    } else {
-        color
-    }
-}
-
-/// Impact squash-pop: on a connect both fighters freeze (`hitlag`) and we briefly scale the sprite up,
-/// easing back as the freeze decays — the classic platform-fighter "pop". 1.0 (no change) otherwise.
-/// Pure function of sim state, so it stays rollback-consistent.
-fn impact_pop(f: &Fighter) -> f32 {
-    if f.hitlag <= 0 {
-        return 1.0;
-    }
-    1.0 + 0.20 * (f.hitlag as f32 / 8.0).min(1.0)
-}
-
-/// A world-space nametag: small, the player's color, with a dark outline so it reads over the
-/// light stage. Centered horizontally each frame in `place_tag` (Label origin is top-left).
-fn make_tag(name: &str, color: Color, font_px: i32) -> Gd<Label> {
-    let mut l = Label::new_alloc();
-    l.set_text(name);
-    l.add_theme_font_size_override("font_size", font_px);
-    l.add_theme_color_override("font_color", color);
-    l.add_theme_constant_override("outline_size", 6);
-    l.add_theme_color_override("font_outline_color", Color::from_rgba(0.05, 0.06, 0.10, 0.92));
-    l.set_z_index(100); // above the sprites
-    l
-}
-
-/// An off-stage chip: screen-pinned, the player's color on a dark rounded chip, hidden until the
-/// fighter leaves the view. Text (name + arrow + distance) and position are set in `place_edge_tags`.
-fn make_edge_tag(color: Color) -> Gd<Label> {
-    let mut l = Label::new_alloc();
-    l.add_theme_font_size_override("font_size", 26);
-    l.add_theme_color_override("font_color", color);
-    l.add_theme_constant_override("outline_size", 5);
-    l.add_theme_color_override("font_outline_color", Color::from_rgba(0.04, 0.05, 0.09, 0.95));
-    let mut bg = godot::classes::StyleBoxFlat::new_gd();
-    bg.set_bg_color(Color::from_rgba(0.08, 0.10, 0.16, 0.85));
-    bg.set_corner_radius_all(8);
-    bg.set_content_margin_all(8.0);
-    l.add_theme_stylebox_override("normal", &bg);
-    l.set_visible(false);
-    l
-}
-
-/// A bottom-HUD damage label: big, outlined, on a dark chip so the % reads over the white stage.
-/// Color + text are refreshed every frame in `update_hud`.
-fn make_hud_label(color: Color) -> Gd<Label> {
-    let mut l = Label::new_alloc();
-    l.add_theme_font_size_override("font_size", 38);
-    l.add_theme_color_override("font_color", color);
-    l.add_theme_constant_override("outline_size", 8);
-    l.add_theme_color_override("font_outline_color", Color::from_rgba(0.04, 0.05, 0.09, 0.95));
-    let mut bg = godot::classes::StyleBoxFlat::new_gd();
-    bg.set_bg_color(Color::from_rgba(0.07, 0.09, 0.14, 0.80));
-    bg.set_corner_radius_all(8);
-    bg.set_content_margin_all(10.0);
-    l.add_theme_stylebox_override("normal", &bg);
-    l.set_z_index(100);
-    l
-}
-
-/// Position a nametag above a fighter's feet position, centered on the body.
-fn place_tag(tag: &mut Gd<Label>, feet: sim::Vector2) {
-    const TAG_RISE: f32 = 168.0; // above the feet, clear of the ~140px-tall sprite's head
-    let half_w = tag.get_size().x * 0.5;
-    let head = gv(feet) + Vector2::new(-half_w, -TAG_RISE);
-    tag.set_global_position(head);
-}
-
-/// CharState -> SpriteFrames clip. 15 states collapse onto ~9 clips (choppy by design;
-/// the Kenney pose set has no per-state art). Air splits rise/fall by vertical velocity.
-fn clip_for(f: &Fighter) -> &'static str {
-    use CharState::*;
-    // A fresh wall bounce overrides the launch state: show the tilted bounce frame while the window
-    // (set in the sim's hitstun block) is open. Cosmetic only — the sim drives the physics.
-    if f.wall_hit > 0 {
-        return "wallbounce";
-    }
-    match f.state {
-        Stand => "idle",
-        Walk | Roll => "walk",
-        Dash | Run => "run",
-        Turn | Skid => "skid",
-        Crouch | JumpSquat | SpotDodge | Landing | Shield => "crouch",
-        Air | AirDodge => {
-            if f.vel.y < 0.0 {
-                "jump"
-            } else {
-                "fall"
-            }
-        }
-        LedgeHold => "hang",
-        LedgeClimb => "climb",
-        Jab => "jab",
-        Dtilt => "dtilt",
-        Nair => "nair",
-        Dair => "dair",
-        DashAttack => "run",
-        Grab | GrabHold => "jab",   // reach / hold reuse the swing pose
-        Grabbed => "skid",          // held: a stumbled pose
-        Knockdown => "crouch",      // floored: low pose
-        Getup => "crouch",          // rising
-        TechInPlace => "skid",      // braced recovery
-        TechRoll => "walk",         // rolling across the ground
-
-        SpecialN | SpecialS | SpecialD => "jab", // reuse the swing pose until specials get art
-        SpecialU => "jump",
-        Helpless => "fall",
-        // launched/hitstun: tumble through the air (the sim drives the slide); rising vs falling pose.
-        Launched => {
-            if f.vel.y < 0.0 {
-                "jump"
-            } else {
-                "fall"
-            }
-        }
-    }
-}
-
-/// Every clip name `clip_for` can ever return. The checker walks this so a character missing art for
-/// one of them is reported once at load, not discovered as a blank frame mid-match. Keep in sync with
-/// `clip_for` (adding a state there with a new clip name means adding it here).
-const ALL_CLIPS: &[&str] = &[
-    "idle", "walk", "run", "skid", "crouch", "jump", "fall", "hang", "climb", "jab", "nair", "dtilt",
-    "dair", "wallbounce",
-];
-
-/// Where a missing clip falls back to. `clip_for` names a rich set of poses; a character need only
-/// supply art for some of them, and the rest degrade down this chain to "idle" (which every
-/// character must define) instead of rendering an empty frame. A name mapping to itself terminates.
-fn clip_fallback(name: &str) -> &'static str {
-    match name {
-        "dtilt" => "crouch",
-        "crouch" => "skid",
-        "skid" => "idle",
-        "nair" => "jab",
-        "jab" => "idle",
-        "dair" => "fall",
-        "wallbounce" => "fall",
-        "fall" => "jump",
-        "jump" => "idle",
-        "run" => "walk",
-        "walk" => "idle",
-        "hang" => "idle",
-        "climb" => "idle",
-        _ => "idle",
-    }
-}
-
-/// Resolve a desired clip against what the sprite's SpriteFrames actually contains, walking the
-/// fallback chain until a present animation is found ("idle" is the guaranteed terminal). Bounded so
-/// a malformed chain can never spin. This is the generic safety net: `clip_for` may name a clip the
-/// current character has no art for, and this picks the nearest pose it does have.
-fn resolve_clip(a: &Gd<AnimatedSprite2D>, want: &str) -> StringName {
-    let Some(sf) = a.get_sprite_frames() else { return StringName::from(want) };
-    let mut name = want;
-    for _ in 0..ALL_CLIPS.len() + 1 {
-        if sf.has_animation(&StringName::from(name)) {
-            return StringName::from(name);
-        }
-        let next = clip_fallback(name);
-        if next == name {
-            break;
-        }
-        name = next;
-    }
-    StringName::from("idle")
-}
-
-/// Multi-frame attack sync: lock the sprite's shown frame to the sim's per-state frame counter, so a
-/// swing's art tracks its frame data (startup -> active -> recovery) instead of the clip's own fps
-/// clock. Rollback-correct, since the shown frame is a pure function of sim state. No-op for
-/// non-attacks (they keep their looping playback) and for single-frame clips. This is the hook that
-/// makes genuine multi-frame attack animations land on-window; richer per-attack art just drops in.
-fn sync_attack_frame(a: &mut Gd<AnimatedSprite2D>, f: &Fighter, t: &Tune) {
-    let Some(atk) = sim::attack_for(t, f.state) else { return };
-    let Some(sf) = a.get_sprite_frames() else { return };
-    let name = a.get_animation();
-    let n = sf.get_frame_count(&name);
-    if n <= 1 {
-        return; // a single-pose clip has nothing to step through
-    }
-    // Scrub the swing across the CURRENT live hitbox window, so a multi-box move replays the
-    // animation once PER box: the 3-punch jab throws three visible punches, the stomp swings on each
-    // of its three timed boxes. Before the first box: hold the wind-up frame; between/after boxes:
-    // hold the last frame (the recoil) until the next box opens.
-    let last = n as i64 - 1;
-    let idx = if let Some(hb) = atk.box_at(f.frame) {
-        let local = f.frame - hb.start; // 0..len within this box's own window
-        ((local * n as i64) / hb.len.max(1)).clamp(0, last)
-    } else if f.frame < atk.startup {
-        0
-    } else {
-        last
-    };
-    a.set_frame(idx as i32);
-}
-
-/// Sprite tilt for a wall bounce: while the `wall_hit` window is open, lean the body off-vertical
-/// (in the direction it's now travelling) so the bounce reads as a hard ricochet, easing back to
-/// upright as the window decays. 0 outside the window. Cosmetic; never touches the sim.
-fn wall_tilt(f: &Fighter) -> f32 {
-    if f.wall_hit <= 0 {
-        return 0.0;
-    }
-    let dir = if f.vel.x >= 0.0 { 1.0 } else { -1.0 };
-    let decay = (f.wall_hit as f32 / 12.0).clamp(0.0, 1.0); // WALL_TILT_FRAMES in the sim
-    dir * 0.45 * decay // up to ~25° at impact, unwinding to 0
-}
-
-/// Point an AnimatedSprite2D at a roster character: frames, scale, feet-offset, crisp filter, idle.
-/// The single place sprite + character are wired, so ready() build and live char-swap stay in sync.
-fn apply_character(a: &mut Gd<AnimatedSprite2D>, c: &Character) {
-    let sf = build_frames(c);
-    validate_character(c, &sf);
-    a.set_sprite_frames(&sf);
-    a.set_scale(Vector2::splat(c.scale));
-    a.set_offset(Vector2::new(0.0, c.offset_y)); // feet on pos
-    a.set_texture_filter(godot::classes::canvas_item::TextureFilter::NEAREST); // crisp pixels
-    a.play_ex().name("idle").done();
-}
-
-/// Load a texture by path, returning None (with a warning) instead of aborting when the file is
-/// missing. Lets `build_frames` skip a bad frame and fall back rather than killing the whole sprite.
-fn try_tex(path: &str) -> Option<Gd<Texture2D>> {
-    match try_load::<Texture2D>(path) {
-        Ok(t) => Some(t),
-        Err(_) => {
-            godot_warn!("anim: missing texture {path}");
-            None
-        }
-    }
-}
-
-/// Build a character's SpriteFrames from its clip table. Strip clips slice a sheet into cells;
-/// Poses clips take one whole PNG per frame. Clip names match `clip_for` (choppy by design; the
-/// art has no per-state poses, so several CharStates reuse one clip). Missing files are skipped with
-/// a warning; any clip that ends up with zero frames is dropped so `resolve_clip` falls back past it.
-fn build_frames(c: &Character) -> Gd<SpriteFrames> {
-    let mut sf = SpriteFrames::new_gd();
-    for clip in &c.clips {
-        let name = clip.name.as_str();
-        sf.add_animation(name);
-        sf.set_animation_speed(name, clip.fps);
-        sf.set_animation_loop(name, clip.looped);
-        match &c.sheet {
-            Sheet::Strip { frame_px } => {
-                if let Some(sheet) = try_tex(&format!("res://assets/{}/{}.png", c.dir, clip.files[0])) {
-                    // Cell width: explicit, else texture width / frame count. Cell height = full strip
-                    // height, so non-square frames (common in Rivals rips) slice correctly.
-                    let frames = clip.frames.max(1);
-                    let fw = if *frame_px > 0.0 { *frame_px } else { sheet.get_width() as f32 / frames as f32 };
-                    let fh = sheet.get_height() as f32;
-                    for i in 0..frames {
-                        let mut at = AtlasTexture::new_gd();
-                        at.set_atlas(&sheet);
-                        at.set_region(Rect2::new(Vector2::new(i as f32 * fw, 0.0), Vector2::new(fw, fh)));
-                        sf.add_frame(name, &at.upcast::<Texture2D>());
-                    }
-                }
-            }
-            Sheet::Poses { prefix } => {
-                for f in &clip.files {
-                    if let Some(tex) = try_tex(&format!("res://assets/{}/{}_{}.png", c.dir, prefix, f)) {
-                        sf.add_frame(name, &tex);
-                    }
-                }
-            }
-        }
-        // a clip that loaded no frames is worse than absent: an empty animation renders nothing.
-        // Drop it so `resolve_clip` walks past to a pose that has art.
-        if sf.get_frame_count(name) == 0 {
-            sf.remove_animation(name);
-        }
-    }
-    sf
-}
-
-/// Startup checker: report any `clip_for` clip the built frames can't satisfy even after fallback,
-/// and confirm "idle" exists (the terminal every fallback chain lands on). Logs once per character
-/// at build; never panics — the game still runs on whatever art is present.
-fn validate_character(c: &Character, sf: &Gd<SpriteFrames>) {
-    if !sf.has_animation(&StringName::from("idle")) {
-        godot_error!("anim: character '{}' has no 'idle' clip — fallbacks have no terminal", c.dir);
-    }
-    for &want in ALL_CLIPS {
-        if sf.has_animation(&StringName::from(want)) {
-            continue;
-        }
-        // walk the same chain resolve_clip uses; report what it will substitute.
-        let mut name = want;
-        for _ in 0..ALL_CLIPS.len() + 1 {
-            let next = clip_fallback(name);
-            if next == name || sf.has_animation(&StringName::from(next)) {
-                name = next;
-                break;
-            }
-            name = next;
-        }
-        godot_print!("anim: '{}' missing clip '{want}' -> using '{name}'", c.dir);
-    }
-}

@@ -3,7 +3,7 @@
 
 use super::router::{Intent, MenuCtx, Route};
 use super::Screen;
-use crate::kneeman::roster_names;
+use crate::roster::roster_names;
 use crate::ui::themes::Theme;
 
 pub struct Charss;

@@ -4,7 +4,9 @@ use godot::prelude::*;
 
 use futures_signals::signal::Mutable;
 
-use crate::kneeman::{Identity, KneeMan, NetDebug};
+use crate::identity::Identity;
+use crate::kneeman::KneeMan;
+use crate::net::NetDebug;
 use crate::sim::{Action, AttackData, Fighter, Hitbox, SimState, Tune};
 use crate::ui::menu::router::{Intent, MenuCells, Route, Router};
 use crate::ui::themes::{dark, xp::Xp, Theme};
@@ -124,9 +126,9 @@ impl INode for DebugUi {
         };
         let ctx = bridge.bind().current_frame().clone();
         // grab the shared BehaviorSubjects (cheap clones of the same cells)
-        let (state_cell, tune_cell, net_cell, identity_cell, charsel_cell) = {
+        let (state_cell, tune_cell, gizmos_cell, net_cell, identity_cell, charsel_cell) = {
             let f = fighter.bind();
-            (f.state_cell(), f.tune_cell(), f.net_cell(), f.identity_cell(), f.charsel_cell())
+            (f.state_cell(), f.tune_cell(), f.gizmos_cell(), f.net_cell(), f.identity_cell(), f.charsel_cell())
         };
 
         // --- XP menu: drawn every frame (independent of the debug panel toggle) ---
@@ -149,6 +151,7 @@ impl INode for DebugUi {
             &ctx,
             &state_cell,
             &tune_cell,
+            &gizmos_cell,
             &net_cell,
             &identity_cell,
             &charsel_cell,
@@ -215,6 +218,7 @@ fn draw_panel(
     ctx: &egui::Context,
     state_cell: &Mutable<SimState>,
     tune_cell: &Mutable<Tune>,
+    gizmos_cell: &Mutable<bool>,
     net_cell: &Mutable<NetDebug>,
     identity_cell: &Mutable<Identity>,
     charsel_cell: &Mutable<[i64; 2]>,
@@ -237,6 +241,11 @@ fn draw_panel(
           ui.selectable_value(tab, Tab::Gamepad, "pad");
           ui.selectable_value(tab, Tab::Server, "server");
       });
+      ui.separator();
+      let mut show_boxes = gizmos_cell.get();
+      if ui.checkbox(&mut show_boxes, "show hitboxes / ECB").changed() {
+          gizmos_cell.set(show_boxes);
+      }
       ui.separator();
       egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
         match *tab {
@@ -532,7 +541,7 @@ fn json_field(chunk: &str, key: &str) -> Option<String> {
 /// shared charsel cell; KneeMan::sync_charsel applies it to the live sprite next frame. Roster
 /// names come from kneeman::roster_names (built-ins + assets/roster.json), so new packs show up here.
 fn char_row(ui: &mut egui::Ui, label: &str, slot: usize, charsel: &Mutable<[i64; 2]>) {
-    let names = crate::kneeman::roster_names();
+    let names = crate::roster::roster_names();
     let n = names.len().max(1) as i64;
     let mut sel = charsel.get_cloned();
     let cur = sel[slot].rem_euclid(n);
