@@ -6,7 +6,8 @@ use futures_signals::signal::Mutable;
 
 use crate::kneeman::{Identity, KneeMan, NetDebug};
 use crate::sim::{Action, AttackData, Fighter, SimState, Tune};
-use crate::theme;
+use crate::ui::menu::router::{Intent, MenuCells, Router};
+use crate::ui::themes::{dark, xp::Xp, Theme};
 
 /// Which group of collapsers the panel is showing. Persisted on the node so it survives the
 /// per-frame immediate-mode redraw.
@@ -36,6 +37,8 @@ pub struct DebugUi {
     tab: Tab,
     http: Option<Gd<HttpRequest>>,    // fetches the relay's /status JSON
     server_status: Mutable<String>,   // latest status body (or a fetching/error message)
+    router: Router,                   // XP menu nav state (memory-router); independent of the panel
+    menu_esc: bool,                   // an Esc was pressed; the next process() resolves it (deferred)
 }
 
 #[godot_api]
@@ -51,12 +54,14 @@ impl INode for DebugUi {
             tab: Tab::default(),
             http: None,
             server_status: Mutable::new(String::from("(not fetched)")),
+            router: Router::default(),
+            menu_esc: false,
         }
     }
 
     fn ready(&mut self) {
         let bridge = gdext_egui::EguiBridge::new_alloc();
-        bridge.bind().setup_context(|ctx| theme::apply(ctx)); // stylesheet, once
+        bridge.bind().setup_context(|ctx| dark::Dark.install(ctx)); // stylesheet, once
         let node = bridge.clone().upcast::<Node>();
         self.base_mut().add_child(&node);
         self.egui = Some(bridge);
@@ -94,6 +99,12 @@ impl INode for DebugUi {
             self.show = !self.show;
             return;
         }
+        // Esc drives the XP menu: opens the pause menu in game, else backs out / closes a dialog.
+        // Resolved in process() (egui can't be poked here), like the want_status deferral.
+        if key.get_keycode() == Key::ESCAPE {
+            self.menu_esc = true;
+            return;
+        }
         if key.is_meta_pressed() && key.is_shift_pressed() {
             match key.get_keycode() {
                 Key::J => self.show = !self.show,
@@ -111,15 +122,28 @@ impl INode for DebugUi {
         let (Some(bridge), Some(fighter)) = (self.egui.clone(), self.fighter.clone()) else {
             return;
         };
-        if !self.show {
-            return;
-        }
         let ctx = bridge.bind().current_frame().clone();
         // grab the shared BehaviorSubjects (cheap clones of the same cells)
         let (state_cell, tune_cell, net_cell, identity_cell, charsel_cell) = {
             let f = fighter.bind();
             (f.state_cell(), f.tune_cell(), f.net_cell(), f.identity_cell(), f.charsel_cell())
         };
+
+        // --- XP menu: drawn every frame (independent of the debug panel toggle) ---
+        {
+            let cells = MenuCells { state: &state_cell, tune: &tune_cell, charsel: &charsel_cell };
+            // resolve a pending Esc BEFORE drawing so the route change shows this frame
+            if std::mem::take(&mut self.menu_esc) {
+                self.router.apply(vec![Intent::Esc], &cells);
+            }
+            let mut out: Vec<Intent> = Vec::new();
+            crate::ui::menu::menu(&ctx, &Xp, &mut self.router, &cells, &mut out);
+            self.router.apply(out, &cells);
+        }
+
+        if !self.show {
+            return;
+        }
         let mut want_status = false;
         draw_panel(
             &ctx,
@@ -206,23 +230,23 @@ fn draw_panel(
         Tab::Status => {
         let p = &s.fighters[0]; // debug panel tracks player 0
         egui::CollapsingHeader::new("status").default_open(false).show(ui, |ui| {
-            theme::card(ui, |ui| {
-                theme::stat(ui, "state", p.state_name());
-                theme::stat(ui, "frame", p.frame.to_string());
-                theme::stat(ui, "facing", if p.facing < 0.0 { "◄ left" } else { "right ►" });
-                theme::stat(ui, "pos", format!("{:.0}, {:.0}", p.pos.x, p.pos.y));
-                theme::stat(ui, "vel", format!("{:.0}, {:.0}", p.vel.x, p.vel.y));
-                theme::stat(ui, "air jumps", p.air_jumps.to_string());
-                theme::stat(ui, "air dodges", p.air_dodges.to_string());
-                theme::stat(ui, "fast fall", p.fast_falling.to_string());
-                theme::stat(ui, "intangible", p.intangible.to_string());
-                theme::stat(ui, "hitlag", p.hitlag.to_string());
-                theme::stat(ui, "aerial buf", p.aerial_buffer_frames().to_string());
-                theme::stat(ui, "attack buf", p.attack_buffer_frames().to_string());
-                theme::stat(ui, "holding", if p.holding >= 0 { "gun" } else { "—" });
-                theme::stat(ui, "autohop", if p.autohop_aerial { "yes (-dmg)" } else { "no" });
-                theme::stat(ui, "own %", format!("{:.0}", p.damage));
-                theme::stat(ui, "dummy %", format!("{:.0}", s.fighters[1].damage));
+            dark::card(ui, |ui| {
+                dark::stat(ui, "state", p.state_name());
+                dark::stat(ui, "frame", p.frame.to_string());
+                dark::stat(ui, "facing", if p.facing < 0.0 { "◄ left" } else { "right ►" });
+                dark::stat(ui, "pos", format!("{:.0}, {:.0}", p.pos.x, p.pos.y));
+                dark::stat(ui, "vel", format!("{:.0}, {:.0}", p.vel.x, p.vel.y));
+                dark::stat(ui, "air jumps", p.air_jumps.to_string());
+                dark::stat(ui, "air dodges", p.air_dodges.to_string());
+                dark::stat(ui, "fast fall", p.fast_falling.to_string());
+                dark::stat(ui, "intangible", p.intangible.to_string());
+                dark::stat(ui, "hitlag", p.hitlag.to_string());
+                dark::stat(ui, "aerial buf", p.aerial_buffer_frames().to_string());
+                dark::stat(ui, "attack buf", p.attack_buffer_frames().to_string());
+                dark::stat(ui, "holding", if p.holding >= 0 { "gun" } else { "—" });
+                dark::stat(ui, "autohop", if p.autohop_aerial { "yes (-dmg)" } else { "no" });
+                dark::stat(ui, "own %", format!("{:.0}", p.damage));
+                dark::stat(ui, "dummy %", format!("{:.0}", s.fighters[1].damage));
             });
         });
 
@@ -232,7 +256,7 @@ fn draw_panel(
 
         if let Some(mut cam) = camera {
             egui::CollapsingHeader::new("view scale").default_open(false).show(ui, |ui| {
-                theme::card(ui, |ui| {
+                dark::card(ui, |ui| {
                     let mut z = cam.get_zoom().x;
                     if ui
                         .add(egui::Slider::new(&mut z, 0.4..=2.5).text("camera zoom"))
@@ -399,21 +423,21 @@ fn draw_panel(
 /// guest answer -> ICE both ways -> conn `connected` -> channel `open` -> rollback. A stall shows
 /// here: e.g. signal stuck at `have-local-offer` with answer in = 0 means the peer never answered.
 fn net_card(ui: &mut egui::Ui, n: &NetDebug) {
-    theme::card(ui, |ui| {
-        theme::stat(ui, "phase", n.phase);
-        theme::stat(ui, "role", format!("{} (handle {})", n.role, n.handle));
-        theme::stat(ui, "signaling ws", n.ws);
-        theme::stat(ui, "pc conn", n.conn);
-        theme::stat(ui, "ice gather", n.gather);
-        theme::stat(ui, "sdp signal", n.signal);
-        theme::stat(ui, "data channel", n.channel);
+    dark::card(ui, |ui| {
+        dark::stat(ui, "phase", n.phase);
+        dark::stat(ui, "role", format!("{} (handle {})", n.role, n.handle));
+        dark::stat(ui, "signaling ws", n.ws);
+        dark::stat(ui, "pc conn", n.conn);
+        dark::stat(ui, "ice gather", n.gather);
+        dark::stat(ui, "sdp signal", n.signal);
+        dark::stat(ui, "data channel", n.channel);
     });
     ui.add_space(6.0);
-    ui.label(egui::RichText::new("handshake frames  (out / in)").color(theme::MUTED));
-    theme::card(ui, |ui| {
-        theme::stat(ui, "offer", format!("{} / {}", n.offer.0, n.offer.1));
-        theme::stat(ui, "answer", format!("{} / {}", n.answer.0, n.answer.1));
-        theme::stat(ui, "ice", format!("{} / {}", n.ice.0, n.ice.1));
+    ui.label(egui::RichText::new("handshake frames  (out / in)").color(dark::MUTED));
+    dark::card(ui, |ui| {
+        dark::stat(ui, "offer", format!("{} / {}", n.offer.0, n.offer.1));
+        dark::stat(ui, "answer", format!("{} / {}", n.answer.0, n.answer.1));
+        dark::stat(ui, "ice", format!("{} / {}", n.ice.0, n.ice.1));
     });
 }
 
@@ -425,13 +449,13 @@ fn server_card(ui: &mut egui::Ui, status: &Mutable<String>, want_status: &mut bo
         if ui.button("⟳ refresh").clicked() {
             *want_status = true;
         }
-        ui.label(egui::RichText::new(crate::rtc::STATUS_URL).color(theme::MUTED));
+        ui.label(egui::RichText::new(crate::rtc::STATUS_URL).color(dark::MUTED));
     });
     ui.add_space(6.0);
     let body = status.get_cloned();
-    theme::card(ui, |ui| {
+    dark::card(ui, |ui| {
         for (k, v) in pretty_status(&body) {
-            theme::stat(ui, &k, v);
+            dark::stat(ui, &k, v);
         }
     });
     ui.add_space(6.0);
@@ -496,7 +520,7 @@ fn char_row(ui: &mut egui::Ui, label: &str, slot: usize, charsel: &Mutable<[i64;
     let mut sel = charsel.get_cloned();
     let cur = sel[slot].rem_euclid(n);
     ui.horizontal(|ui| {
-        ui.colored_label(theme::MUTED, label);
+        ui.colored_label(dark::MUTED, label);
         if ui.small_button("◀").clicked() {
             sel[slot] = (cur - 1).rem_euclid(n);
             charsel.set(sel);
@@ -513,9 +537,9 @@ fn char_row(ui: &mut egui::Ui, label: &str, slot: usize, charsel: &Mutable<[i64;
 fn identity_card(ui: &mut egui::Ui, cell: &Mutable<Identity>, charsel: &Mutable<[i64; 2]>) {
     let mut id = cell.get_cloned();
     let mut changed = false;
-    theme::card(ui, |ui| {
+    dark::card(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.colored_label(theme::MUTED, "name");
+            ui.colored_label(dark::MUTED, "name");
             let resp = egui::TextEdit::singleline(&mut id.name)
                 .char_limit(16)
                 .desired_width(170.0)
@@ -526,7 +550,7 @@ fn identity_card(ui: &mut egui::Ui, cell: &Mutable<Identity>, charsel: &Mutable<
         char_row(ui, "P1 char", 0, charsel);
         char_row(ui, "P2 char", 1, charsel);
         ui.horizontal(|ui| {
-            ui.colored_label(theme::MUTED, "color");
+            ui.colored_label(dark::MUTED, "color");
             let mut rgb = [id.color.r, id.color.g, id.color.b];
             if ui.color_edit_button_rgb(&mut rgb).changed() {
                 id.color = Color::from_rgb(rgb[0], rgb[1], rgb[2]);
@@ -534,7 +558,7 @@ fn identity_card(ui: &mut egui::Ui, cell: &Mutable<Identity>, charsel: &Mutable<
             }
         });
         ui.horizontal(|ui| {
-            ui.colored_label(theme::MUTED, "tag size");
+            ui.colored_label(dark::MUTED, "tag size");
             let resp = ui.add(egui::Slider::new(&mut id.font_px, 10..=96).suffix("px"));
             changed |= resp.changed();
         });
@@ -543,7 +567,7 @@ fn identity_card(ui: &mut egui::Ui, cell: &Mutable<Identity>, charsel: &Mutable<
     ui.label(
         egui::RichText::new("saved to this browser · hovers over your fighter")
             .size(11.0)
-            .color(theme::MUTED),
+            .color(dark::MUTED),
     );
     if changed {
         cell.set(id);
@@ -559,8 +583,8 @@ fn gamepad_card(ui: &mut egui::Ui) {
     use godot::global::{JoyAxis, JoyButton};
     let mut input = Input::singleton();
     let Some(dev) = input.get_connected_joypads().get(0) else {
-        theme::card(ui, |ui| {
-            ui.colored_label(theme::MUTED, "no controller detected");
+        dark::card(ui, |ui| {
+            ui.colored_label(dark::MUTED, "no controller detected");
         });
         ui.add_space(4.0);
         ui.label(
@@ -569,14 +593,14 @@ fn gamepad_card(ui: &mut egui::Ui) {
                  (browsers hide gamepads until they send input)",
             )
             .size(11.0)
-            .color(theme::MUTED),
+            .color(dark::MUTED),
         );
         return;
     };
     let dev = dev as i32; // Input methods take i32 device ids
 
-    theme::card(ui, |ui| {
-        theme::stat(ui, "device", input.get_joy_name(dev).to_string());
+    dark::card(ui, |ui| {
+        dark::stat(ui, "device", input.get_joy_name(dev).to_string());
     });
     ui.add_space(6.0);
 
@@ -588,7 +612,7 @@ fn gamepad_card(ui: &mut egui::Ui) {
     });
     ui.add_space(6.0);
 
-    theme::card(ui, |ui| {
+    dark::card(ui, |ui| {
         let lt = input.get_joy_axis(dev, JoyAxis::TRIGGER_LEFT).clamp(0.0, 1.0);
         let rt = input.get_joy_axis(dev, JoyAxis::TRIGGER_RIGHT).clamp(0.0, 1.0);
         ui.add(egui::ProgressBar::new(lt).desired_height(8.0).text("L2"));
@@ -611,13 +635,13 @@ fn gamepad_card(ui: &mut egui::Ui) {
         (JoyButton::DPAD_LEFT, "d-left"),
         (JoyButton::DPAD_RIGHT, "d-right"),
     ];
-    theme::card(ui, |ui| {
+    dark::card(ui, |ui| {
         for (b, label) in pips {
             let on = input.is_joy_button_pressed(dev, b);
             ui.horizontal(|ui| {
                 let (resp, painter) = ui.allocate_painter(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                painter.circle_filled(resp.rect.center(), 5.0, if on { theme::ACCENT } else { theme::LINE });
-                ui.colored_label(if on { theme::ACCENT } else { theme::MUTED }, label);
+                painter.circle_filled(resp.rect.center(), 5.0, if on { dark::ACCENT } else { dark::LINE });
+                ui.colored_label(if on { dark::ACCENT } else { dark::MUTED }, label);
             });
         }
     });
@@ -626,30 +650,30 @@ fn gamepad_card(ui: &mut egui::Ui) {
 /// One analog stick: a circular gate with crosshair and a dot at the stick position (-1..1 each axis).
 fn stick_box(ui: &mut egui::Ui, label: &str, x: f32, y: f32) {
     ui.vertical(|ui| {
-        ui.colored_label(theme::MUTED, label);
+        ui.colored_label(dark::MUTED, label);
         let (resp, painter) = ui.allocate_painter(egui::vec2(72.0, 72.0), egui::Sense::hover());
         let ctr = resp.rect.center();
         let r = 28.0_f32;
-        let grid = egui::Stroke::new(1.0_f32, theme::LINE);
+        let grid = egui::Stroke::new(1.0_f32, dark::LINE);
         painter.circle_stroke(ctr, r, grid);
         painter.line_segment([egui::pos2(ctr.x - r, ctr.y), egui::pos2(ctr.x + r, ctr.y)], grid);
         painter.line_segment([egui::pos2(ctr.x, ctr.y - r), egui::pos2(ctr.x, ctr.y + r)], grid);
         let p = egui::pos2(ctr.x + x.clamp(-1.0, 1.0) * r, ctr.y + y.clamp(-1.0, 1.0) * r);
-        painter.circle_filled(p, 4.0, theme::ACCENT);
-        ui.colored_label(theme::MUTED, format!("{x:+.2}, {y:+.2}"));
+        painter.circle_filled(p, 4.0, dark::ACCENT);
+        ui.colored_label(dark::MUTED, format!("{x:+.2}, {y:+.2}"));
     });
 }
 
 /// Live readout of the input buffer: what's queued, how long it stays valid, and the captured
 /// aim (the diagonal that the air dodge / wavedash will fire with).
 fn buffer_card(ui: &mut egui::Ui, f: &Fighter, t: &Tune) {
-    theme::card(ui, |ui| {
+    dark::card(ui, |ui| {
         let slot = f.move_buffer();
         let active = slot.timer > 0 && slot.action != Action::None;
         let name = slot.action.name();
-        let col = if active { theme::ACCENT } else { theme::MUTED };
+        let col = if active { dark::ACCENT } else { dark::MUTED };
         ui.horizontal(|ui| {
-            ui.colored_label(theme::MUTED, "queued");
+            ui.colored_label(dark::MUTED, "queued");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.colored_label(col, name);
             });
@@ -668,7 +692,7 @@ fn buffer_card(ui: &mut egui::Ui, f: &Fighter, t: &Tune) {
             ui.allocate_painter(egui::vec2(72.0, 72.0), egui::Sense::hover());
         let ctr = resp.rect.center();
         let r = 28.0_f32;
-        let grid = egui::Stroke::new(1.0_f32, theme::LINE);
+        let grid = egui::Stroke::new(1.0_f32, dark::LINE);
         painter.circle_stroke(ctr, r, grid);
         painter.line_segment([egui::pos2(ctr.x - r, ctr.y), egui::pos2(ctr.x + r, ctr.y)], grid);
         painter.line_segment([egui::pos2(ctr.x, ctr.y - r), egui::pos2(ctr.x, ctr.y + r)], grid);
@@ -679,7 +703,7 @@ fn buffer_card(ui: &mut egui::Ui, f: &Fighter, t: &Tune) {
             painter.line_segment([ctr, end], egui::Stroke::new(2.0_f32, col));
             painter.circle_filled(end, 3.5, col);
         } else {
-            painter.circle_filled(ctr, 2.5, theme::MUTED);
+            painter.circle_filled(ctr, 2.5, dark::MUTED);
         }
     });
 }

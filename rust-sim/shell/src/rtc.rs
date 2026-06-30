@@ -23,6 +23,12 @@ pub const SIGNALING_URL: &str = "wss://hafley.codes/rtc";
 /// when a request arrives without the WebSocket upgrade header). The debug panel fetches this.
 pub const STATUS_URL: &str = "https://hafley.codes/rtc";
 
+/// This build's git short hash, stamped by build.rs. Sent in the dial URL (so the relay's /status
+/// lists which build each client runs) and in the SDP offer/answer (so the peer can flag a version
+/// mismatch before it desyncs). On refocus the web client refetches /status and compares its own
+/// `build_hash` to this to catch a stale cached wasm. "unknown" if built outside a git checkout.
+pub const BUILD_HASH: &str = env!("BUILD_HASH");
+
 /// Frames of input delay fed to ggrs. Higher = fewer rollbacks but more felt latency. 2 is a sane
 /// LAN/decent-connection default.
 pub const INPUT_DELAY: usize = 2;

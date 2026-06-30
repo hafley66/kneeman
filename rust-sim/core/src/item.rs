@@ -146,6 +146,21 @@ impl Item {
     }
 }
 
+/// A menu-facing description of a spawnable item: which kind, plus the name + one-line blurb the
+/// item screen shows. Host-independent so the shell renders the roster without knowing the kinds.
+pub struct ItemCard {
+    pub kind: ItemKind,
+    pub name: &'static str,
+    pub blurb: &'static str,
+}
+
+/// The items the menu offers to spawn. Order here is the order the screen lists them.
+pub const MENU_ITEMS: &[ItemCard] = &[
+    ItemCard { kind: ItemKind::LaserGun, name: "Laser Gun", blurb: "hold attack to spray flat bolts" },
+    ItemCard { kind: ItemKind::BobGun, name: "Bob Gun", blurb: "lobs an arcing bomb that blasts" },
+    ItemCard { kind: ItemKind::Pen, name: "Pen", blurb: "draw ink terrain to stand on" },
+];
+
 // --- items ---------------------------------------------------------------------------------------
 
 const HOLD_OFFSET: Vector2 = Vector2::new(34.0, -56.0); // held item position relative to fighter feet
@@ -223,6 +238,38 @@ pub(crate) fn maybe_spawn_item(n: &mut SimState, t: &Tune) {
         facing: 1.0,
         tool: ToolKind::TrailPen, // todo: roll a random tool when more than one pen ships
     };
+}
+
+/// Force-drop one item of a chosen kind into a free slot (the menu's debug spawn). Lands mid-stage,
+/// dropping in from above like a natural spawn. No-op when the field is full.
+pub fn spawn_kind(n: &mut SimState, kind: ItemKind, t: &Tune) {
+    let Some(slot) = n.items.iter().position(|it| !it.active()) else {
+        return;
+    };
+    let ammo = match kind {
+        ItemKind::BobGun => t.bomb.ammo,
+        ItemKind::Pen => 0, // a pen's budget lives on its InkPath at draw start
+        _ => t.laser.ammo,
+    };
+    let x = (FLOOR_LEFT + FLOOR_RIGHT) * 0.5;
+    n.items[slot] = Item {
+        kind,
+        pos: Vector2::new(x, GROUND_Y - 240.0),
+        vel: Vector2::ZERO,
+        owner: -1,
+        ammo,
+        timer: 0,
+        facing: 1.0,
+        tool: ToolKind::TrailPen,
+    };
+}
+
+/// Clear every item slot and unhand both fighters (the menu's "clear field" button).
+pub fn clear_items(n: &mut SimState) {
+    n.items = [Item::EMPTY; MAX_ITEMS];
+    for f in &mut n.fighters {
+        f.holding = -1;
+    }
 }
 
 /// Nearest unowned ground gun overlapping a grounded, actionable fighter (the pickup the attack

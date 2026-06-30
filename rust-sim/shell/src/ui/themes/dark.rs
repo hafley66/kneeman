@@ -11,6 +11,36 @@ pub const LINE: Color32 = Color32::from_rgb(69, 71, 90);
 
 const R_WIDGET: CornerRadius = CornerRadius::same(6);
 
+/// The dark theme as a unit value. Carries no state; methods route to the free fns below.
+pub struct Dark;
+
+impl super::Theme for Dark {
+    fn install(&self, ctx: &egui::Context) {
+        apply(ctx);
+    }
+
+    fn window(&self, ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+        egui::Window::new(title).show(ctx, |ui| add(ui));
+    }
+
+    fn dialog(&self, ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+        egui::Modal::new(egui::Id::new(("dark_dlg", title))).show(ctx, |ui| {
+            ui.set_min_width(280.0);
+            ui.heading(title);
+            ui.add_space(6.0);
+            add(ui);
+        });
+    }
+
+    fn button(&self, ui: &mut egui::Ui, label: &str) -> egui::Response {
+        ui.button(label)
+    }
+
+    fn nav_item(&self, ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+        ui.selectable_label(selected, label)
+    }
+}
+
 /// The stylesheet. Apply once via EguiBridge::setup_context.
 pub fn apply(ctx: &egui::Context) {
     let mut v = Visuals::dark();

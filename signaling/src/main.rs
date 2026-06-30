@@ -58,6 +58,7 @@ struct ClientInfo {
     who: String,    // peer socket address
     name: String,   // from ?name= (the player's localStorage name)
     color: String,  // from ?color= (their localStorage color, e.g. "#aabbcc")
+    build: String,  // from ?hash= (their git build hash; compare to build_hash to spot mismatches)
     role: String,   // "" until matched, then "host"/"guest"
     matched: bool,
     since_unix: u64,
@@ -123,8 +124,8 @@ async fn handle(stream: tokio::net::TcpStream, server: Arc<Server>) -> Result<()
     let lower = head.to_ascii_lowercase();
 
     if lower.contains("sec-websocket-key") {
-        let (name, color, room) = parse_query(&head);
-        return relay(stream, server, name, color, room).await;
+        let (name, color, room, build) = parse_query(&head);
+        return relay(stream, server, name, color, room, build).await;
     }
 
     let (method, path) = request_line(&head);
@@ -146,26 +147,29 @@ fn request_line(head: &str) -> (String, String) {
     (method, path)
 }
 
-/// Extract `name`/`color`/`room` from the request line's query string (URL-decoded, lightly).
-fn parse_query(head: &str) -> (String, String, String) {
+/// Extract `name`/`color`/`room`/`hash` from the request line's query string (URL-decoded, lightly).
+/// `hash` is the client's git build hash, surfaced in /status so mismatched clients are visible.
+fn parse_query(head: &str) -> (String, String, String, String) {
     let query = head
         .lines()
         .next()
-        .and_then(|line| line.split_whitespace().nth(1)) // "GET /rtc?name=..&color=..&room=.. HTTP/1.1"
+        .and_then(|line| line.split_whitespace().nth(1)) // "GET /rtc?name=..&color=..&room=..&hash=.. HTTP/1.1"
         .and_then(|path| path.split_once('?').map(|(_, q)| q.to_string()))
         .unwrap_or_default();
-    let (mut name, mut color, mut room) = (String::new(), String::new(), String::new());
+    let (mut name, mut color, mut room, mut build) =
+        (String::new(), String::new(), String::new(), String::new());
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             match k {
                 "name" => name = url_decode(v),
                 "color" => color = url_decode(v),
                 "room" => room = url_decode(v),
+                "hash" => build = url_decode(v),
                 _ => {}
             }
         }
     }
-    (name, color, room)
+    (name, color, room, build)
 }
 
 /// Just enough percent-decoding for `%23` (#) and `+` spaces; identity strings are short + tame.
@@ -208,10 +212,11 @@ async fn serve_status(mut stream: tokio::net::TcpStream, server: &Arc<Server>) -
             rows.push(',');
         }
         rows.push_str(&format!(
-            r#"{{"who":{},"name":{},"color":{},"role":{},"matched":{},"since":{}}}"#,
+            r#"{{"who":{},"name":{},"color":{},"build":{},"role":{},"matched":{},"since":{}}}"#,
             json_str(&c.who),
             json_str(&c.name),
             json_str(&c.color),
+            json_str(&c.build),
             json_str(&c.role),
             c.matched,
             c.since_unix,
@@ -347,10 +352,11 @@ async fn relay(
     name: String,
     color: String,
     room: String,
+    build: String,
 ) -> Result<(), String> {
     let who = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
     let room = norm_room(&room);
-    println!("connect {who} ({name}) room '{room}'");
+    println!("connect {who} ({name}) room '{room}' build '{build}'");
     let id = server.next_id.fetch_add(1, Ordering::Relaxed);
     server.clients.lock().await.insert(
         id,
@@ -358,6 +364,7 @@ async fn relay(
             who: who.clone(),
             name: name.clone(),
             color,
+            build,
             role: String::new(),
             matched: false,
             since_unix: now_unix(),

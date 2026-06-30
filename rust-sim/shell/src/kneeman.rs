@@ -4,7 +4,7 @@ use godot::classes::web_rtc_peer_connection::{ConnectionState, GatheringState, S
 use godot::classes::web_socket_peer::State as WsState;
 use godot::classes::{
     AnimatedSprite2D, AtlasTexture, Button, Camera2D, CanvasLayer, ColorRect, FileAccess, Gradient,
-    GradientTexture2D, INode2D, Input, InputEvent, InputEventKey, InputEventScreenDrag,
+    GradientTexture2D, HttpRequest, INode2D, Input, InputEvent, InputEventKey, InputEventScreenDrag,
     InputEventScreenTouch, Json, Label, Node2D, Panel, Polygon2D, SpriteFrames, StyleBoxFlat,
     Texture2D, TextureRect, WebRtcDataChannel, WebRtcPeerConnection, WebSocketPeer,
 };
@@ -381,7 +381,6 @@ fn gv(v: sim::Vector2) -> Vector2 {
 // no matter the aspect (portrait `aspect=expand` balloons height). The stick (left) drives dir/aim_y;
 // the buttons drive the same Input actions the keyboard/pad use. Hit-tests read the same resolved
 // layout the visuals use (TOUCH_LAYOUT), so touch + visual never drift. --
-const STICK_DEADZONE: f32 = 0.22;
 
 /// One quadrant of the diamond face cluster: the wedge meeting at the center, pointing one cardinal
 /// way (top/left/right/bottom). The whole wedge is the hit area. `actions` are the Input actions a
@@ -406,8 +405,6 @@ const DIR_TOP: usize = 0;
 const DIR_LEFT: usize = 1;
 const DIR_RIGHT: usize = 2;
 const DIR_BOTTOM: usize = 3;
-/// The shorthop rectangle below the bottom tip presses this.
-const SHORTHOP_ACTIONS: &[&str] = &["shorthop"];
 
 /// Resolved diamond geometry in live screen coords for one frame. `input` hit-tests against this:
 /// a point is in the diamond when `|dx|+|dy| <= radius` (L1), and the wedge is whichever axis
@@ -535,8 +532,6 @@ thread_local! {
     static TOUCH_ORIGIN: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((0.0, 0.0)) };
     /// Full-tilt throw distance for the stick in px (scales with viewport; set each frame).
     static TOUCH_STICK_RAD: std::cell::Cell<f32> = const { std::cell::Cell::new(95.0) };
-    /// Previous frame's stick-Y, for tap-jump edge detection (flick up = jump).
-    static TOUCH_PREV_SY: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
     /// Fingers currently holding a wedge: (finger_index, actions) so multi-touch releases the right
     /// Input actions (the top wedge presses two; the rest one).
     static TOUCH_BTNS: std::cell::RefCell<Vec<(i64, &'static [&'static str])>> =
@@ -640,7 +635,7 @@ pub struct KneeMan {
     shorthop_panel: Option<Gd<Panel>>,  // rectangle under the bottom tip
     shorthop_label: Option<Gd<Label>>,
     menu_btn: Option<Gd<Button>>,       // bottom-center MENU tab: opens debug panel + pauses
-    debug_ui: Option<Gd<crate::debug_ui::DebugUi>>, // sibling egui panel, toggled by the MENU button
+    debug_ui: Option<Gd<crate::ui::debug::DebugUi>>, // sibling egui panel, toggled by the MENU button
     paused: bool,                       // MENU pause: freeze the sim while the panel is open
     netdbg: Mutable<NetDebug>,          // transport snapshot, read by the debug panel
     sig: SigCounts,                     // handshake-frame tallies feeding netdbg
@@ -661,6 +656,11 @@ pub struct KneeMan {
     room: Option<Room>,                        // match's room identity; survives a drop so we can rejoin
     resume_snapshot: Option<SimState>,         // sim state captured at a drop, to resume the rebuilt session from
     got_resume: bool,                          // guest: received the host's resume snapshot this reconnect
+
+    // --- version compatibility (build-hash ping; see rtc::BUILD_HASH) ---
+    http: Option<Gd<HttpRequest>>,             // refetches the relay /status on refocus to spot a stale build
+    peer_build: Option<String>,                // opponent's build hash from the SDP handshake (None until traded)
+    stale_build: bool,                         // our wasm is older than the live server build -> reload
 }
 
 #[godot_api]
@@ -708,6 +708,9 @@ impl INode2D for KneeMan {
             room: None,
             resume_snapshot: None,
             got_resume: false,
+            http: None,
+            peer_build: None,
+            stale_build: false,
         }
     }
 
@@ -796,7 +799,16 @@ impl INode2D for KneeMan {
         // Sibling Camera2D (authored in game.tscn). We drive it each frame to keep both fighters
         // framed; without this it sits at its static authored transform and fighters leave the view.
         self.cam = self.base().try_get_node_as::<Camera2D>("../Camera2D");
-        self.debug_ui = self.base().try_get_node_as::<crate::debug_ui::DebugUi>("../DebugUi");
+        self.debug_ui = self.base().try_get_node_as::<crate::ui::debug::DebugUi>("../DebugUi");
+
+        // Version-check HTTP client: refetches the relay /status on refocus to spot a stale cached
+        // web build (web routes this through the browser fetch). Ping once now to catch a stale load.
+        let mut http = HttpRequest::new_alloc();
+        let vcb = self.to_gd();
+        http.connect("request_completed", &Callable::from_object_method(&vcb, "on_status_fetched"));
+        self.base_mut().add_child(&http);
+        self.http = Some(http);
+        self.ping_version();
 
         // Skybox: a screen-pinned vertical gradient behind the world (deep space-blue -> horizon
         // glow). CanvasLayer at a negative layer keeps it under the stage + fighters, and a
@@ -882,6 +894,16 @@ impl INode2D for KneeMan {
         self.place_tags();
     }
 
+    /// Window/tab regained focus (desktop WM focus or browser tab focus on web). Re-ping the relay
+    /// to check whether a deploy left this client running a stale build. The browser tab case is the
+    /// one that matters: a tab backgrounded across a redeploy comes back on cached, mismatched wasm.
+    fn on_notification(&mut self, what: godot::classes::notify::CanvasItemNotification) {
+        use godot::classes::notify::CanvasItemNotification as N;
+        if matches!(what, N::WM_WINDOW_FOCUS_IN | N::APPLICATION_FOCUS_IN) {
+            self.ping_version();
+        }
+    }
+
     /// Touch gamepad. Screen touches feed the on-screen stick/buttons; the stick writes the
     /// thread-local read by `sample_input`; the buttons press/release the same Input actions the
     /// keyboard binds. (Finding a match is the status chip's `on_connect`, not a key here.)
@@ -894,7 +916,7 @@ impl INode2D for KneeMan {
                 // hit-test the shorthop rect, then the diamond wedges, against this frame's layout
                 let hit = TOUCH_DIAMOND.get().and_then(|lay| {
                     if lay.shorthop.contains_point(pos) {
-                        Some(SHORTHOP_ACTIONS)
+                        Some(crate::controls::GameAction::ShortHop.names())
                     } else {
                         quad_at(pos, lay.center, lay.radius).map(|q| QUADS[q].actions)
                     }
@@ -1132,6 +1154,7 @@ impl KneeMan {
         let mut d = VarDictionary::new();
         d.set("kind", sdp_type); // "offer" | "answer"
         d.set("sdp", sdp);
+        d.set("hash", rtc::BUILD_HASH); // peer flags a version mismatch from this
         if let Some(mut ws) = self.ws.clone() {
             ws.send_text(&rtc::to_json(&d));
         }
@@ -1167,9 +1190,47 @@ impl KneeMan {
             ws.send_text(&rtc::to_json(&d));
         }
     }
+
+    /// Relay /status fetched (on focus-in / startup): compare the live server's `build_hash` to ours.
+    /// A mismatch means our wasm is stale (a deploy happened) -- flag it so the status line says reload.
+    #[func]
+    fn on_status_fetched(
+        &mut self,
+        _result: i64,
+        code: i64,
+        _headers: PackedStringArray,
+        body: PackedByteArray,
+    ) {
+        if code != 200 {
+            return; // server unreachable; leave the prior verdict untouched
+        }
+        let text = body.get_string_from_utf8();
+        let server = rtc::dget_str(&rtc::parse_json(&text), "build_hash");
+        // Only call it stale when both hashes are real and differ; "unknown" (dev build) never warns.
+        self.stale_build = !server.is_empty()
+            && server != "unknown"
+            && rtc::BUILD_HASH != "unknown"
+            && server != rtc::BUILD_HASH;
+    }
 }
 
 impl KneeMan {
+    /// Ping the relay's /status to learn the live build, and (if mid-match) re-trade the peer hash.
+    /// Called on focus-in so a tab woken after a deploy notices it's running stale code.
+    fn ping_version(&mut self) {
+        if let Some(http) = self.http.as_mut() {
+            let _ = http.request(rtc::STATUS_URL);
+        }
+    }
+
+    /// Record the opponent's build hash from the handshake. Surfaced by `status_text` so a mismatched
+    /// pair sees it before the differing sims desync. Empty/"unknown" hashes are ignored.
+    fn note_peer_build(&mut self, hash: String) {
+        if !hash.is_empty() && hash != "unknown" {
+            self.peer_build = Some(hash);
+        }
+    }
+
     /// Hand out the shared cells (clones point at the same BehaviorSubject).
     pub fn state_cell(&self) -> Mutable<SimState> {
         self.state.clone()
@@ -1237,79 +1298,18 @@ impl KneeMan {
 
     // --- frame loop (local + netplay) -----------------------------------------------------------
 
-    /// Sample the keyboard into the engine-agnostic `InputFrame`. Associated (no `self`) so the
-    /// netplay loop can call it while a session is borrowed.
+    /// Sample the local player's controls into the engine-agnostic `InputFrame`. Delegates to the
+    /// `controls` boundary (the only raw-device site); the touch stick is merged in from our widget.
     fn sample_input() -> InputFrame {
-        use godot::global::{JoyAxis, JoyButton};
-        let mut input = Input::singleton();
-        // Keyboard movement (the default ui_* actions carry the arrow keys).
-        let mut dir = input.get_axis("ui_left", "ui_right");
-        let mut aim_y = input.get_axis("ui_up", "ui_down"); // -1 up .. +1 down
-        let mut pad_down = false;
-        // Web: the default ui_* movement actions don't carry the pad's stick/dpad, so read the first
-        // connected joypad directly and merge it in (keyboard still works; pad wins when held).
-        if let Some(dev) = input.get_connected_joypads().get(0) {
-            let dev = dev as i32;
-            let dz = 0.2;
-            let sx = input.get_joy_axis(dev, JoyAxis::LEFT_X);
-            let sy = input.get_joy_axis(dev, JoyAxis::LEFT_Y);
-            let dpx = input.is_joy_button_pressed(dev, JoyButton::DPAD_RIGHT) as i32 as f32
-                - input.is_joy_button_pressed(dev, JoyButton::DPAD_LEFT) as i32 as f32;
-            let dpy = input.is_joy_button_pressed(dev, JoyButton::DPAD_DOWN) as i32 as f32
-                - input.is_joy_button_pressed(dev, JoyButton::DPAD_UP) as i32 as f32;
-            let px = if dpx != 0.0 { dpx } else if sx.abs() > dz { sx } else { 0.0 };
-            let py = if dpy != 0.0 { dpy } else if sy.abs() > dz { sy } else { 0.0 };
-            if dir == 0.0 {
-                dir = px;
-            }
-            if aim_y == 0.0 {
-                aim_y = py;
-            }
-            pad_down = py > 0.4;
-        }
-        // On-screen touch stick (mobile). Lowest priority: only fills axes the keyboard/pad left at 0.
-        let (tsx, tsy) = TOUCH_STICK.get();
-        if dir == 0.0 && tsx.abs() > STICK_DEADZONE {
-            dir = tsx;
-        }
-        if aim_y == 0.0 && tsy.abs() > STICK_DEADZONE {
-            aim_y = tsy;
-        }
-        if tsy > 0.4 {
-            pad_down = true;
-        }
-        // Tap-jump (for the pleebs): flick the stick up and you jump, no button needed. Edge-detected
-        // off the merged aim_y so it works for touch + pad + keyboard up.
-        let prev_sy = TOUCH_PREV_SY.get();
-        TOUCH_PREV_SY.set(aim_y);
-        let tap_jump = prev_sy > -0.5 && aim_y <= -0.7;
-        InputFrame {
-            dir,
-            aim_y,
-            jump: tap_jump
-                || input.is_action_just_pressed("jump")
-                || input.is_action_just_pressed("ui_accept")
-                || input.is_action_just_pressed("ui_up"),
-            jump_held: input.is_action_pressed("jump")
-                || input.is_action_pressed("ui_accept")
-                || input.is_action_pressed("ui_up"),
-            shorthop: input.is_action_just_pressed("shorthop"),
-            shield_held: input.is_action_pressed("shield"),
-            shield_pressed: input.is_action_just_pressed("shield"),
-            down: input.is_action_pressed("ui_down") || pad_down,
-            down_pressed: input.is_action_just_pressed("ui_down"),
-            attack: input.is_action_just_pressed("attack"),
-            attack_held: input.is_action_pressed("attack"),
-            grab: input.is_action_just_pressed("grab"),
-            special: input.is_action_just_pressed("special"),
-        }
+        crate::controls::poll(TOUCH_STICK.get())
     }
 
-    /// Single-player: step the pure sim with [local input, neutral P2] and render.
+    /// Local play: step the pure sim with both players' frames and render. P1 is this machine's main
+    /// controls; P2 is couch co-op (second gamepad / WASD), neutral until someone grabs it.
     fn step_local(&mut self) {
         let frame = Self::sample_input();
-        let p1 = InputFrame::default();
-        let next = sim::step(&self.state.get(), [&frame, &p1], &self.tune.get()); // pure scan
+        let p2 = crate::controls::poll_p2();
+        let next = sim::step(&self.state.get(), [&frame, &p2], &self.tune.get()); // pure scan
         self.state.set(next);
         self.base_mut().set_position(gv(next.fighters[0].pos));
         self.render_anim(&next.fighters[0]);
@@ -1403,7 +1403,13 @@ impl KneeMan {
             (c.g * 255.0) as u8,
             (c.b * 255.0) as u8
         );
-        let mut url = format!("{}?name={}&color={}", rtc::SIGNALING_URL, url_escape(&id.name), hex);
+        let mut url = format!(
+            "{}?name={}&color={}&hash={}",
+            rtc::SIGNALING_URL,
+            url_escape(&id.name),
+            hex,
+            rtc::BUILD_HASH,
+        );
         if let Some(code) = room {
             url.push_str(&format!("&room={}", url_escape(code)));
         }
@@ -1472,6 +1478,7 @@ impl KneeMan {
             // session_description_created -> on_sdp_created -> relayed back. No explicit create_answer.
             "offer" => {
                 self.sig.offer_in += 1;
+                self.note_peer_build(rtc::dget_str(&d, "hash"));
                 let sdp = rtc::dget_str(&d, "sdp");
                 if let Some(mut pc) = self.pc.clone() {
                     pc.set_remote_description("offer", &sdp);
@@ -1480,6 +1487,7 @@ impl KneeMan {
             // Host receives the guest's answer.
             "answer" => {
                 self.sig.answer_in += 1;
+                self.note_peer_build(rtc::dget_str(&d, "hash"));
                 let sdp = rtc::dget_str(&d, "sdp");
                 if let Some(mut pc) = self.pc.clone() {
                     pc.set_remote_description("answer", &sdp);
@@ -1676,6 +1684,20 @@ impl KneeMan {
 
     /// One line describing where we are in the netplay lifecycle, shown top-left every frame.
     fn status_text(&self) -> String {
+        // Version warnings ride in front of the lifecycle text: a stale local build (deploy happened
+        // while this tab slept) or an opponent on a different build (their sim will diverge from ours).
+        if self.stale_build {
+            return "⚠ NEW BUILD LIVE  ·  reload the page to update".to_string();
+        }
+        if let Some(peer) = self.peer_build.as_ref() {
+            if peer != rtc::BUILD_HASH {
+                return format!(
+                    "⚠ VERSION MISMATCH  ·  you {} vs opponent {} — both reload",
+                    rtc::BUILD_HASH,
+                    peer,
+                );
+            }
+        }
         match self.phase {
             Phase::Offline => "OFFLINE  ·  tap to find a match".to_string(),
             Phase::Signaling => "SIGNALING…  ·  waiting for an opponent".to_string(),
