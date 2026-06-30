@@ -1,33 +1,36 @@
-//! Controls: the ONLY place in the gameplay path that touches a raw device. Physical keys/buttons
-//! bind to named actions in `project.godot [input]`; the analog stick + dpad are read here (Godot's
-//! default `ui_*` actions don't carry the pad on web). Everything downstream — the whole sim — sees
-//! only the semantic [`InputFrame`]. Nothing else may name `Input`, `JoyButton`, `JoyAxis`, or an
-//! action string; the action universe is [`GameAction`].
+//! Controls: the IMPURE half — the ONLY place in the gameplay path that touches a raw device. It
+//! reads Godot devices, merges them per player, and hands a [`pad::RawPad`] to the pure [`pad`] core,
+//! which does the device-agnostic assembly into the sim's semantic [`InputFrame`]. Everything
+//! downstream sees only `InputFrame`; nothing else may name `Input`, `JoyButton`, `JoyAxis`, or an
+//! action string. The action universe is [`GameAction`].
 //!
 //! Lockdown invariant: `Input::singleton` / `JoyButton` / `JoyAxis` / `is_action_*` appear in this
-//! file (and `ui/debug.rs`'s pad *readout*) only. Keep it that way.
+//! file (and `ui/debug.rs`'s pad *readout*) only. The pure `pad.rs` has no Godot at all.
 //!
 //! Couch co-op: `poll` is player one (keyboard `ui_*`/named actions + pad[0] + touch); `poll_p2` is
 //! player two, read straight off the SECOND gamepad and a left-hand keyboard cluster. Godot's named
 //! actions are global and can't tell two keyboards apart, so P2 bypasses `GameAction::names` and reads
-//! raw keys/buttons here (still inside this one boundary). Netplay still supplies its P2 over the wire;
-//! `poll_p2` is for the local/offline path only.
+//! raw keys/buttons here. Netplay still supplies its P2 over the wire; `poll_p2` is local-path only.
+
+pub mod pad;
+
+use std::cell::Cell;
 
 use godot::classes::Input;
 use godot::global::{JoyAxis, JoyButton, Key};
 use godot::prelude::*;
 
 use crate::sim::InputFrame;
+use pad::{PadMemory, RawPad};
 
 const STICK_DEADZONE: f32 = 0.22; // pad stick magnitude below this reads as neutral
 
 thread_local! {
-    // last frame's aim_y, for edge-detecting the stick-flick "tap jump".
-    static PREV_AIM_Y: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
-    // player two's edge trackers (held-button bitmask + aim_y), kept apart from P1's so neither
-    // player's edges leak into the other.
-    static P2_PREV_MASK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-    static P2_PREV_AIM_Y: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    // Per-player tap-jump memory, owned here and threaded through the pure fold each frame.
+    static P1_MEM: Cell<PadMemory> = Cell::new(PadMemory::default());
+    static P2_MEM: Cell<PadMemory> = Cell::new(PadMemory::default());
+    // Player two's raw-button edge tracker (held -> pressed); stays impure (per-device history).
+    static P2_PREV_MASK: Cell<u8> = const { Cell::new(0) };
 }
 
 /// The action universe. Every game-meaningful input is one of these; nothing downstream names a
@@ -120,26 +123,27 @@ pub fn poll(touch_stick: (f32, f32)) -> InputFrame {
     if tsy > 0.4 {
         pad_down = true;
     }
-    // Tap-jump (for the pleebs): flick the stick up and you jump, no button needed. Edge-detected
-    // off the merged aim_y so it works for touch + pad + keyboard up.
-    let prev_sy = PREV_AIM_Y.get();
-    PREV_AIM_Y.set(aim_y);
-    let tap_jump = prev_sy > -0.5 && aim_y <= -0.7;
-    InputFrame {
-        dir,
-        aim_y,
-        jump: tap_jump || pressed(&mut input, GameAction::Jump),
+    // Hand the merged device reads to the pure core; it owns tap-jump (flick the stick up to jump,
+    // no button) and the frame assembly, so behavior is identical across touch/pad/keyboard.
+    let raw = RawPad {
+        move_x: dir,
+        move_y: aim_y,
         jump_held: held(&mut input, GameAction::Jump),
-        shorthop: pressed(&mut input, GameAction::ShortHop),
+        jump_pressed: pressed(&mut input, GameAction::Jump),
+        shorthop_pressed: pressed(&mut input, GameAction::ShortHop),
         shield_held: held(&mut input, GameAction::Shield),
         shield_pressed: pressed(&mut input, GameAction::Shield),
-        down: held(&mut input, GameAction::Down) || pad_down,
+        down_held: held(&mut input, GameAction::Down) || pad_down,
         down_pressed: pressed(&mut input, GameAction::Down),
-        attack: pressed(&mut input, GameAction::Attack),
         attack_held: held(&mut input, GameAction::Attack),
-        grab: pressed(&mut input, GameAction::Grab),
-        special: pressed(&mut input, GameAction::Special),
-    }
+        attack_pressed: pressed(&mut input, GameAction::Attack),
+        grab_pressed: pressed(&mut input, GameAction::Grab),
+        special_pressed: pressed(&mut input, GameAction::Special),
+    };
+    let mut mem = P1_MEM.get();
+    let frame = mem.frame(&raw);
+    P1_MEM.set(mem);
+    frame
 }
 
 // --- player two (couch co-op) ------------------------------------------------------------------
@@ -244,24 +248,24 @@ pub fn poll_p2() -> InputFrame {
     let edge = |bit: u8| (mask & bit != 0) && (prev & bit == 0);
     let held = |bit: u8| mask & bit != 0;
 
-    // tap-jump: flick the stick/W up, no button needed (own edge tracker, never P1's).
-    let prev_sy = P2_PREV_AIM_Y.get();
-    P2_PREV_AIM_Y.set(aim_y);
-    let tap_jump = prev_sy > -0.5 && aim_y <= -0.7;
-
-    InputFrame {
-        dir,
-        aim_y,
-        jump: tap_jump || edge(B_JUMP),
+    // Same pure core as P1 (tap-jump + assembly); only the raw reads + edge detection differ here.
+    let raw = RawPad {
+        move_x: dir,
+        move_y: aim_y,
         jump_held: held(B_JUMP),
-        shorthop: edge(B_SHORTHOP),
+        jump_pressed: edge(B_JUMP),
+        shorthop_pressed: edge(B_SHORTHOP),
         shield_held: held(B_SHIELD),
         shield_pressed: edge(B_SHIELD),
-        down: held(B_DOWN),
+        down_held: held(B_DOWN),
         down_pressed: edge(B_DOWN),
-        attack: edge(B_ATTACK),
         attack_held: held(B_ATTACK),
-        grab: edge(B_GRAB),
-        special: edge(B_SPECIAL),
-    }
+        attack_pressed: edge(B_ATTACK),
+        grab_pressed: edge(B_GRAB),
+        special_pressed: edge(B_SPECIAL),
+    };
+    let mut mem = P2_MEM.get();
+    let frame = mem.frame(&raw);
+    P2_MEM.set(mem);
+    frame
 }
