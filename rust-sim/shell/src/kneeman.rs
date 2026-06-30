@@ -134,9 +134,20 @@ impl Default for Identity {
     }
 }
 
-/// Stable default for the remote slot until Cut 2 trades the real identity over the signaling ws.
-fn p2_identity() -> Identity {
-    Identity { name: "P2".into(), color: Color::from_rgb(1.0, 0.55, 0.35), font_px: 32 }
+/// Presentation color for a non-local fighter (slot 0 wears the local identity color instead).
+/// Cosmetic only — never folded into the netplay checksum, so it can never desync a session.
+fn slot_color(idx: usize) -> Color {
+    match idx {
+        1 => Color::from_rgb(1.0, 0.55, 0.35),  // orange
+        2 => Color::from_rgb(0.45, 0.92, 0.50), // green
+        3 => Color::from_rgb(0.80, 0.55, 0.95), // purple
+        _ => Color::from_rgb(0.35, 0.75, 1.0),  // blue (slot-0 fallback)
+    }
+}
+
+/// Nametag text for a non-local fighter ("P2".."P4"); slot 0 wears the local identity name.
+fn slot_name(idx: usize) -> String {
+    format!("P{}", idx + 1)
 }
 
 /// Cap the name length and trim; cosmetic only (the tag and the saved file both show this).
@@ -616,17 +627,17 @@ pub struct KneeMan {
     base: Base<Node2D>,
     state: Mutable<SimState>, // source of truth, observed everywhere
     tune: Mutable<Tune>,      // live config, written by egui
-    anim: Option<Gd<AnimatedSprite2D>>, // P1 sprite, driven by CharState
+    // Per-fighter render slots, indexed 0..active. `sprites[0]` is the node's own "Anim" child
+    // (positioned via the node); `sprites[1..]` are world-space siblings positioned each frame.
+    sprites: [Option<Gd<AnimatedSprite2D>>; sim::MAX_PLAYERS], // driven by CharState per fighter
     dummy: Option<Gd<ColorRect>>,       // legacy P2 block (hidden once the P2 sprite exists)
-    p2: Option<Gd<AnimatedSprite2D>>,   // P2 sprite (world-space sibling), driven by fighters[1]
-    tag_p1: Option<Gd<Label>>,          // world-space nametag hovering over P1
-    tag_p2: Option<Gd<Label>>,          // world-space nametag hovering over P2
-    edge_tags: [Option<Gd<Label>>; 2],  // screen-space "off-stage" chips: name + arrow + distance
-    prev_pos: [sim::Vector2; 2],        // last frame's feet pos, for KO teleport detection (bangs)
-    trails: [Vec<sim::Vector2>; 2],     // recent feet positions per fighter, for the fast-move smear
+    tags: [Option<Gd<Label>>; sim::MAX_PLAYERS], // world-space nametags hovering over each head
+    edge_tags: [Option<Gd<Label>>; sim::MAX_PLAYERS], // screen-space "off-stage" chips: name+arrow+dist
+    prev_pos: [sim::Vector2; sim::MAX_PLAYERS], // last frame's feet pos, for KO teleport detection (bangs)
+    trails: [Vec<sim::Vector2>; sim::MAX_PLAYERS], // recent feet positions per fighter, for the fast-move smear
     bangs: Vec<(Vector2, f32)>,         // active blast flashes: world pos + age (0..1), drawn in draw()
     status: Option<Gd<Button>>,         // screen-space netplay status chip; tap it to find a match
-    hud: [Option<Gd<Label>>; 2],        // bottom damage panel: each fighter's name + % (built in ready)
+    hud: [Option<Gd<Label>>; sim::MAX_PLAYERS], // bottom damage panel: each fighter's name + %
     cam: Option<Gd<Camera2D>>,          // sibling Camera2D, tracked to fit both fighters each frame
     stick_base: Option<Gd<Panel>>,      // touch stick ring (follows the active finger origin)
     stick_knob: Option<Gd<Panel>>,      // touch stick knob (offset by the current tilt)
@@ -641,8 +652,8 @@ pub struct KneeMan {
     sig: SigCounts,                     // handshake-frame tallies feeding netdbg
     identity: Mutable<Identity>,        // local player name+color, edited by the panel, persisted
     saved_identity: Identity,           // last value written to localStorage (change detection)
-    charsel: Mutable<[i64; 2]>,         // per-slot roster pick, written by the menu, applied live
-    characters: [usize; 2],             // per-slot index into ROSTER; char-select writes these later
+    charsel: Mutable<[i64; 2]>,         // P1/P2 roster pick, written by the menu, applied live
+    characters: [usize; sim::MAX_PLAYERS], // per-fighter index into ROSTER; charsel drives slots 0..2
 
     // --- netplay (Godot WebRTC). All None/Offline until the player taps the status chip to join. ---
     phase: Phase,
@@ -669,17 +680,15 @@ impl INode2D for KneeMan {
             base,
             state: Mutable::new(SimState::spawn()),
             tune: Mutable::new(Tune::default()),
-            anim: None,
+            sprites: Default::default(),
             dummy: None,
-            p2: None,
-            tag_p1: None,
-            tag_p2: None,
-            edge_tags: [None, None],
-            prev_pos: [sim::Vector2::new(0.0, 0.0); 2],
-            trails: [Vec::new(), Vec::new()],
+            tags: Default::default(),
+            edge_tags: Default::default(),
+            prev_pos: [sim::Vector2::new(0.0, 0.0); sim::MAX_PLAYERS],
+            trails: Default::default(),
             bangs: Vec::new(),
             status: None,
-            hud: [None, None],
+            hud: Default::default(),
             cam: None,
             stick_base: None,
             stick_knob: None,
@@ -695,7 +704,7 @@ impl INode2D for KneeMan {
             identity: Mutable::new(Identity::default()),
             saved_identity: Identity::default(),
             charsel: Mutable::new([0, 1]),
-            characters: [0, 1], // default: P1 frog, P2 zombie (the animated built-ins). Char-select overrides.
+            characters: [0, 1, 0, 1], // default: frog/zombie alternating; charsel overrides slots 0..2
             phase: Phase::Offline,
             role: None,
             local_handle: 0,
@@ -716,21 +725,12 @@ impl INode2D for KneeMan {
         let pos = self.state.get().fighters[0].pos;
         self.base_mut().set_position(gv(pos));
 
-        // Resolve the AnimatedSprite2D and hand it a SpriteFrames built in code
-        // (one clip per movement state). Building it here, not in a .tres, keeps the
-        // CharState->clip wiring readable and avoids hand-authoring resource uids.
-        let roster = roster();
-        if let Some(mut a) = self
-            .base()
-            .get_node_or_null("Anim")
-            .and_then(|n| n.try_cast::<AnimatedSprite2D>().ok())
-        {
-            let c = &roster[self.characters[0].min(roster.len() - 1)];
-            apply_character(&mut a, c);
-            self.anim = Some(a);
-        }
+        // Load the saved identity (web) before building tags so slot 0's tag wears the right name/color.
+        let id = load_identity();
+        self.identity.set(id.clone());
+        self.saved_identity = id.clone();
 
-        // Legacy P2 block: hide it, the P2 sprite replaces it.
+        // Legacy P2 block: hide it, the per-fighter sprites replace it.
         self.dummy = self
             .base()
             .get_node_or_null("../Dummy")
@@ -739,29 +739,41 @@ impl INode2D for KneeMan {
             d.set_visible(false);
         }
 
-        // Load the saved identity (web) before building tags so P1's tag wears the right name/color.
-        let id = load_identity();
-        self.identity.set(id.clone());
-        self.saved_identity = id.clone();
+        // Per-fighter sprites + nametags, one slot per possible player. Slot 0 is the node's own
+        // "Anim" child (positioned via the node itself); slots 1.. are world-space siblings under the
+        // parent, positioned each frame in `render_fighter`. Tags are world-space labels hovering over
+        // each head, wearing the slot color. Built here, not in a .tres, so the CharState->clip wiring
+        // stays readable. Dormant slots (>= active) are hidden each frame by the render loop.
+        let roster = roster();
+        for k in 0..sim::MAX_PLAYERS {
+            let c = &roster[self.characters[k].min(roster.len() - 1)];
+            let color = if k == 0 { id.color } else { slot_color(k) };
+            let name = if k == 0 { id.name.clone() } else { slot_name(k) };
+            let tag = make_tag(&name, color, id.font_px);
 
-        // P2 as a real sprite (world-space sibling under the parent, positioned each frame).
-        let c2 = &roster[self.characters[1].min(roster.len() - 1)];
-        let mut p2 = AnimatedSprite2D::new_alloc();
-        apply_character(&mut p2, c2);
-        // Nametags: world-space labels that hover over each head, wearing the player's color.
-        let tag_p1 = make_tag(&id.name, id.color, id.font_px);
-        let tag_p2 = make_tag(&p2_identity().name, p2_identity().color, id.font_px);
-        // Add as world-space siblings under our parent. Deferred: during ready() the parent is still
-        // "busy setting up children", so an immediate add_child is rejected (re-entrant child setup).
-        // call_deferred runs it the moment setup finishes, before the first frame draws.
-        if let Some(mut parent) = self.base().get_parent() {
-            parent.call_deferred("add_child", &[p2.to_variant()]);
-            parent.call_deferred("add_child", &[tag_p1.to_variant()]);
-            parent.call_deferred("add_child", &[tag_p2.to_variant()]);
+            let sprite = if k == 0 {
+                // Slot 0: the authored "Anim" child; it tracks the node, so no per-frame position.
+                self.base()
+                    .get_node_or_null("Anim")
+                    .and_then(|n| n.try_cast::<AnimatedSprite2D>().ok())
+            } else {
+                Some(AnimatedSprite2D::new_alloc())
+            };
+            if let Some(mut a) = sprite {
+                apply_character(&mut a, c);
+                // World-space siblings (slots 1..) add deferred: during ready() the parent is still
+                // "busy setting up children", so an immediate add_child is rejected. The tag is a
+                // world-space sibling for every slot.
+                if let Some(mut parent) = self.base().get_parent() {
+                    if k != 0 {
+                        parent.call_deferred("add_child", &[a.to_variant()]);
+                    }
+                    parent.call_deferred("add_child", &[tag.to_variant()]);
+                }
+                self.sprites[k] = Some(a);
+                self.tags[k] = Some(tag);
+            }
         }
-        self.p2 = Some(p2);
-        self.tag_p1 = Some(tag_p1);
-        self.tag_p2 = Some(tag_p2);
 
         // Always-on netplay status chip. A CanvasLayer pins it to the screen (not the world), so it
         // stays put as the camera tracks the fighter. It's a Button, not a Label: tapping/clicking it
@@ -784,13 +796,14 @@ impl INode2D for KneeMan {
         label.connect("pressed", &Callable::from_object_method(&cb, "on_connect"));
         layer.add_child(&label);
 
-        // Bottom damage panel: each fighter's name + %, wearing the player color. Same screen-pinned
-        // CanvasLayer. Positioned/filled every frame in `update_hud` (handles window resize).
-        let hud_p1 = make_hud_label(self.identity.get_cloned().color);
-        let hud_p2 = make_hud_label(p2_identity().color);
-        layer.add_child(&hud_p1);
-        layer.add_child(&hud_p2);
-        self.hud = [Some(hud_p1), Some(hud_p2)];
+        // Bottom damage panel: each fighter's name + %, wearing the slot color. Same screen-pinned
+        // CanvasLayer. Positioned/filled every frame in `update_hud` (handles window resize + active count).
+        for k in 0..sim::MAX_PLAYERS {
+            let color = if k == 0 { self.identity.get_cloned().color } else { slot_color(k) };
+            let l = make_hud_label(color);
+            layer.add_child(&l);
+            self.hud[k] = Some(l);
+        }
 
         self.base_mut().add_child(&layer);
         self.status = Some(label);
@@ -835,12 +848,13 @@ impl INode2D for KneeMan {
         // launched out of view, showing name + a pointer arrow + the off-screen distance.
         let mut edge_layer = CanvasLayer::new_alloc();
         edge_layer.set_layer(40);
-        let edge_p1 = make_edge_tag(self.identity.get_cloned().color);
-        let edge_p2 = make_edge_tag(p2_identity().color);
-        edge_layer.add_child(&edge_p1);
-        edge_layer.add_child(&edge_p2);
+        for k in 0..sim::MAX_PLAYERS {
+            let color = if k == 0 { self.identity.get_cloned().color } else { slot_color(k) };
+            let chip = make_edge_tag(color);
+            edge_layer.add_child(&chip);
+            self.edge_tags[k] = Some(chip);
+        }
         self.base_mut().add_child(&edge_layer);
-        self.edge_tags = [Some(edge_p1), Some(edge_p2)];
 
         self.build_touch_ui();
         self.update_status();
@@ -976,11 +990,12 @@ impl INode2D for KneeMan {
     fn draw(&mut self) {
         let s = self.state.get();
         let t = self.tune.get();
+        let active = s.active as usize;
         let origin = self.base().get_position();
 
         // Blast bangs: a KO teleports the fighter from a blast edge back to spawn in one frame.
         // Detect that jump, drop a flash on the boundary they flew through, age the rest out.
-        for k in 0..2 {
+        for k in 0..active {
             let p = s.fighters[k].pos;
             let prev = self.prev_pos[k];
             if (p - prev).length() > 700.0 {
@@ -1014,7 +1029,7 @@ impl INode2D for KneeMan {
         // sprite far enough per frame that the eye reads it as a teleport. Trail a few fading
         // ghost discs along the recent path so the movement reads as motion instead of a pop.
         // Purely cosmetic (shell-side), never touches the sim or the netplay checksum.
-        for k in 0..2 {
+        for k in 0..active {
             let p = s.fighters[k].pos;
             let trail = &mut self.trails[k];
             trail.push(p);
@@ -1046,7 +1061,7 @@ impl INode2D for KneeMan {
         let ecb = Color::from_rgba(0.20, 0.85, 0.95, 0.85);
         let hurt_col = Color::from_rgba(0.95, 0.85, 0.20, 0.30);
         let hit_col = Color::from_rgba(0.95, 0.25, 0.25, 0.45);
-        for f in &s.fighters {
+        for f in &s.fighters[..active] {
             // ECB diamond: the actual collision shape — bottom vert = feet, side verts = walls.
             let v = sim::ecb_verts(f.pos);
             for k in 0..4 {
@@ -1310,8 +1325,7 @@ impl KneeMan {
         let next = sim::step(&self.state.get(), &[&frame, &p2], &self.tune.get()); // pure scan
         self.state.set(next);
         self.base_mut().set_position(gv(next.fighters[0].pos));
-        self.render_anim(&next.fighters[0]);
-        self.render_p2(&next.fighters[1]);
+        self.render_fighters(&next);
         self.update_camera();
         self.update_touch();
         self.base_mut().queue_redraw();
@@ -1345,8 +1359,7 @@ impl KneeMan {
         }
         let s = self.state.get();
         self.base_mut().set_position(gv(s.fighters[0].pos));
-        self.render_anim(&s.fighters[0]);
-        self.render_p2(&s.fighters[1]);
+        self.render_fighters(&s);
         self.update_camera();
         self.update_touch();
         self.base_mut().queue_redraw();
@@ -1712,21 +1725,28 @@ impl KneeMan {
     fn update_camera(&mut self) {
         let Some(mut cam) = self.cam.clone() else { return };
         let s = self.state.get();
-        let p0 = gv(s.fighters[0].pos);
-        let p1 = gv(s.fighters[1].pos);
-        let mid = (p0 + p1) * 0.5;
+        let active = (s.active as usize).max(1);
+        // Bounding box over every live fighter; the camera frames the whole pack, not just a pair.
+        let mut lo = gv(s.fighters[0].pos);
+        let mut hi = lo;
+        for f in &s.fighters[..active] {
+            let p = gv(f.pos);
+            lo = Vector2::new(lo.x.min(p.x), lo.y.min(p.y));
+            hi = Vector2::new(hi.x.max(p.x), hi.y.max(p.y));
+        }
+        let mid = (lo + hi) * 0.5;
         let view = self.base().get_viewport_rect().size;
         let aspect = if view.y > 0.0 { view.x / view.y } else { 1.78 };
-        // Portrait / near-square (a phone held upright, or a tall window): a wide both-fighters
-        // frame zooms the action to a speck. Lean the focus onto the local player and tighten the
-        // zoom so they stay big; landscape keeps the classic both-fighters framing.
+        // Portrait / near-square (a phone held upright, or a tall window): a wide whole-pack frame
+        // zooms the action to a speck. Lean the focus onto the local player and tighten the zoom so
+        // they stay big; landscape keeps the classic shared-camera framing.
         let portrait = aspect < 1.3;
-        let local = gv(s.fighters[self.local_handle.min(1)].pos);
+        let local = gv(s.fighters[self.local_handle.min(active - 1)].pos);
         let focus = if portrait { mid.lerp(local, 0.7) } else { mid };
 
-        // world span the camera must show: distance between fighters + breathing room.
-        let span_x = (p0.x - p1.x).abs() + 700.0;
-        let span_y = (p0.y - p1.y).abs() + 450.0;
+        // world span the camera must show: spread of the pack + breathing room.
+        let span_x = (hi.x - lo.x) + 700.0;
+        let span_y = (hi.y - lo.y) + 450.0;
         // Camera2D zoom is inverse: smaller zoom = wider view. Fit both axes, take the tighter.
         // Portrait floors the zoom higher (don't shrink to fit a far-away dummy) and allows a
         // closer max so a lone player on mobile fills the screen.
@@ -1907,24 +1927,63 @@ impl KneeMan {
 
     fn update_hud(&mut self) {
         let s = self.state.get();
-        let names = [self.identity.get_cloned().name, p2_identity().name];
+        let active = s.active as usize;
         let view = self.base().get_viewport_rect().size;
-        for k in 0..2 {
+        // Lay the panels out evenly across the bottom strip; slot 0 hugs the left, the last slot the
+        // right, the rest spaced between. Dormant slots (>= active) are hidden.
+        let y = view.y - 150.0;
+        let span = (view.x - 300.0).max(0.0); // inset both ends so the chips clear the screen edges
+        for k in 0..sim::MAX_PLAYERS {
             let Some(mut l) = self.hud[k].clone() else { continue };
+            if k >= active {
+                l.set_visible(false);
+                continue;
+            }
+            l.set_visible(true);
+            let name = self.player_name(k);
             let pct = s.fighters[k].damage.round() as i32;
-            l.set_text(&format!("{}\n{pct}%", names[k]));
+            l.set_text(&format!("{name}\n{pct}%"));
             let danger = (s.fighters[k].damage / 150.0).clamp(0.0, 1.0);
             l.add_theme_color_override("font_color", Color::from_rgb(1.0, 1.0 - danger, 1.0 - danger));
-            let y = view.y - 150.0;
-            let x = if k == 0 { 70.0 } else { view.x - 230.0 };
-            l.set_position(Vector2::new(x, y));
+            let t = if active <= 1 { 0.0 } else { k as f32 / (active - 1) as f32 };
+            l.set_position(Vector2::new(70.0 + t * span, y));
         }
     }
 
-    /// Drive the P1 sprite: clip for the state, flip by facing, and wear the player's color (green
-    /// while intangible — the universal "you can't be hit" read).
-    fn render_anim(&mut self, f: &Fighter) {
-        let Some(mut a) = self.anim.clone() else { return };
+    /// Nametag/HUD text for fighter `idx`: slot 0 is the live local identity name, the rest are "Pn".
+    fn player_name(&self, idx: usize) -> String {
+        if idx == 0 { self.identity.get_cloned().name } else { slot_name(idx) }
+    }
+
+    /// Slot color for fighter `idx`: slot 0 wears the live local identity color; the rest take the
+    /// fixed slot palette. Cosmetic only (never folded into the netplay checksum).
+    fn slot_tint(&self, idx: usize) -> Color {
+        if idx == 0 { self.identity.get_cloned().color } else { slot_color(idx) }
+    }
+
+    /// Drive every live fighter's sprite, hiding the dormant slots (>= active). Slot 0 is the node's
+    /// own child, so it tracks the node position; slots 1.. are world-space siblings positioned here.
+    fn render_fighters(&mut self, s: &SimState) {
+        let active = s.active as usize;
+        for k in 0..active {
+            self.render_fighter(k, &s.fighters[k]);
+        }
+        for k in active..sim::MAX_PLAYERS {
+            if let Some(mut a) = self.sprites[k].clone() {
+                a.set_visible(false);
+            }
+        }
+    }
+
+    /// Drive one fighter's sprite: clip for the state, flip by facing, slot tint, and (for the
+    /// world-space siblings, slot != 0) the feet position. Green tint while intangible — the
+    /// universal "you can't be hit" read.
+    fn render_fighter(&mut self, idx: usize, f: &Fighter) {
+        let Some(mut a) = self.sprites[idx].clone() else { return };
+        a.set_visible(true);
+        if idx != 0 {
+            a.set_global_position(gv(f.pos)); // slot 0 tracks the node; siblings position here
+        }
         let clip = resolve_clip(&a, clip_for(f));
         if a.get_animation() != clip {
             a.play_ex().name(&clip).done(); // only restart when the clip actually changes
@@ -1932,22 +1991,7 @@ impl KneeMan {
         sync_attack_frame(&mut a, f, &self.tune.get());
         a.set_flip_h(f.facing < 0.0); // frog faces right by default
         a.set_rotation(wall_tilt(f));
-        a.set_modulate(sprite_tint(f, self.identity.get_cloned().color));
-    }
-
-    /// Drive the P2 sprite: same as P1 but positioned in world space each frame (it's a sibling, not
-    /// a child of this node), wearing the P2 color.
-    fn render_p2(&mut self, f: &Fighter) {
-        let Some(mut a) = self.p2.clone() else { return };
-        a.set_global_position(gv(f.pos));
-        let clip = resolve_clip(&a, clip_for(f));
-        if a.get_animation() != clip {
-            a.play_ex().name(&clip).done();
-        }
-        sync_attack_frame(&mut a, f, &self.tune.get());
-        a.set_flip_h(f.facing < 0.0);
-        a.set_rotation(wall_tilt(f));
-        a.set_modulate(sprite_tint(f, p2_identity().color));
+        a.set_modulate(sprite_tint(f, self.slot_tint(idx)));
     }
 
     /// Persist the identity when the panel changes it, and refresh P1's nametag to match.
@@ -1957,12 +2001,13 @@ impl KneeMan {
             return;
         }
         save_identity(&id);
-        if let Some(mut tag) = self.tag_p1.clone() {
-            tag.set_text(&id.name);
-            tag.add_theme_color_override("font_color", id.color);
-            tag.add_theme_font_size_override("font_size", id.font_px);
-        }
-        if let Some(mut tag) = self.tag_p2.clone() {
+        // Slot 0's tag wears the local name + color; every tag shares the local player's font size.
+        for (k, tag) in self.tags.iter().enumerate() {
+            let Some(mut tag) = tag.clone() else { continue };
+            if k == 0 {
+                tag.set_text(&id.name);
+                tag.add_theme_color_override("font_color", id.color);
+            }
             tag.add_theme_font_size_override("font_size", id.font_px);
         }
         self.saved_identity = id;
@@ -1974,28 +2019,31 @@ impl KneeMan {
     fn sync_charsel(&mut self) {
         let want = self.charsel.get_cloned();
         let roster = roster();
-        for slot in 0..2 {
+        for slot in 0..want.len() {
             let idx = (want[slot].max(0) as usize).min(roster.len() - 1);
             if idx == self.characters[slot] {
                 continue;
             }
             self.characters[slot] = idx;
             let c = &roster[idx];
-            let sprite = if slot == 0 { self.anim.clone() } else { self.p2.clone() };
-            if let Some(mut a) = sprite {
+            if let Some(mut a) = self.sprites[slot].clone() {
                 apply_character(&mut a, c);
             }
         }
     }
 
-    /// Hover each nametag a fixed height over its fighter's head, centered on the body.
+    /// Hover each live fighter's nametag a fixed height over its head; hide the dormant slots.
     fn place_tags(&mut self) {
         let s = self.state.get();
-        if let Some(mut tag) = self.tag_p1.clone() {
-            place_tag(&mut tag, s.fighters[0].pos);
-        }
-        if let Some(mut tag) = self.tag_p2.clone() {
-            place_tag(&mut tag, s.fighters[1].pos);
+        let active = s.active as usize;
+        for k in 0..sim::MAX_PLAYERS {
+            let Some(mut tag) = self.tags[k].clone() else { continue };
+            if k >= active {
+                tag.set_visible(false);
+                continue;
+            }
+            tag.set_visible(true);
+            place_tag(&mut tag, s.fighters[k].pos);
         }
         self.place_edge_tags();
     }
@@ -2009,10 +2057,15 @@ impl KneeMan {
         let view = self.base().get_viewport_rect().size;
         let cam_c = cam.get_position();
         let zoom = cam.get_zoom();
-        let names = [self.identity.get_cloned().name, p2_identity().name];
+        let active = s.active as usize;
+        let names: Vec<String> = (0..sim::MAX_PLAYERS).map(|k| self.player_name(k)).collect();
         const M: f32 = 56.0; // keep the chip this far inside the screen edge
-        for k in 0..2 {
+        for k in 0..sim::MAX_PLAYERS {
             let Some(tag) = self.edge_tags[k].as_mut() else { continue };
+            if k >= active {
+                tag.set_visible(false);
+                continue;
+            }
             let world = gv(s.fighters[k].pos);
             let screen = (world - cam_c) * zoom + view * 0.5;
             let off = screen.x < M || screen.x > view.x - M || screen.y < M || screen.y > view.y - M;
