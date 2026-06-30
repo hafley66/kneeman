@@ -1309,7 +1309,7 @@ impl KneeMan {
     fn step_local(&mut self) {
         let frame = Self::sample_input();
         let p2 = crate::controls::poll_p2();
-        let next = sim::step(&self.state.get(), [&frame, &p2], &self.tune.get()); // pure scan
+        let next = sim::step(&self.state.get(), &[&frame, &p2], &self.tune.get()); // pure scan
         self.state.set(next);
         self.base_mut().set_position(gv(next.fighters[0].pos));
         self.render_anim(&next.fighters[0]);

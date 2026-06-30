@@ -190,7 +190,7 @@ impl Game {
                 GgrsRequest::AdvanceFrame { inputs } => {
                     let i0 = decode(inputs[0].0);
                     let i1 = decode(inputs[1].0);
-                    self.state = step(&self.state, [&i0, &i1], &self.tune);
+                    self.state = step(&self.state, &[&i0, &i1], &self.tune);
                 }
             }
         }
@@ -359,7 +359,7 @@ pub mod replay {
         for &(p0, p1) in &log.frames {
             let i0 = decode(p0);
             let i1 = decode(p1);
-            s = step(&s, [&i0, &i1], tune);
+            s = step(&s, &[&i0, &i1], tune);
             out.push(checksum(&s));
         }
         out
@@ -497,7 +497,7 @@ mod tests {
         let log = fixture_log(300);
         let mut s = SimState::spawn();
         for &(p0, p1) in &log.frames {
-            s = step(&s, [&decode(p0), &decode(p1)], &t);
+            s = step(&s, &[&decode(p0), &decode(p1)], &t);
         }
         let bytes = bincode::serialize(&s).expect("serialize SimState");
         let back: SimState = bincode::deserialize(&bytes).expect("deserialize SimState");

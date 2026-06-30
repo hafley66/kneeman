@@ -58,7 +58,7 @@ fn drive(script: &[[InputFrame; 2]]) -> Vec<Snap> {
     let mut s = SimState::spawn();
     let mut trace = Vec::with_capacity(script.len());
     for inputs in script {
-        s = step(&s, [&inputs[0], &inputs[1]], &t);
+        s = step(&s, &[&inputs[0], &inputs[1]], &t);
         trace.push(snap(&s));
     }
     trace
@@ -70,7 +70,7 @@ fn settled() -> (SimState, Tune) {
     let t = Tune::default();
     let mut s = SimState::spawn();
     for _ in 0..120 {
-        s = step(&s, [&idle(), &idle()], &t);
+        s = step(&s, &[&idle(), &idle()], &t);
     }
     assert_eq!(s.fighters[0].state, CharState::Stand, "fighter should settle to Stand");
     (s, t)
@@ -128,10 +128,10 @@ fn jump_leaves_the_ground() {
     let (mut s, t) = settled();
     let ground = s.fighters[0].pos.y;
     // full hop: press + hold for the jumpsquat, then keep holding through takeoff.
-    s = step(&s, [&press(|i| { i.jump = true; i.jump_held = true; }), &idle()], &t);
+    s = step(&s, &[&press(|i| { i.jump = true; i.jump_held = true; }), &idle()], &t);
     let mut lowest = s.fighters[0].pos.y;
     for _ in 0..40 {
-        s = step(&s, [&press(|i| i.jump_held = true), &idle()], &t);
+        s = step(&s, &[&press(|i| i.jump_held = true), &idle()], &t);
         lowest = lowest.min(s.fighters[0].pos.y);
     }
     assert!(lowest < ground - 50.0, "fighter should rise well above the floor (got {lowest} vs {ground})");
@@ -145,10 +145,10 @@ fn jump_leaves_the_ground() {
 fn jump_plus_attack_autohops_into_an_aerial() {
     let (mut s, t) = settled();
     // same-frame jump + attack with empty hands = auto short-hop aerial
-    s = step(&s, [&press(|i| { i.jump = true; i.jump_held = true; i.attack = true; }), &idle()], &t);
+    s = step(&s, &[&press(|i| { i.jump = true; i.jump_held = true; i.attack = true; }), &idle()], &t);
     let mut saw_aerial = false;
     for _ in 0..14 {
-        s = step(&s, [&press(|i| i.jump_held = true), &idle()], &t);
+        s = step(&s, &[&press(|i| i.jump_held = true), &idle()], &t);
         if matches!(s.fighters[0].state, CharState::Nair | CharState::Dair) {
             saw_aerial = true;
             break;
@@ -161,14 +161,14 @@ fn jump_plus_attack_autohops_into_an_aerial() {
 #[test]
 fn second_jump_in_air_is_an_air_jump() {
     let (mut s, t) = settled();
-    s = step(&s, [&press(|i| { i.jump = true; i.jump_held = true; }), &idle()], &t);
+    s = step(&s, &[&press(|i| { i.jump = true; i.jump_held = true; }), &idle()], &t);
     for _ in 0..8 {
-        s = step(&s, [&press(|i| i.jump_held = true), &idle()], &t);
+        s = step(&s, &[&press(|i| i.jump_held = true), &idle()], &t);
     }
     assert_eq!(s.fighters[0].state, CharState::Air, "should be airborne after the hop");
     let before = s.fighters[0].air_jumps;
-    s = step(&s, [&idle(), &idle()], &t); // release
-    s = step(&s, [&press(|i| { i.jump = true; i.jump_held = true; }), &idle()], &t);
+    s = step(&s, &[&idle(), &idle()], &t); // release
+    s = step(&s, &[&press(|i| { i.jump = true; i.jump_held = true; }), &idle()], &t);
     assert_eq!(s.fighters[0].air_jumps, before - 1, "the second jump should spend an air jump");
     assert!(s.fighters[0].vel.y < 0.0, "the air jump should drive the fighter upward");
 }
@@ -177,15 +177,15 @@ fn second_jump_in_air_is_an_air_jump() {
 fn airdodge_into_the_ground_wavedashes() {
     let (mut s, t) = settled();
     // jump, then airdodge down-toward during the jumpsquat = wavedash out of the squat
-    s = step(&s, [&press(|i| { i.jump = true; i.jump_held = true; }), &idle()], &t);
-    s = step(&s, [&press(|i| {
+    s = step(&s, &[&press(|i| { i.jump = true; i.jump_held = true; }), &idle()], &t);
+    s = step(&s, &[&press(|i| {
         i.shield_pressed = true;
         i.dir = 1.0;
         i.aim_y = 1.0; // down-forward (screen y is positive downward)
     }), &idle()], &t);
     let mut grounded_with_slide = false;
     for _ in 0..20 {
-        s = step(&s, [&idle(), &idle()], &t);
+        s = step(&s, &[&idle(), &idle()], &t);
         let f = &s.fighters[0];
         if !matches!(f.state, CharState::Air | CharState::AirDodge | CharState::JumpSquat)
             && f.vel.x.abs() > 1.0
@@ -200,14 +200,14 @@ fn airdodge_into_the_ground_wavedashes() {
 #[test]
 fn grounded_attack_enters_jab() {
     let (s, t) = settled();
-    let after = step(&s, [&press(|i| i.attack = true), &idle()], &t);
+    let after = step(&s, &[&press(|i| i.attack = true), &idle()], &t);
     assert_eq!(after.fighters[0].state, CharState::Jab, "grounded attack should start a jab");
 }
 
 #[test]
 fn down_plus_attack_enters_dtilt() {
     let (s, t) = settled();
-    let after = step(&s, [&press(|i| { i.attack = true; i.down = true; }), &idle()], &t);
+    let after = step(&s, &[&press(|i| { i.attack = true; i.down = true; }), &idle()], &t);
     assert_eq!(
         after.fighters[0].state,
         CharState::Dtilt,
@@ -247,7 +247,7 @@ fn fighter_lands_and_stands_on_a_drawn_ink_floor() {
     s.paths[0] = shelf;
     // fighter 0 now drops straight down onto the shelf and settles.
     for _ in 0..120 {
-        s = step(&s, [&idle(), &idle()], &t);
+        s = step(&s, &[&idle(), &idle()], &t);
     }
     let f = &s.fighters[0];
     assert_eq!(f.ground_ink, 0, "should be standing on the ink path, not fallen through");
@@ -266,7 +266,7 @@ fn holding_a_pen_and_attacking_lays_an_ink_path() {
             i.attack_held = true;
             i.dir = 1.0;
         });
-        s = step(&s, [&p0, &idle()], &t);
+        s = step(&s, &[&p0, &idle()], &t);
     }
     let path = s.paths.iter().find(|p| p.active() && p.owner == 0);
     assert!(path.is_some(), "holding a pen and attacking should lay an ink path");
@@ -286,7 +286,7 @@ fn attack_over_gun_picks_it_up() {
         facing: 1.0,
         tool: ToolKind::TrailPen,
     };
-    let after = step(&s, [&press(|i| i.attack = true), &idle()], &t);
+    let after = step(&s, &[&press(|i| i.attack = true), &idle()], &t);
     assert_eq!(after.fighters[0].holding, 0, "attack over an unowned gun should pick it up");
     assert_ne!(after.fighters[0].state, CharState::Jab, "pickup should not also jab");
 }
@@ -306,7 +306,7 @@ fn firing_a_held_gun_spawns_a_bolt_and_spends_ammo() {
         facing: 1.0,
         tool: ToolKind::TrailPen,
     };
-    let after = step(&s, [&press(|i| i.attack = true), &idle()], &t);
+    let after = step(&s, &[&press(|i| i.attack = true), &idle()], &t);
     let bolts = after.items.iter().filter(|x| x.kind == ItemKind::LaserBolt).count();
     assert_eq!(bolts, 1, "one bolt should spawn");
     assert_eq!(after.items[0].ammo, 15, "ammo should decrement by one");
@@ -327,7 +327,7 @@ fn grab_drops_a_held_gun() {
         facing: 1.0,
         tool: ToolKind::TrailPen,
     };
-    let after = step(&s, [&press(|i| i.grab = true), &idle()], &t);
+    let after = step(&s, &[&press(|i| i.grab = true), &idle()], &t);
     assert_eq!(after.fighters[0].holding, -1, "grab should drop the held item");
     assert!(after.items[0].owner < 0, "dropped gun becomes unowned");
 }
@@ -339,7 +339,7 @@ fn falling_past_the_blast_zone_respawns() {
     let spawn_y = s.fighters[0].pos.y;
     s.fighters[0].pos.y = 5000.0; // way past BLAST_Y
     s.fighters[0].damage = 88.0;
-    let after = step(&s, [&idle(), &idle()], &t);
+    let after = step(&s, &[&idle(), &idle()], &t);
     assert!(after.fighters[0].pos.y <= spawn_y + 1.0, "should respawn back at the top");
     assert_eq!(after.fighters[0].damage, 0.0, "respawn resets damage");
 }

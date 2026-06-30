@@ -221,13 +221,18 @@ pub struct Fighter {
 /// Max simultaneous items+projectiles on screen (fixed so SimState stays Copy + checksums cheaply).
 pub const MAX_ITEMS: usize = 8;
 
+/// Max fighters in one match. Fixed (not a `Vec`) so `SimState` stays `Copy` and rollback snapshots
+/// don't heap-allocate; `SimState::active` says how many of the slots are actually in play. 4 is the
+/// canonical platform-fighter cap. See plans/n-player.md.
+pub const MAX_PLAYERS: usize = 4;
 
-/// The entire sim state as a plain value: two fighters + the item field. This is what the
-/// BehaviorSubject holds, what ggrs saves/rolls back, and what egui renders. `Copy` so snapshots
-/// are free.
+/// The entire sim state as a plain value: the fighters (slots `0..active`) + the item field. This is
+/// what the BehaviorSubject holds, what ggrs saves/rolls back, and what egui renders. `Copy` so
+/// snapshots are free.
 #[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimState {
-    pub fighters: [Fighter; 2],
+    pub fighters: [Fighter; MAX_PLAYERS],
+    pub active: u8, // fighters[0..active] are live; the rest are dormant (not stepped, not drawn)
     pub items: [Item; MAX_ITEMS],
     pub paths: [InkPath; MAX_DRAWN], // drawn ink + baked stage strokes; same polyline primitive
     pub tick: u64, // global frame counter (drives item spawn cadence)
@@ -342,16 +347,45 @@ impl Fighter {
 }
 
 impl SimState {
-    /// Two fighters facing each other on the main stage (airborne drop-in).
+    /// Two fighters facing each other on the main stage (airborne drop-in). The default match size.
     pub fn spawn() -> Self {
+        Self::spawn_n(2)
+    }
+
+    /// `count` fighters (clamped to `1..=MAX_PLAYERS`) dropped in evenly across the stage, each
+    /// facing the stage centre. Dormant slots still hold a valid `Fighter` (so the array is sound)
+    /// but `active` excludes them from stepping, combat, and rendering.
+    pub fn spawn_n(count: usize) -> Self {
+        let count = count.clamp(1, MAX_PLAYERS);
+        let mut fighters = [Fighter::spawn(480.0, 1.0); MAX_PLAYERS];
+        for (p, f) in fighters.iter_mut().enumerate() {
+            let (x, facing) = spawn_slot(p, count);
+            *f = Fighter::spawn(x, facing);
+        }
         Self {
-            fighters: [Fighter::spawn(480.0, 1.0), Fighter::spawn(720.0, -1.0)],
+            fighters,
+            active: count as u8,
             items: [Item::EMPTY; MAX_ITEMS],
             paths: [InkPath::EMPTY; MAX_DRAWN],
             tick: 0,
-            rng: 0x9E37_79B9_7F4A_7C15, // fixed seed: both peers spawn identical items
+            rng: 0x9E37_79B9_7F4A_7C15, // fixed seed: every peer spawns identical items
         }
     }
+}
+
+/// Spawn position + facing for player `p` of `count`. Two players keep the historical 480/720 split
+/// (so existing behavior/tests are byte-identical); more players spread evenly over the same band,
+/// each turned toward stage centre.
+fn spawn_slot(p: usize, count: usize) -> (f32, f32) {
+    const CENTER: f32 = 600.0;
+    if count <= 2 {
+        return if p == 0 { (480.0, 1.0) } else { (720.0, -1.0) };
+    }
+    const LEFT: f32 = 360.0;
+    const RIGHT: f32 = 840.0;
+    let t = p as f32 / (count - 1) as f32;
+    let x = LEFT + (RIGHT - LEFT) * t;
+    (x, if x < CENTER { 1.0 } else { -1.0 })
 }
 
 /// Per-character attributes in SOURCE UNITS (units/frame @ 60fps; frames are integers).
@@ -640,34 +674,64 @@ pub struct InputFrame {
 /// One tick of the whole sim: advance each fighter from its own input, then resolve combat
 /// both directions. Pure value-in/value-out — this is what ggrs calls (possibly N times per
 /// frame during rollback). `inputs[k]` drives `fighters[k]`.
-pub fn step(s: &SimState, inputs: [&InputFrame; 2], t: &Tune) -> SimState {
+pub fn step(s: &SimState, inputs: &[&InputFrame], t: &Tune) -> SimState {
     let mut n = *s;
     n.tick = n.tick.wrapping_add(1);
     maybe_spawn_item(&mut n, t);
+    let np = (n.active as usize).min(inputs.len());
 
-    // Each fighter's FSM scans its raw input and emits a pure "next action" (Act). The input is never
-    // mutated; `apply_act` actuates the descriptor into the whole SimState (spawn bolt / drop / grab).
-    let items0 = n.items; // read-only snapshot so the FSM can decide pickup-vs-jab without borrowing
+    // Phase 1: each fighter's FSM scans its raw input and emits a pure "next action" (Act). The input
+    // is never mutated. All FSMs run BEFORE any actuation so no fighter's advance sees another's
+    // already-applied effect (preserves the old two-then-two ordering for any player count).
     let paths = n.paths; // ink is fixed for the frame (it mutates last, in update_paths); snapshot to collide
-    let act0 = advance(&mut n.fighters[0], &items0, &paths, inputs[0], t);
-    let items1 = n.items;
-    let act1 = advance(&mut n.fighters[1], &items1, &paths, inputs[1], t);
-    apply_act(&mut n, 0, act0, t);
-    apply_act(&mut n, 1, act1, t);
-    // split the array so both fighters can be borrowed mutably at once. The victim's stick this frame
-    // feeds trajectory DI, so each call passes the defender's aim.
-    let aim0 = Vector2::new(inputs[0].dir, inputs[0].aim_y);
-    let aim1 = Vector2::new(inputs[1].dir, inputs[1].aim_y);
-    let (l, r) = n.fighters.split_at_mut(1);
-    resolve_combat(&mut l[0], &mut r[0], aim1, t); // p0 attacks p1 (victim p1 DIs)
-    resolve_combat(&mut r[0], &mut l[0], aim0, t); // p1 attacks p0 (victim p0 DIs)
-    // grabs: catch / hold / pummel / throw / mash-out. Cross-fighter, so it owns the held pair.
-    resolve_grab(&mut l[0], &mut r[0], 0, 1, inputs[0], inputs[1], t); // p0 grabs p1
-    resolve_grab(&mut r[0], &mut l[0], 1, 0, inputs[1], inputs[0], t); // p1 grabs p0
+    let mut acts = [Act::None; MAX_PLAYERS];
+    for p in 0..np {
+        let items = n.items; // read-only snapshot so the FSM decides pickup-vs-jab without borrowing
+        acts[p] = advance(&mut n.fighters[p], &items, &paths, inputs[p], t);
+    }
+    // Phase 2: actuate in handle order (spawns bolts / drops / picks up on the shared item array).
+    for p in 0..np {
+        apply_act(&mut n, p, acts[p], t);
+    }
+    // Phase 3: pairwise combat + grabs over every ordered (attacker, victim) pair. The victim's stick
+    // this frame feeds trajectory DI, so each call passes the defender's aim. `pair_mut` borrows the
+    // two distinct fighters at once (generalizes the old hand split).
+    for a in 0..np {
+        for b in 0..np {
+            if a == b {
+                continue;
+            }
+            let aim_b = Vector2::new(inputs[b].dir, inputs[b].aim_y);
+            let (fa, fb) = pair_mut(&mut n.fighters, a, b);
+            resolve_combat(fa, fb, aim_b, t); // a attacks b (victim b DIs)
+        }
+    }
+    for a in 0..np {
+        for b in 0..np {
+            if a == b {
+                continue;
+            }
+            let (fa, fb) = pair_mut(&mut n.fighters, a, b);
+            resolve_grab(fa, fb, a as i8, b as i8, inputs[a], inputs[b], t); // a grabs b
+        }
+    }
 
     update_items(&mut n, t); // move bolts, follow held guns, resolve bolt hits
     update_paths(&mut n, inputs, t); // lay/extend/finalize drawn ink, decay old nodes
     n
+}
+
+/// Two distinct fighters (`a != b`) borrowed mutably at once, via one `split_at_mut`. Replaces the
+/// old hand-rolled `split_at_mut(1)` now that the pair is dynamic.
+fn pair_mut(fs: &mut [Fighter], a: usize, b: usize) -> (&mut Fighter, &mut Fighter) {
+    debug_assert_ne!(a, b, "pair_mut needs two distinct fighters");
+    if a < b {
+        let (l, r) = fs.split_at_mut(b);
+        (&mut l[a], &mut r[0])
+    } else {
+        let (l, r) = fs.split_at_mut(a);
+        (&mut r[0], &mut l[b])
+    }
 }
 
 /// Advance ONE fighter by one frame from its own input: buffer, state machine, integrate +
@@ -1589,9 +1653,10 @@ fn apply_act(n: &mut SimState, idx: usize, act: Act, t: &Tune) {
 /// path the moment its owner stops drawing or runs out of budget (running `classify` once to cache
 /// grabbability), then decay old nodes per-node and free spent slots. Baked stage strokes (owner < 0)
 /// never draw or decay. Pure; the only place ink paths mutate. See the `ink-paths` skill.
-fn update_paths(n: &mut SimState, inputs: [&InputFrame; 2], t: &Tune) {
+fn update_paths(n: &mut SimState, inputs: &[&InputFrame], t: &Tune) {
     let tick = n.tick;
-    for idx in 0..2 {
+    let np = (n.active as usize).min(inputs.len());
+    for idx in 0..np {
         let f = n.fighters[idx];
         let holding = f.holding;
         let pen = holding >= 0 && n.items[holding as usize].kind.is_pen();
@@ -1759,7 +1824,7 @@ mod di_tests {
         f.coyote = 4;
         let jump = InputFrame { jump: true, jump_held: true, ..Default::default() };
         let idle = InputFrame::default();
-        let out = step(&s, [&jump, &idle], &t);
+        let out = step(&s, &[&jump, &idle], &t);
         let g = &out.fighters[0];
         // one frame of gravity is integrated after takeoff, so compare against fullhop + g*DT.
         let expect = t.fullhop_v + t.gravity * DT;
@@ -1781,7 +1846,7 @@ mod di_tests {
         f.coyote = 0;
         let jump = InputFrame { jump: true, jump_held: true, ..Default::default() };
         let idle = InputFrame::default();
-        let out = step(&s, [&jump, &idle], &t);
+        let out = step(&s, &[&jump, &idle], &t);
         let g = &out.fighters[0];
         let expect = t.airjump_v + t.gravity * DT;
         assert!((g.vel.y - expect).abs() < 1e-3, "no coyote -> air jump velocity");
@@ -1804,14 +1869,14 @@ mod di_tests {
         let idle = InputFrame::default();
 
         // frame 1: facing flips, but velocity is still rightward (no instant reversal).
-        let s1 = step(&s, [&left, &idle], &t);
+        let s1 = step(&s, &[&left, &idle], &t);
         assert_eq!(s1.fighters[0].facing, -1.0, "facing flips on the reversal frame");
         assert!(s1.fighters[0].vel.x > 0.0, "velocity must NOT teleport to the new direction");
 
         // hold left a few more frames: momentum bleeds through 0 and goes negative.
         let mut cur = s1;
         for _ in 0..8 {
-            cur = step(&cur, [&left, &idle], &t);
+            cur = step(&cur, &[&left, &idle], &t);
         }
         assert!(cur.fighters[0].vel.x < 0.0, "sustained reversal eventually crosses 0 to the left");
     }
@@ -1831,14 +1896,14 @@ mod di_tests {
         let hold = InputFrame { aim_y: -1.0, ..Default::default() };
 
         // press frame enters the up-B state
-        let mut cur = step(&s, [&up_b, &Default::default()], &t);
+        let mut cur = step(&s, &[&up_b, &Default::default()], &t);
         assert_eq!(cur.fighters[0].state, CharState::SpecialU, "stick-up special = up-B");
 
         // run it out: it leaves the ground rising, then becomes Helpless
         let mut saw_rise = false;
         let mut saw_helpless = false;
         for _ in 0..60 {
-            cur = step(&cur, [&hold, &Default::default()], &t);
+            cur = step(&cur, &[&hold, &Default::default()], &t);
             if cur.fighters[0].vel.y < 0.0 {
                 saw_rise = true;
             }
@@ -1870,10 +1935,10 @@ mod di_tests {
             }
             let press = InputFrame { special: true, aim_y, dir, ..Default::default() };
             let hold = InputFrame { aim_y, dir, ..Default::default() };
-            let mut cur = step(&s, [&press, &Default::default()], &t);
+            let mut cur = step(&s, &[&press, &Default::default()], &t);
             let mut prev = cur.fighters[0].pos;
             for _ in 0..40 {
-                cur = step(&cur, [&hold, &Default::default()], &t);
+                cur = step(&cur, &[&hold, &Default::default()], &t);
                 let p = cur.fighters[0].pos;
                 let d = (p - prev).length();
                 assert!(d <= MAX_STEP, "{label}: single-frame jump {d:.1}px > {MAX_STEP} (teleport)");
@@ -1892,12 +1957,12 @@ mod di_tests {
         f.ground_plat = 0;
         f.pos = Vector2::new(600.0, GROUND_Y);
         let nb = InputFrame { special: true, ..Default::default() };
-        let cur = step(&s, [&nb, &Default::default()], &t);
+        let cur = step(&s, &[&nb, &Default::default()], &t);
         assert_eq!(cur.fighters[0].state, CharState::SpecialN, "neutral stick + special = neutral-B");
         // a few frames in, still grounded and still in the punch (not launched into the air)
         let mut c = cur;
         for _ in 0..6 {
-            c = step(&c, [&Default::default(), &Default::default()], &t);
+            c = step(&c, &[&Default::default(), &Default::default()], &t);
         }
         assert!(c.fighters[0].ground_plat >= 0, "neutral-B stays grounded");
     }
@@ -1920,7 +1985,7 @@ mod di_tests {
                 f.vel = Vector2::ZERO;
             }
             let press = InputFrame { special: true, aim_y, dir, ..Default::default() };
-            let cur = step(&s, [&press, &Default::default()], &t);
+            let cur = step(&s, &[&press, &Default::default()], &t);
             assert!(cur.fighters[0].pos.y < GROUND_Y - 50.0, "{label}: snapped to ground");
             assert_eq!(cur.fighters[0].ground_plat, -1, "{label}: must read as airborne");
         }
@@ -1942,9 +2007,9 @@ mod di_tests {
         let idle = InputFrame::default();
 
         // p0 presses grab; within startup+active it should catch p1.
-        let mut c = step(&s, [&grab, &idle], &t);
+        let mut c = step(&s, &[&grab, &idle], &t);
         for _ in 0..(t.grab_startup + t.grab_active) {
-            c = step(&c, [&idle, &idle], &t);
+            c = step(&c, &[&idle, &idle], &t);
         }
         assert_eq!(c.fighters[0].state, CharState::GrabHold, "grabber holds");
         assert_eq!(c.fighters[1].state, CharState::Grabbed, "victim held");
@@ -1954,12 +2019,12 @@ mod di_tests {
         // pummel raises the victim's damage without releasing.
         let pummel = InputFrame { attack: true, ..Default::default() };
         let before = c.fighters[1].damage;
-        c = step(&c, [&pummel, &idle], &t);
+        c = step(&c, &[&pummel, &idle], &t);
         assert!(c.fighters[1].damage > before, "pummel deals damage");
         assert_eq!(c.fighters[0].state, CharState::GrabHold, "still holding after pummel");
 
         // re-press grab = throw: victim launched, both unlinked.
-        c = step(&c, [&grab, &idle], &t);
+        c = step(&c, &[&grab, &idle], &t);
         assert_eq!(c.fighters[0].grab_link, -1, "grabber released on throw");
         assert!(c.fighters[1].hitstun > 0, "victim launched with hitstun");
         assert_ne!(c.fighters[1].state, CharState::Grabbed, "victim no longer held");
@@ -1980,10 +2045,10 @@ mod di_tests {
         f1.pos = Vector2::new(900.0, GROUND_Y); // far away
         let grab = InputFrame { grab: true, ..Default::default() };
         let idle = InputFrame::default();
-        let mut c = step(&s, [&grab, &idle], &t);
+        let mut c = step(&s, &[&grab, &idle], &t);
         assert_eq!(c.fighters[0].state, CharState::Grab, "entered grab");
         for _ in 0..(t.grab_startup + t.grab_active + t.grab_recovery + 1) {
-            c = step(&c, [&idle, &idle], &t);
+            c = step(&c, &[&idle, &idle], &t);
         }
         assert_eq!(c.fighters[0].state, CharState::Stand, "whiffed grab returns to neutral");
         assert_eq!(c.fighters[1].state, CharState::Stand, "victim untouched");
@@ -2008,7 +2073,7 @@ mod di_tests {
         let t = Tune::from_char(&CharData::KNEEMAN);
         let s = launched(&t);
         let idle = InputFrame::default();
-        let c = step(&s, [&idle, &idle], &t);
+        let c = step(&s, &[&idle, &idle], &t);
         assert_eq!(c.fighters[0].state, CharState::Knockdown, "missed tech -> floored");
         assert!(!c.fighters[0].tumble, "tumble cleared on knockdown");
     }
@@ -2030,7 +2095,7 @@ mod di_tests {
         let apex = {
             let mut hi = c.fighters[0].pos.y;
             for _ in 0..120 {
-                c = step(&c, [&idle, &idle], &t);
+                c = step(&c, &[&idle, &idle], &t);
                 hi = hi.min(c.fighters[0].pos.y); // smaller y = higher
             }
             hi
@@ -2061,7 +2126,7 @@ mod di_tests {
         let mut c = s;
         // run past the launch frame (Punch startup) plus a bit
         for _ in 0..30 {
-            c = step(&c, [&idle, &idle], &t);
+            c = step(&c, &[&idle, &idle], &t);
         }
         assert!(
             c.fighters[0].pos.y > start_y + 100.0,
@@ -2080,7 +2145,7 @@ mod di_tests {
         let s = launched(&t);
         let tech = InputFrame { shield_pressed: true, ..Default::default() };
         let idle = InputFrame::default();
-        let c = step(&s, [&tech, &idle], &t);
+        let c = step(&s, &[&tech, &idle], &t);
         assert_eq!(c.fighters[0].state, CharState::TechInPlace, "teched the landing");
         assert!(c.fighters[0].intangible, "tech is intangible");
     }
@@ -2091,7 +2156,7 @@ mod di_tests {
         let s = launched(&t);
         let tech_left = InputFrame { shield_pressed: true, dir: -1.0, ..Default::default() };
         let idle = InputFrame::default();
-        let c = step(&s, [&tech_left, &idle], &t);
+        let c = step(&s, &[&tech_left, &idle], &t);
         assert_eq!(c.fighters[0].state, CharState::TechRoll, "held a direction -> tech roll");
         assert!(c.fighters[0].vel.x < 0.0, "rolls in the held direction");
     }
@@ -2101,10 +2166,10 @@ mod di_tests {
         let t = Tune::from_char(&CharData::KNEEMAN);
         let s = launched(&t);
         let idle = InputFrame::default();
-        let mut c = step(&s, [&idle, &idle], &t);
+        let mut c = step(&s, &[&idle, &idle], &t);
         assert_eq!(c.fighters[0].state, CharState::Knockdown);
         for _ in 0..(t.knockdown_frames + t.getup_frames + 2) {
-            c = step(&c, [&idle, &idle], &t);
+            c = step(&c, &[&idle, &idle], &t);
         }
         assert_eq!(c.fighters[0].state, CharState::Stand, "floored -> getup -> stand");
     }
@@ -2183,7 +2248,7 @@ mod geo_wiring_tests {
         assert!(t.wall_bounce > 0.0);
         let s = at_left_wall(Vector2::new(900.0, 0.0), true);
         let idle = InputFrame::default();
-        let out = step(&s, [&idle, &idle], &t);
+        let out = step(&s, &[&idle, &idle], &t);
         let f = &out.fighters[0];
         assert!(f.vel.x < 0.0, "tumbling into the wall kicks back the other way, got {}", f.vel.x);
         assert!((f.pos.x + ECB_HALF_W) <= FLOOR_LEFT + 1.0, "still depenetrated out of the wall");
@@ -2195,7 +2260,7 @@ mod geo_wiring_tests {
         let t = Tune::default();
         let s = at_left_wall(Vector2::new(900.0, 0.0), false);
         let idle = InputFrame::default();
-        let out = step(&s, [&idle, &idle], &t);
+        let out = step(&s, &[&idle, &idle], &t);
         assert!(out.fighters[0].vel.x.abs() < 1e-3, "no bounce without tumble (e=0 dead stop)");
     }
 
