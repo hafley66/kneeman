@@ -487,4 +487,21 @@ mod tests {
         assert!((d.dir - 1.0).abs() < 0.02);
         assert!((d.aim_y + 1.0).abs() < 0.02);
     }
+
+    /// The reconnect resume ships a `SimState` snapshot as bincode; a mid-match state must survive
+    /// the round-trip byte-for-byte, or the two rebuilt sessions start from different states.
+    #[test]
+    fn simstate_bincode_roundtrip_resumes_identically() {
+        // Run a stepped, non-spawn state so fighters, items, tick and rng are all populated.
+        let t = Tune::default();
+        let log = fixture_log(300);
+        let mut s = SimState::spawn();
+        for &(p0, p1) in &log.frames {
+            s = step(&s, [&decode(p0), &decode(p1)], &t);
+        }
+        let bytes = bincode::serialize(&s).expect("serialize SimState");
+        let back: SimState = bincode::deserialize(&bytes).expect("deserialize SimState");
+        assert!(s == back, "snapshot must round-trip exactly"); // SimState has no Debug
+        assert_eq!(checksum(&s), checksum(&back), "checksum must match after resume decode");
+    }
 }

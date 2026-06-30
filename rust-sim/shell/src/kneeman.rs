@@ -18,12 +18,55 @@ use smash_net::{encode, start_p2p, Game, GgrsConfig, GgrsError, GgrsEvent, P2PSe
 
 /// Netplay lifecycle. Offline = local single-player (default). Signaling = dialing the relay +
 /// doing the WebRTC handshake; still renders local play so the page isn't frozen. Running = ggrs
-/// rollback drives the sim from both peers' inputs.
+/// rollback drives the sim from both peers' inputs. Reconnecting = the peer dropped mid-match; we
+/// re-dial the private room and hold a window for them to come back before falling to Offline.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Phase {
     Offline,
     Signaling,
     Running,
+    Reconnecting,
+}
+
+/// How long (ms) to keep a match's room alive after a transport drop, waiting for the dropped peer
+/// to re-dial and re-pair. Past this, the room is freed and we return to local play ("turn off").
+const RECONNECT_WINDOW_MS: u64 = 12_000;
+
+/// The match's room identity on the client (the "lobby entity"). `code` is the private room both
+/// peers re-dial to find EACH OTHER again after a transport drop — the host mints it once paired and
+/// ships it to the guest over the signaling socket; the relay forwards it verbatim, so no server
+/// change is needed. `deadline_ms` is `Some` only while we're inside the reconnect window.
+struct Room {
+    code: String,
+    deadline_ms: Option<u64>,
+}
+
+/// Monotonic ms clock (Godot's, so it works the same on native + the emscripten web build).
+fn now_ms() -> u64 {
+    godot::classes::Time::singleton().get_ticks_msec()
+}
+
+/// Mint a private room code for reconnect. Only the host calls this, once, so it just needs to be
+/// unlikely to collide with another pair's room at the same instant: microsecond clock xor'd with a
+/// hash of the host's name. Both peers then share THIS code (host sends it over the relay).
+fn mint_room_code(name: &str) -> String {
+    let t = godot::classes::Time::singleton().get_ticks_usec();
+    let salt = name.bytes().fold(0u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
+    format!("rm{:x}", t ^ salt.rotate_left(17))
+}
+
+/// Serialize a sim snapshot for the signaling channel: bincode bytes (same wire as ggrs messages),
+/// base64'd via Godot's Marshalls so it rides inside a JSON text frame.
+fn encode_state(s: &SimState) -> GString {
+    let bytes = bincode::serialize(s).expect("serialize SimState snapshot");
+    godot::classes::Marshalls::singleton().raw_to_base64(&PackedByteArray::from(bytes.as_slice()))
+}
+
+/// Inverse of `encode_state`. `None` if the base64/bincode doesn't decode (malformed frame), so the
+/// guest keeps waiting for a good one rather than resuming from garbage.
+fn decode_state(b64: &str) -> Option<SimState> {
+    let raw = godot::classes::Marshalls::singleton().base64_to_raw(b64);
+    bincode::deserialize::<SimState>(raw.as_slice()).ok()
 }
 
 /// Read-only snapshot of the netplay transport machine for the debug panel. Every field is a
@@ -611,6 +654,9 @@ pub struct KneeMan {
     channel: Option<Gd<WebRtcDataChannel>>,    // negotiated data channel ggrs rides
     session: Option<P2PSession<GgrsConfig>>,   // rollback session (once the channel opens)
     game: Option<Game>,                        // ggrs-authoritative sim state during a match
+    room: Option<Room>,                        // match's room identity; survives a drop so we can rejoin
+    resume_snapshot: Option<SimState>,         // sim state captured at a drop, to resume the rebuilt session from
+    got_resume: bool,                          // guest: received the host's resume snapshot this reconnect
 }
 
 #[godot_api]
@@ -655,6 +701,9 @@ impl INode2D for KneeMan {
             channel: None,
             session: None,
             game: None,
+            room: None,
+            resume_snapshot: None,
+            got_resume: false,
         }
     }
 
@@ -801,6 +850,25 @@ impl INode2D for KneeMan {
                 }
             }
             Phase::Running => self.step_net(),
+            // Re-pair through the same handshake pump; keep showing local play meanwhile. Give up
+            // and free the room once the window elapses with no opponent back.
+            Phase::Reconnecting => {
+                self.pump_signaling();
+                if self.phase == Phase::Reconnecting {
+                    let expired = self
+                        .room
+                        .as_ref()
+                        .and_then(|r| r.deadline_ms)
+                        .map(|d| now_ms() > d)
+                        .unwrap_or(true);
+                    if expired {
+                        godot_print!("netplay: reconnect window elapsed — turning off");
+                        self.reset_offline();
+                    } else {
+                        self.step_local();
+                    }
+                }
+            }
         }
         self.update_status();
         self.update_hud();
@@ -1116,6 +1184,7 @@ impl KneeMan {
                 Phase::Offline => "offline",
                 Phase::Signaling => "signaling",
                 Phase::Running => "running",
+                Phase::Reconnecting => "reconnecting",
             },
             role: match self.role {
                 Some(Role::Host) => "host",
@@ -1224,10 +1293,20 @@ impl KneeMan {
         if let Some(mut pc) = self.pc.clone() {
             pc.poll();
         }
+        // Transport-level drop: ICE failed or the data channel closed. ggrs also reports the peer
+        // gone (its packets stopped) via a Disconnected event. Either one opens the reconnect window.
+        let mut peer_gone = self.transport_dropped();
         let requests = {
             let Some(session) = self.session.as_mut() else { return };
             session.poll_remote_clients();
-            if session.current_state() != SessionState::Running {
+            for ev in session.events() {
+                if matches!(ev, GgrsEvent::Disconnected { .. }) {
+                    peer_gone = true;
+                }
+            }
+            if peer_gone {
+                None
+            } else if session.current_state() != SessionState::Running {
                 None // still synchronizing with the peer; hold the last rendered frame
             } else {
                 let net = encode(&Self::sample_input());
@@ -1245,6 +1324,10 @@ impl KneeMan {
                 }
             }
         };
+        if peer_gone {
+            self.begin_reconnect();
+            return;
+        }
         if let (Some(reqs), Some(game)) = (requests, self.game.as_mut()) {
             game.handle(reqs);
         }
@@ -1263,9 +1346,23 @@ impl KneeMan {
     // --- netplay setup / signaling --------------------------------------------------------------
 
     /// Dial the signaling relay. The relay replies `matched` with a role, kicking off the handshake.
+    /// A fresh match has no room yet (the host mints one once paired); reconnects re-dial with it.
     fn start_matchmaking(&mut self) {
+        self.room = None;
+        self.resume_snapshot = None; // fresh match starts from spawn, not a stale snapshot
+        self.got_resume = false;
+        if !self.dial(None) {
+            return;
+        }
+        self.phase = Phase::Signaling;
+        godot_print!("netplay: dialing {} ...", rtc::SIGNALING_URL);
+    }
+
+    /// Open a signaling socket, tagged with our identity (so the relay's /status lists us) and an
+    /// optional `room` code. `None` = open matchmaking (relay's "default" room); `Some(code)` =
+    /// re-pair with a specific opponent on reconnect. Returns false if the dial failed.
+    fn dial(&mut self, room: Option<&str>) -> bool {
         let mut ws = WebSocketPeer::new_gd();
-        // Tag the dial with our identity so the relay's /status page can list who is connected.
         let id = self.identity.get_cloned();
         let c = id.color;
         let hex = format!(
@@ -1274,15 +1371,17 @@ impl KneeMan {
             (c.g * 255.0) as u8,
             (c.b * 255.0) as u8
         );
-        let url = format!("{}?name={}&color={}", rtc::SIGNALING_URL, url_escape(&id.name), hex);
+        let mut url = format!("{}?name={}&color={}", rtc::SIGNALING_URL, url_escape(&id.name), hex);
+        if let Some(code) = room {
+            url.push_str(&format!("&room={}", url_escape(code)));
+        }
         if ws.connect_to_url(&url) != godot::global::Error::OK {
             godot_error!("netplay: signaling dial failed");
-            return;
+            return false;
         }
         self.ws = Some(ws);
         self.sig = SigCounts::default(); // fresh tallies per match attempt
-        self.phase = Phase::Signaling;
-        godot_print!("netplay: dialing {} ...", rtc::SIGNALING_URL);
+        true
     }
 
     /// Per-frame while Signaling: drain inbound relay frames, drive the peer connection, and start
@@ -1315,7 +1414,15 @@ impl KneeMan {
         }
         if let Some(ch) = self.channel.clone() {
             if ch.get_ready_state() == ChannelState::OPEN && self.session.is_none() {
-                self.begin_session();
+                // On reconnect the guest must hold until the host's resume snapshot lands, or the two
+                // rebuilt sessions would start from different states. First match (or host) has nothing
+                // to wait for.
+                let waiting_for_resume = self.phase == Phase::Reconnecting
+                    && self.role == Some(Role::Guest)
+                    && !self.got_resume;
+                if !waiting_for_resume {
+                    self.begin_session();
+                }
             }
         }
     }
@@ -1355,6 +1462,24 @@ impl KneeMan {
                     pc.add_ice_candidate(&media, index, &name);
                 }
             }
+            // Host mints the private reconnect room and relays the code; guest stores it so both
+            // sides re-dial the SAME room if the transport drops later. Ignore once we already have one.
+            "room" => {
+                let code = rtc::dget_str(&d, "code");
+                if !code.is_empty() && self.room.is_none() {
+                    self.room = Some(Room { code, deadline_ms: None });
+                }
+            }
+            // Reconnect resume: the host ships the sim state to start the rebuilt session from. The
+            // host's snapshot is authoritative, so it overwrites ours; `got_resume` releases the
+            // guest's `begin_session` gate.
+            "resume" => {
+                let b64 = rtc::dget_str(&d, "state");
+                if let Some(snap) = decode_state(&b64) {
+                    self.resume_snapshot = Some(snap);
+                    self.got_resume = true;
+                }
+            }
             "bye" => self.reset_offline(),
             _ => {}
         }
@@ -1389,6 +1514,27 @@ impl KneeMan {
         self.pc = Some(pc);
 
         if role == Role::Host {
+            // First time as host: mint the private reconnect room and ship the code to the guest
+            // over the relay (it forwards unknown frames verbatim). On a reconnect the room already
+            // exists, so don't re-mint — both sides keep the original code.
+            if self.room.is_none() {
+                let code = mint_room_code(&self.identity.get_cloned().name);
+                let mut d = VarDictionary::new();
+                d.set("kind", "room");
+                d.set("code", code.clone());
+                if let Some(mut ws) = self.ws.clone() {
+                    ws.send_text(&rtc::to_json(&d));
+                }
+                self.room = Some(Room { code, deadline_ms: None });
+            } else if let Some(snap) = self.resume_snapshot {
+                // Reconnect: ship our snapshot so both peers rebuild the session from the same state.
+                let mut d = VarDictionary::new();
+                d.set("kind", "resume");
+                d.set("state", encode_state(&snap));
+                if let Some(mut ws) = self.ws.clone() {
+                    ws.send_text(&rtc::to_json(&d));
+                }
+            }
             if let Some(mut pc) = self.pc.clone() {
                 pc.create_offer();
             }
@@ -1406,9 +1552,17 @@ impl KneeMan {
         match start_p2p(local_handle, remote, socket, rtc::INPUT_DELAY) {
             Ok(session) => {
                 self.session = Some(session);
-                self.game = Some(Game::new(self.tune.get()));
+                // Resume from the agreed snapshot on a reconnect; spawn fresh on a first match. Both
+                // peers reach this with the SAME snapshot (the host's), so frame 0 of the rebuilt
+                // session is identical and ggrs stays in sync.
+                let state = self.resume_snapshot.unwrap_or_else(SimState::spawn);
+                self.game = Some(Game { state, tune: self.tune.get() });
+                self.state.set(state);
                 self.local_handle = local_handle;
                 self.phase = Phase::Running;
+                if let Some(r) = self.room.as_mut() {
+                    r.deadline_ms = None; // back in a match; close the reconnect window
+                }
                 godot_print!("netplay: channel open, rollback running (handle {local_handle})");
             }
             Err(e) => {
@@ -1418,7 +1572,7 @@ impl KneeMan {
         }
     }
 
-    /// Tear down all networking and return to single-player.
+    /// Tear down all networking and return to single-player. Frees the room ("turn off").
     fn reset_offline(&mut self) {
         self.session = None;
         self.game = None;
@@ -1428,8 +1582,64 @@ impl KneeMan {
             ws.close();
         }
         self.role = None;
+        self.room = None;
+        self.resume_snapshot = None;
+        self.got_resume = false;
         self.phase = Phase::Offline;
         godot_print!("netplay: offline");
+    }
+
+    /// Has the live transport died? ICE went to `failed`, or the ggrs data channel closed. (A merely
+    /// `disconnected` connection can still recover ICE on its own, so it does NOT count here — only a
+    /// definitive failure triggers the heavier room reconnect.)
+    fn transport_dropped(&self) -> bool {
+        let chan_closed = self
+            .channel
+            .as_ref()
+            .map(|c| c.get_ready_state() == ChannelState::CLOSED)
+            .unwrap_or(false);
+        let conn_failed = self
+            .pc
+            .as_ref()
+            .map(|p| p.get_connection_state() == ConnectionState::FAILED)
+            .unwrap_or(false);
+        chan_closed || conn_failed
+    }
+
+    /// Peer dropped mid-match: drop the dead transport but KEEP the room identity, re-dial the
+    /// private room, and open the reconnect window. Both peers do this and re-pair with each other
+    /// (only they know the code). Without a shared code (drop before it was exchanged) we can't
+    /// rejoin, so fall straight to offline.
+    fn begin_reconnect(&mut self) {
+        let Some(code) = self.room.as_ref().map(|r| r.code.clone()) else {
+            self.reset_offline();
+            return;
+        };
+        godot_print!("netplay: peer dropped — reconnecting to room {code}");
+        // Capture the latest sim state so the rebuilt session resumes here instead of from spawn.
+        // Both peers capture; the new host's snapshot wins (it ships it over the relay).
+        self.resume_snapshot = self
+            .game
+            .as_ref()
+            .map(|g| g.state)
+            .or_else(|| Some(self.state.get()));
+        self.got_resume = false;
+        self.session = None;
+        self.game = None;
+        self.channel = None;
+        self.pc = None;
+        if let Some(mut ws) = self.ws.take() {
+            ws.close();
+        }
+        self.role = None;
+        if !self.dial(Some(&code)) {
+            self.reset_offline();
+            return;
+        }
+        if let Some(r) = self.room.as_mut() {
+            r.deadline_ms = Some(now_ms() + RECONNECT_WINDOW_MS);
+        }
+        self.phase = Phase::Reconnecting;
     }
 
     /// One line describing where we are in the netplay lifecycle, shown top-left every frame.
@@ -1444,6 +1654,15 @@ impl KneeMan {
                     None => "?",
                 };
                 format!("NETPLAY  ·  {who} (handle {})", self.local_handle)
+            }
+            Phase::Reconnecting => {
+                let secs = self
+                    .room
+                    .as_ref()
+                    .and_then(|r| r.deadline_ms)
+                    .map(|d| d.saturating_sub(now_ms()).div_ceil(1000))
+                    .unwrap_or(0);
+                format!("RECONNECTING…  ·  waiting {secs}s for your opponent")
             }
         }
     }

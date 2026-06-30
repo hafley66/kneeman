@@ -6,4 +6,5 @@ edition = "2021"
 # PURE sim crate. No godot, no IO. Vectors are glam (same version godot already pulls),
 # so this compiles standalone on native + wasm for the rollback/netcode path.
 [dependencies]
-glam = "0.30"
+glam = { version = "0.30", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }

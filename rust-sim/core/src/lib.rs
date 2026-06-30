@@ -2,6 +2,8 @@
 // godot original); the shell converts to godot::Vector2 at the render boundary.
 pub use glam::Vec2 as Vector2;
 
+use serde::{Deserialize, Serialize};
+
 pub mod geo; // deterministic collision geometry, API-shaped to mirror parry2d (swap-in later)
 
 // fixed timestep; the sim never uses wall-clock delta (determinism).
@@ -103,7 +105,7 @@ fn sign(x: f32) -> f32 {
 /// Ground/air/ledge action states. `frame` (in SimState) is the per-state timer that resets on
 /// every transition, mirroring an animation frame — it gates the dash window, jumpsquat takeoff,
 /// pivot, dodge length, landing lag, ledge intangibility, and getup.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum CharState {
     Stand,     // idle, grounded
     Walk,      // tilt-speed ground move
@@ -483,7 +485,7 @@ pub fn hurtbox(f: &Fighter) -> (Vector2, f32) {
 /// `window` is the only place a buffer length is decided, dispatched by a match (the enum's job —
 /// no bit tricks): the lookahead edges share the live Tune window; `Grab` is 0 (press-frame only,
 /// as today) but expressible, the seam to give it a real buffer later.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum Action {
     #[default]
     None,
@@ -542,7 +544,7 @@ const N_LANE: usize = 5;
 /// One lane's pending action. `timer == 0` (or `action == None`) means empty; while live, `aim` is
 /// the stick captured at the press and, on the movement lane, refreshed within the window — the
 /// diagonal that lets a buffered air-dodge keep its latest direction.
-#[derive(Copy, Clone, PartialEq, Default, Debug)]
+#[derive(Copy, Clone, PartialEq, Default, Debug, Serialize, Deserialize)]
 pub struct Slot {
     pub action: Action,
     pub timer: i64,
@@ -553,7 +555,7 @@ pub struct Slot {
 /// per-fighter (the old single-player SimState fields); `damage`/`hitstun` were the old
 /// `dummy_*` fields, now owned by every fighter (each can take and deal hits).
 /// `frame` is the per-fighter STATE timer (reset on every transition), not a global clock.
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fighter {
     pub frame: i64,
     pub pos: Vector2,
@@ -587,7 +589,7 @@ pub const MAX_ITEMS: usize = 8;
 
 /// What an item slot is. `None` = empty slot. Add kinds freely; behavior dispatches by `match`
 /// (the "trait methods" are functions keyed on kind), config lives per-kind in Tune.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ItemKind {
     None,
     LaserGun,  // pickup weapon: hold + attack to fire LaserBolts until ammo runs out
@@ -612,7 +614,7 @@ impl ItemKind {
 /// One item OR projectile. Plain Copy data so it rolls back. `owner`: -1 = unowned ground item;
 /// else the fighter index that holds it (gun) or fired it (bolt). `timer`: gun = fire cooldown,
 /// bolt = remaining lifetime. `ammo`: gun shots left.
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub kind: ItemKind,
     pub pos: Vector2,
@@ -641,7 +643,7 @@ impl Item {
 /// The entire sim state as a plain value: two fighters + the item field. This is what the
 /// BehaviorSubject holds, what ggrs saves/rolls back, and what egui renders. `Copy` so snapshots
 /// are free.
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimState {
     pub fighters: [Fighter; 2],
     pub items: [Item; MAX_ITEMS],
