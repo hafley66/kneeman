@@ -10,7 +10,7 @@ use godot::classes::{
 };
 use godot::global::Key;
 use godot::prelude::*;
-use godot::tools::load;
+use godot::tools::try_load;
 
 use crate::rtc::{self, Role, RtcSocket};
 use crate::sim::{self, CharState, Fighter, InputFrame, SimState, Tune};
@@ -259,6 +259,8 @@ fn frog() -> Character {
             clip("climb", &["double_jump"], 6, 14.0, true),
             clip("jab", &["hit"], 7, 20.0, false),
             clip("nair", &["double_jump"], 6, 18.0, true),
+            clip("dtilt", &["hit"], 7, 26.0, false), // pothole swing reuses the punch sheet, one-shot
+            clip("wallbounce", &["fall"], 1, 1.0, false), // wall hit: a single frozen frame, tilted in render
         ],
     }
 }
@@ -282,6 +284,8 @@ fn zombie() -> Character {
             clip("climb", &["climb1", "climb2"], 2, 8.0, true),
             clip("jab", &["action1"], 1, 1.0, false),
             clip("nair", &["kick"], 1, 1.0, false),
+            clip("dtilt", &["duck"], 1, 1.0, false),     // pothole reuses the duck pose
+            clip("wallbounce", &["hurt"], 1, 1.0, false), // wall hit reuses the hurt pose
         ],
     }
 }
@@ -1077,7 +1081,35 @@ impl INode2D for KneeMan {
                         .width(3.0)
                         .done();
                 }
+                sim::ItemKind::Pen => {
+                    // drawing tool pickup: a bright nib so it reads as ink.
+                    let size = Vector2::new(30.0, 30.0);
+                    self.base_mut().draw_rect(
+                        Rect2::new(c - size * 0.5, size),
+                        Color::from_rgb(0.20, 0.55, 1.0),
+                    );
+                }
                 sim::ItemKind::None => {}
+            }
+        }
+
+        // drawn ink paths: stroke each live polyline. Cosmetic read of the sim's cached classes —
+        // grabbable lips get a hotter tint so the playable surface is legible.
+        for p in &s.paths {
+            if !p.active() {
+                continue;
+            }
+            let n = p.len as usize;
+            for seg in 0..n.saturating_sub(1) {
+                let a = gv(p.pts[seg]) - origin;
+                let b = gv(p.pts[seg + 1]) - origin;
+                let col = match p.class[seg] {
+                    sim::SegClass::Ledge => Color::from_rgb(1.0, 0.85, 0.2), // grabbable lip
+                    sim::SegClass::Floor => Color::from_rgb(0.3, 0.7, 1.0),
+                    sim::SegClass::Wall => Color::from_rgb(0.6, 0.4, 1.0),
+                    sim::SegClass::None => Color::from_rgba(0.5, 0.8, 1.0, 0.5), // not yet a surface
+                };
+                self.base_mut().draw_line_ex(a, b, col).width(7.0).done();
             }
         }
     }
@@ -1896,11 +1928,13 @@ impl KneeMan {
     /// while intangible — the universal "you can't be hit" read).
     fn render_anim(&mut self, f: &Fighter) {
         let Some(mut a) = self.anim.clone() else { return };
-        let clip = clip_for(f);
-        if a.get_animation() != StringName::from(clip) {
-            a.play_ex().name(clip).done(); // only restart when the clip actually changes
+        let clip = resolve_clip(&a, clip_for(f));
+        if a.get_animation() != clip {
+            a.play_ex().name(&clip).done(); // only restart when the clip actually changes
         }
+        sync_attack_frame(&mut a, f, &self.tune.get());
         a.set_flip_h(f.facing < 0.0); // frog faces right by default
+        a.set_rotation(wall_tilt(f));
         a.set_modulate(sprite_tint(f, self.identity.get_cloned().color));
     }
 
@@ -1909,11 +1943,13 @@ impl KneeMan {
     fn render_p2(&mut self, f: &Fighter) {
         let Some(mut a) = self.p2.clone() else { return };
         a.set_global_position(gv(f.pos));
-        let clip = clip_for(f);
-        if a.get_animation() != StringName::from(clip) {
-            a.play_ex().name(clip).done();
+        let clip = resolve_clip(&a, clip_for(f));
+        if a.get_animation() != clip {
+            a.play_ex().name(&clip).done();
         }
+        sync_attack_frame(&mut a, f, &self.tune.get());
         a.set_flip_h(f.facing < 0.0);
+        a.set_rotation(wall_tilt(f));
         a.set_modulate(sprite_tint(f, p2_identity().color));
     }
 
@@ -2078,6 +2114,11 @@ fn place_tag(tag: &mut Gd<Label>, feet: sim::Vector2) {
 /// the Kenney pose set has no per-state art). Air splits rise/fall by vertical velocity.
 fn clip_for(f: &Fighter) -> &'static str {
     use CharState::*;
+    // A fresh wall bounce overrides the launch state: show the tilted bounce frame while the window
+    // (set in the sim's hitstun block) is open. Cosmetic only — the sim drives the physics.
+    if f.wall_hit > 0 {
+        return "wallbounce";
+    }
     match f.state {
         Stand => "idle",
         Walk | Roll => "walk",
@@ -2094,6 +2135,7 @@ fn clip_for(f: &Fighter) -> &'static str {
         LedgeHold => "hang",
         LedgeClimb => "climb",
         Jab => "jab",
+        Dtilt => "dtilt",
         Nair => "nair",
         Dair => "fall",
         DashAttack => "run",
@@ -2110,19 +2152,114 @@ fn clip_for(f: &Fighter) -> &'static str {
     }
 }
 
+/// Every clip name `clip_for` can ever return. The checker walks this so a character missing art for
+/// one of them is reported once at load, not discovered as a blank frame mid-match. Keep in sync with
+/// `clip_for` (adding a state there with a new clip name means adding it here).
+const ALL_CLIPS: &[&str] = &[
+    "idle", "walk", "run", "skid", "crouch", "jump", "fall", "hang", "climb", "jab", "nair", "dtilt",
+    "wallbounce",
+];
+
+/// Where a missing clip falls back to. `clip_for` names a rich set of poses; a character need only
+/// supply art for some of them, and the rest degrade down this chain to "idle" (which every
+/// character must define) instead of rendering an empty frame. A name mapping to itself terminates.
+fn clip_fallback(name: &str) -> &'static str {
+    match name {
+        "dtilt" => "crouch",
+        "crouch" => "skid",
+        "skid" => "idle",
+        "nair" => "jab",
+        "jab" => "idle",
+        "dair" => "fall",
+        "wallbounce" => "fall",
+        "fall" => "jump",
+        "jump" => "idle",
+        "run" => "walk",
+        "walk" => "idle",
+        "hang" => "idle",
+        "climb" => "idle",
+        _ => "idle",
+    }
+}
+
+/// Resolve a desired clip against what the sprite's SpriteFrames actually contains, walking the
+/// fallback chain until a present animation is found ("idle" is the guaranteed terminal). Bounded so
+/// a malformed chain can never spin. This is the generic safety net: `clip_for` may name a clip the
+/// current character has no art for, and this picks the nearest pose it does have.
+fn resolve_clip(a: &Gd<AnimatedSprite2D>, want: &str) -> StringName {
+    let Some(sf) = a.get_sprite_frames() else { return StringName::from(want) };
+    let mut name = want;
+    for _ in 0..ALL_CLIPS.len() + 1 {
+        if sf.has_animation(&StringName::from(name)) {
+            return StringName::from(name);
+        }
+        let next = clip_fallback(name);
+        if next == name {
+            break;
+        }
+        name = next;
+    }
+    StringName::from("idle")
+}
+
+/// Multi-frame attack sync: lock the sprite's shown frame to the sim's per-state frame counter, so a
+/// swing's art tracks its frame data (startup -> active -> recovery) instead of the clip's own fps
+/// clock. Rollback-correct, since the shown frame is a pure function of sim state. No-op for
+/// non-attacks (they keep their looping playback) and for single-frame clips. This is the hook that
+/// makes genuine multi-frame attack animations land on-window; richer per-attack art just drops in.
+fn sync_attack_frame(a: &mut Gd<AnimatedSprite2D>, f: &Fighter, t: &Tune) {
+    let Some(atk) = sim::attack_for(t, f.state) else { return };
+    let Some(sf) = a.get_sprite_frames() else { return };
+    let name = a.get_animation();
+    let n = sf.get_frame_count(&name);
+    if n <= 1 {
+        return; // a single-pose clip has nothing to step through
+    }
+    let total = atk.total().max(1);
+    let idx = ((f.frame * n as i64) / total).clamp(0, n as i64 - 1);
+    a.set_frame(idx as i32);
+}
+
+/// Sprite tilt for a wall bounce: while the `wall_hit` window is open, lean the body off-vertical
+/// (in the direction it's now travelling) so the bounce reads as a hard ricochet, easing back to
+/// upright as the window decays. 0 outside the window. Cosmetic; never touches the sim.
+fn wall_tilt(f: &Fighter) -> f32 {
+    if f.wall_hit <= 0 {
+        return 0.0;
+    }
+    let dir = if f.vel.x >= 0.0 { 1.0 } else { -1.0 };
+    let decay = (f.wall_hit as f32 / 12.0).clamp(0.0, 1.0); // WALL_TILT_FRAMES in the sim
+    dir * 0.45 * decay // up to ~25° at impact, unwinding to 0
+}
+
 /// Point an AnimatedSprite2D at a roster character: frames, scale, feet-offset, crisp filter, idle.
 /// The single place sprite + character are wired, so ready() build and live char-swap stay in sync.
 fn apply_character(a: &mut Gd<AnimatedSprite2D>, c: &Character) {
-    a.set_sprite_frames(&build_frames(c));
+    let sf = build_frames(c);
+    validate_character(c, &sf);
+    a.set_sprite_frames(&sf);
     a.set_scale(Vector2::splat(c.scale));
     a.set_offset(Vector2::new(0.0, c.offset_y)); // feet on pos
     a.set_texture_filter(godot::classes::canvas_item::TextureFilter::NEAREST); // crisp pixels
     a.play_ex().name("idle").done();
 }
 
+/// Load a texture by path, returning None (with a warning) instead of aborting when the file is
+/// missing. Lets `build_frames` skip a bad frame and fall back rather than killing the whole sprite.
+fn try_tex(path: &str) -> Option<Gd<Texture2D>> {
+    match try_load::<Texture2D>(path) {
+        Ok(t) => Some(t),
+        Err(_) => {
+            godot_warn!("anim: missing texture {path}");
+            None
+        }
+    }
+}
+
 /// Build a character's SpriteFrames from its clip table. Strip clips slice a sheet into cells;
 /// Poses clips take one whole PNG per frame. Clip names match `clip_for` (choppy by design; the
-/// art has no per-state poses, so several CharStates reuse one clip).
+/// art has no per-state poses, so several CharStates reuse one clip). Missing files are skipped with
+/// a warning; any clip that ends up with zero frames is dropped so `resolve_clip` falls back past it.
 fn build_frames(c: &Character) -> Gd<SpriteFrames> {
     let mut sf = SpriteFrames::new_gd();
     for clip in &c.clips {
@@ -2132,26 +2269,58 @@ fn build_frames(c: &Character) -> Gd<SpriteFrames> {
         sf.set_animation_loop(name, clip.looped);
         match &c.sheet {
             Sheet::Strip { frame_px } => {
-                let sheet = load::<Texture2D>(&format!("res://assets/{}/{}.png", c.dir, clip.files[0]));
-                // Cell width: explicit, else texture width / frame count. Cell height = full strip
-                // height, so non-square frames (common in Rivals rips) slice correctly.
-                let frames = clip.frames.max(1);
-                let fw = if *frame_px > 0.0 { *frame_px } else { sheet.get_width() as f32 / frames as f32 };
-                let fh = sheet.get_height() as f32;
-                for i in 0..frames {
-                    let mut at = AtlasTexture::new_gd();
-                    at.set_atlas(&sheet);
-                    at.set_region(Rect2::new(Vector2::new(i as f32 * fw, 0.0), Vector2::new(fw, fh)));
-                    sf.add_frame(name, &at.upcast::<Texture2D>());
+                if let Some(sheet) = try_tex(&format!("res://assets/{}/{}.png", c.dir, clip.files[0])) {
+                    // Cell width: explicit, else texture width / frame count. Cell height = full strip
+                    // height, so non-square frames (common in Rivals rips) slice correctly.
+                    let frames = clip.frames.max(1);
+                    let fw = if *frame_px > 0.0 { *frame_px } else { sheet.get_width() as f32 / frames as f32 };
+                    let fh = sheet.get_height() as f32;
+                    for i in 0..frames {
+                        let mut at = AtlasTexture::new_gd();
+                        at.set_atlas(&sheet);
+                        at.set_region(Rect2::new(Vector2::new(i as f32 * fw, 0.0), Vector2::new(fw, fh)));
+                        sf.add_frame(name, &at.upcast::<Texture2D>());
+                    }
                 }
             }
             Sheet::Poses { prefix } => {
                 for f in &clip.files {
-                    let tex = load::<Texture2D>(&format!("res://assets/{}/{}_{}.png", c.dir, prefix, f));
-                    sf.add_frame(name, &tex);
+                    if let Some(tex) = try_tex(&format!("res://assets/{}/{}_{}.png", c.dir, prefix, f)) {
+                        sf.add_frame(name, &tex);
+                    }
                 }
             }
         }
+        // a clip that loaded no frames is worse than absent: an empty animation renders nothing.
+        // Drop it so `resolve_clip` walks past to a pose that has art.
+        if sf.get_frame_count(name) == 0 {
+            sf.remove_animation(name);
+        }
     }
     sf
+}
+
+/// Startup checker: report any `clip_for` clip the built frames can't satisfy even after fallback,
+/// and confirm "idle" exists (the terminal every fallback chain lands on). Logs once per character
+/// at build; never panics — the game still runs on whatever art is present.
+fn validate_character(c: &Character, sf: &Gd<SpriteFrames>) {
+    if !sf.has_animation(&StringName::from("idle")) {
+        godot_error!("anim: character '{}' has no 'idle' clip — fallbacks have no terminal", c.dir);
+    }
+    for &want in ALL_CLIPS {
+        if sf.has_animation(&StringName::from(want)) {
+            continue;
+        }
+        // walk the same chain resolve_clip uses; report what it will substitute.
+        let mut name = want;
+        for _ in 0..ALL_CLIPS.len() + 1 {
+            let next = clip_fallback(name);
+            if next == name || sf.has_animation(&StringName::from(next)) {
+                name = next;
+                break;
+            }
+            name = next;
+        }
+        godot_print!("anim: '{}' missing clip '{want}' -> using '{name}'", c.dir);
+    }
 }

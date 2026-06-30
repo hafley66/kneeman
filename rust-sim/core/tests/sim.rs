@@ -205,6 +205,75 @@ fn grounded_attack_enters_jab() {
 }
 
 #[test]
+fn down_plus_attack_enters_dtilt() {
+    let (s, t) = settled();
+    let after = step(&s, [&press(|i| { i.attack = true; i.down = true; }), &idle()], &t);
+    assert_eq!(
+        after.fighters[0].state,
+        CharState::Dtilt,
+        "down + attack on the ground should start the dtilt pothole"
+    );
+}
+
+#[test]
+fn classify_caches_floor_wall_and_grabbable_lip() {
+    // a flat shelf (0,0)->(100,0) then a sharp drop (100,0)->(120,200).
+    let mut p = InkPath::EMPTY;
+    p.props = StrokeProps::PEN;
+    p.pts[0] = Vector2::new(0.0, 0.0);
+    p.pts[1] = Vector2::new(100.0, 0.0);
+    p.pts[2] = Vector2::new(120.0, 200.0);
+    p.len = 3;
+    classify(&mut p);
+    assert_eq!(p.class[0], SegClass::Ledge, "the flat open-end shelf is a grabbable lip");
+    assert_eq!(p.class[1], SegClass::Wall, "the steep drop classifies as a wall");
+}
+
+#[test]
+fn fighter_lands_and_stands_on_a_drawn_ink_floor() {
+    let t = Tune::default();
+    let mut s = SimState::spawn();
+    // drop fighter 0 over open air (no soft platform spans x=180; main floor is far below at 760).
+    s.fighters[0].pos = Vector2::new(180.0, 250.0);
+    // a flat finalized ink shelf directly under the drop, well above the main floor.
+    let mut shelf = InkPath::EMPTY;
+    shelf.props = StrokeProps::PEN;
+    shelf.owner = 0;
+    shelf.pts[0] = Vector2::new(100.0, 400.0);
+    shelf.pts[1] = Vector2::new(260.0, 400.0);
+    shelf.len = 2;
+    classify(&mut shelf); // caches Floor/Ledge so collision can read it
+    assert!(matches!(shelf.class[0], SegClass::Floor | SegClass::Ledge), "flat shelf is walkable");
+    s.paths[0] = shelf;
+    // fighter 0 now drops straight down onto the shelf and settles.
+    for _ in 0..120 {
+        s = step(&s, [&idle(), &idle()], &t);
+    }
+    let f = &s.fighters[0];
+    assert_eq!(f.ground_ink, 0, "should be standing on the ink path, not fallen through");
+    assert_eq!(f.state, CharState::Stand, "settles into Stand on the ink");
+    assert!((f.pos.y - 400.0).abs() < 2.0, "feet pinned to the ink surface (400), got {}", f.pos.y);
+}
+
+#[test]
+fn holding_a_pen_and_attacking_lays_an_ink_path() {
+    let (mut s, t) = settled();
+    s.fighters[0].holding = 0;
+    s.items[0] = Item { kind: ItemKind::Pen, owner: 0, ..Item::EMPTY };
+    // hold attack + walk right; the trail pen lays nodes along the movement.
+    for _ in 0..40 {
+        let p0 = press(|i| {
+            i.attack_held = true;
+            i.dir = 1.0;
+        });
+        s = step(&s, [&p0, &idle()], &t);
+    }
+    let path = s.paths.iter().find(|p| p.active() && p.owner == 0);
+    assert!(path.is_some(), "holding a pen and attacking should lay an ink path");
+    assert!(path.unwrap().len >= 2, "a moving trail pen should plant multiple nodes");
+}
+
+#[test]
 fn attack_over_gun_picks_it_up() {
     let (mut s, t) = settled();
     s.items[0] = Item {
@@ -215,6 +284,7 @@ fn attack_over_gun_picks_it_up() {
         ammo: 16,
         timer: 0,
         facing: 1.0,
+        tool: ToolKind::TrailPen,
     };
     let after = step(&s, [&press(|i| i.attack = true), &idle()], &t);
     assert_eq!(after.fighters[0].holding, 0, "attack over an unowned gun should pick it up");
@@ -234,6 +304,7 @@ fn firing_a_held_gun_spawns_a_bolt_and_spends_ammo() {
         ammo: 16,
         timer: 0,
         facing: 1.0,
+        tool: ToolKind::TrailPen,
     };
     let after = step(&s, [&press(|i| i.attack = true), &idle()], &t);
     let bolts = after.items.iter().filter(|x| x.kind == ItemKind::LaserBolt).count();
@@ -254,6 +325,7 @@ fn grab_drops_a_held_gun() {
         ammo: 16,
         timer: 0,
         facing: 1.0,
+        tool: ToolKind::TrailPen,
     };
     let after = step(&s, [&press(|i| i.grab = true), &idle()], &t);
     assert_eq!(after.fighters[0].holding, -1, "grab should drop the held item");
