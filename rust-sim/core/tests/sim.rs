@@ -292,6 +292,24 @@ fn attack_over_gun_picks_it_up() {
 }
 
 #[test]
+fn grab_over_an_item_picks_it_up() {
+    let (mut s, t) = settled();
+    s.items[0] = Item {
+        kind: ItemKind::LaserGun,
+        pos: s.fighters[0].pos, // standing over it
+        vel: Vector2::ZERO,
+        owner: -1,
+        ammo: 16,
+        timer: 0,
+        facing: 1.0,
+        tool: ToolKind::TrailPen,
+    };
+    let after = step(&s, &[&press(|i| i.grab = true), &idle()], &t);
+    assert_eq!(after.fighters[0].holding, 0, "grab over an unowned item should pick it up");
+    assert_ne!(after.fighters[0].state, CharState::Grab, "item grab should not start a fighter-grab");
+}
+
+#[test]
 fn firing_a_held_gun_spawns_a_bolt_and_spends_ammo() {
     let t = Tune::default();
     let mut s = SimState::spawn();

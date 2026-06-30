@@ -107,11 +107,26 @@ impl AttackData {
     // baseline definitions; live copies live in Tune so the panel can edit them.
     // PM/community-flavored bkb/kbg/angle (NOT the Melee decomp). Knockback runs through
     // `knockback_units`; aerials author `transcendent: true` (aerials don't clank).
-    pub(crate) const JAB: Self = Self::one(
-        3, 3, 9,
-        Hitbox { damage: 3.0, off: Vector2::new(44.0, -64.0), r: 32.0,
-            angle: 35.0, bkb: 18.0, kbg: 30.0, ..Hitbox::NONE },
-    );
+    // 3-punch jab autocombo: one press throws three sequenced hits on the shared frame clock. The
+    // first two are weak SET-knockback links (a jab-lock pop that holds the victim regardless of %),
+    // the third is the launcher with real growth. Three boxes, three windows, no extra FSM state.
+    pub(crate) const JAB: Self = Self {
+        startup: 3,
+        recovery: 12,
+        boxes: [
+            Hitbox { id: 0, start: 3, len: 2, off: Vector2::new(44.0, -64.0), r: 32.0,
+                damage: 3.0, angle: 80.0, bkb: 8.0, kbg: 0.0, set_kb: 6.0,
+                transcendent: false, refresh: 0 },
+            Hitbox { id: 1, start: 9, len: 2, off: Vector2::new(48.0, -64.0), r: 32.0,
+                damage: 3.0, angle: 80.0, bkb: 8.0, kbg: 0.0, set_kb: 7.0,
+                transcendent: false, refresh: 0 },
+            Hitbox { id: 2, start: 15, len: 3, off: Vector2::new(54.0, -60.0), r: 36.0,
+                damage: 6.0, angle: 40.0, bkb: 24.0, kbg: 52.0, set_kb: 0.0,
+                transcendent: false, refresh: 0 },
+            Hitbox::NONE,
+        ],
+        nbox: 3,
+    };
     // neutral aerial — a sex-kick: a strong early pop, then a weak lingering tail at the same limb.
     // Two boxes, same off/r, different windows + payoff. Aerial => transcendent.
     pub(crate) const NAIR: Self = Self {
@@ -128,11 +143,29 @@ impl AttackData {
         ],
         nbox: 2,
     };
-    pub(crate) const DAIR: Self = Self::one(
-        10, 6, 18,
-        Hitbox { damage: 11.0, off: Vector2::new(10.0, 24.0), r: 40.0,
-            angle: -72.0, bkb: 20.0, kbg: 38.0, transcendent: true, ..Hitbox::NONE },
-    );
+    // Knee Man's famous aerial stomp (Captain-Falcon-flavored): three timed hitboxes on one drop.
+    // Hit the early window and you spike hard (lowest id ⇒ wins); whiff it and you catch the weak
+    // drag-down linger, then the move recovers into a late upward knee pop. Aerial ⇒ transcendent.
+    pub(crate) const DAIR: Self = Self {
+        startup: 6,
+        recovery: 6,
+        boxes: [
+            // the STOMP: deep meteor spike, tiny window.
+            Hitbox { id: 0, start: 6, len: 3, off: Vector2::new(8.0, 30.0), r: 44.0,
+                damage: 12.0, angle: -85.0, bkb: 18.0, kbg: 34.0, set_kb: 0.0,
+                transcendent: true, refresh: 0 },
+            // drag-down linger: weak set-kb that pulls them with you (combo glue).
+            Hitbox { id: 1, start: 9, len: 4, off: Vector2::new(14.0, 10.0), r: 40.0,
+                damage: 4.0, angle: 20.0, bkb: 8.0, kbg: 0.0, set_kb: 5.0,
+                transcendent: true, refresh: 0 },
+            // the knee pop on the way out: an upward launcher.
+            Hitbox { id: 2, start: 20, len: 4, off: Vector2::new(20.0, -50.0), r: 46.0,
+                damage: 9.0, angle: 60.0, bkb: 16.0, kbg: 44.0, set_kb: 0.0,
+                transcendent: true, refresh: 0 },
+            Hitbox::NONE,
+        ],
+        nbox: 3,
+    };
     pub(crate) const DASH_ATTACK: Self = Self::one(
         8, 38,
         6,

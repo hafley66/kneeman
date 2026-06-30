@@ -1073,8 +1073,9 @@ impl INode2D for KneeMan {
             let (bc, br) = sim::hurtbox(f);
             let hurt = gv(bc) - origin;
             self.base_mut().draw_circle(hurt, br, hurt_col);
-            // active hitbox: present only while this fighter's attack is live.
-            if let Some((hc, hr)) = sim::active_hitbox(f, &t) {
+            // active hitboxes: every box live this frame (a multi-box move shows all its windows).
+            for hb in sim::live_hitboxes(f, &t).into_iter().flatten() {
+                let (hc, hr) = hb;
                 let c = gv(hc) - origin;
                 self.base_mut().draw_circle(c, hr, hit_col);
             }
