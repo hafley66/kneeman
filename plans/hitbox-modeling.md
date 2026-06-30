@@ -4,6 +4,19 @@ Target: replace the single-circle hitbox model with a Brawl-shaped one — multi
 (id priority), swept (capsule) overlap so fast moves don't tunnel, capsule hurtboxes, and real
 clank/rebound with a transcendent-priority opt-out. Must stay rollback-safe.
 
+## Progress
+- **A — windowed multi-hitbox + id priority: DONE** (`434be93`). `Hitbox{id/start/len/off/r/
+  damage/angle/bkb/kbg/set_kb/transcendent/refresh}`, `AttackData{startup, recovery, boxes:[Hitbox;
+  4], nbox}`, `box_at` (lowest-id live), `live_hitboxes`, `hit_cd[box][victim]` replacing
+  `attack_hit`, `CharState::Launched` hit-interrupt. Deleted `HitLate`/`hit_at`/`active_span`.
+- **E — PM knockback: DONE** (`434be93`). `knockback_units` (community formula), `Tune.weight/
+  kb_speed/kb_hitstun`, `hitstun = floor(0.4*KB)`. Items + specials ported.
+- **Moves: DONE** (`8d32fe5`). 3-punch jab autocombo, Knee Man aerial stomp (3 timed boxes), item
+  grab on the grab button. Shell draws all live boxes.
+- **Remaining: B** (swept/capsule hits, `prev_pos`), **D** (clank + transcendent pass), **C**
+  (capsule hurtbox). `weight` is on `Tune` (single char) for now, not per-`Fighter` — revisit when a
+  second character lands.
+
 ## Where we are today
 `AttackData` (`core/src/moves/mod.rs:34`) is ONE circle `(off, r)` live for
 `[startup, startup + active_span)`, with two TIME windows (early/late "sex kick", same shape).
