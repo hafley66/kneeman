@@ -3,7 +3,7 @@
 //! for the slot type carried in `SimState.items`. Pure; re-exported at the crate root.
 
 use crate::{
-    airborne, hurtbox, AttackData, Fighter, HitLate, SimState, ToolKind, Tune, Vector2, DT,
+    airborne, hurtbox, knockback_units, Fighter, Hitbox, SimState, ToolKind, Tune, Vector2, DT,
     FLOOR_LEFT, FLOOR_RIGHT, GROUND_Y, HITLAG_PER_DMG, MAX_ITEMS,
 };
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ pub struct ItemConfig {
     pub proj_gravity: f32, // px/s^2 pulling the projectile down (0 = straight laser; >0 = arcing lob)
     pub blast_r: f32,      // explosion radius on detonation (0 = single-target bolt, no AoE)
     pub model_id: u8,      // shell sprite key (rendering only; sim ignores it)
-    pub hit: AttackData,   // projectile / explosion damage + knockback
+    pub hit: Hitbox,       // projectile / explosion damage + knockback (one box; transcendent)
 }
 
 impl ItemConfig {
@@ -37,17 +37,9 @@ impl ItemConfig {
         proj_gravity: 0.0, // dead-straight
         blast_r: 0.0,      // single-target
         model_id: 0,
-        hit: AttackData {
-            startup: 0,
-            active: 1,
-            recovery: 0,
-            off: Vector2::ZERO,
-            r: 12.0,
-            damage: 2.5,
-            kb_base: 180.0,
-            kb_scale: 1.2,
-            kb_angle: 12.0, // near-flat: lasers push, don't launch
-            late: HitLate::NONE,
+        hit: Hitbox {
+            r: 12.0, damage: 2.5, angle: 12.0, // near-flat: lasers push, don't launch
+            bkb: 10.0, kbg: 18.0, transcendent: true, ..Hitbox::NONE
         },
     };
 
@@ -64,17 +56,10 @@ impl ItemConfig {
         proj_gravity: 2400.0,
         blast_r: 170.0,    // generous splash
         model_id: 1,       // red model key (shell)
-        hit: AttackData {
-            startup: 0,
-            active: 1,
-            recovery: 0,
-            off: Vector2::ZERO,
+        hit: Hitbox {
             r: 22.0,        // contact radius of the bomb body
-            damage: 16.0,
-            kb_base: 760.0, // launches hard -> kills at mid %
-            kb_scale: 5.0,
-            kb_angle: 55.0, // up-and-out pop
-            late: HitLate::NONE,
+            damage: 16.0, angle: 55.0, // up-and-out pop
+            bkb: 28.0, kbg: 88.0, transcendent: true, ..Hitbox::NONE // launches hard -> kills at mid %
         },
     };
 }
@@ -452,14 +437,16 @@ fn explode(n: &mut SimState, center: Vector2, t: &Tune) {
         }
         let falloff = 1.0 - 0.5 * (dist / t.bomb.blast_r); // full at center, ~half at the rim
         let f = &mut n.fighters[fi];
-        f.damage += atk.damage * falloff;
-        let speed = (atk.kb_base + atk.kb_scale * f.damage) * t.knockback_mult * falloff;
+        let dmg = atk.damage * falloff;
+        f.damage += dmg;
+        let kb = knockback_units(f.damage, dmg, t.weight, &atk) * falloff;
+        let speed = kb * t.kb_speed * t.knockback_mult;
         let radial = if dist > 1.0 { d / dist } else { Vector2::new(0.0, -1.0) };
         f.vel = (radial + Vector2::new(0.0, -0.4)).normalize_or_zero() * speed; // up-biased pop
-        f.hitstun = (speed * 0.12) as i64;
+        f.hitstun = (kb * t.kb_hitstun) as i64;
         f.tumble = speed > t.tumble_speed;
-        f.hitlag = (atk.damage * HITLAG_PER_DMG) as i64 + 4;
-        f.attack_hit = false;
+        f.hitlag = (dmg * HITLAG_PER_DMG) as i64 + 4;
+        f.arm_hits();
     }
 }
 
@@ -471,11 +458,13 @@ fn apply_bolt_hit(b: &mut Fighter, bolt: &Item, t: &Tune) {
     }
     let atk = t.laser.hit;
     let scale = if bolt.ammo == 1 { t.laser.autofire_dmg } else { 1.0 }; // auto-fire bolts are weaker
-    b.damage += atk.damage * scale;
-    let speed = (atk.kb_base + atk.kb_scale * b.damage) * t.knockback_mult;
-    let ang = atk.kb_angle.to_radians();
+    let dmg = atk.damage * scale;
+    b.damage += dmg;
+    let kb = knockback_units(b.damage, dmg, t.weight, &atk);
+    let speed = kb * t.kb_speed * t.knockback_mult;
+    let ang = atk.angle.to_radians();
     b.vel = Vector2::new(ang.cos() * bolt.facing, -ang.sin()) * speed;
-    b.hitstun = (speed * 0.12) as i64;
+    b.hitstun = (kb * t.kb_hitstun) as i64;
     b.tumble = speed > t.tumble_speed;
-    b.hitlag = (atk.damage * HITLAG_PER_DMG) as i64 + 2;
+    b.hitlag = (dmg * HITLAG_PER_DMG) as i64 + 2;
 }

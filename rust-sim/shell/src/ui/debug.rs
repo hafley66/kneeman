@@ -5,7 +5,7 @@ use godot::prelude::*;
 use futures_signals::signal::Mutable;
 
 use crate::kneeman::{Identity, KneeMan, NetDebug};
-use crate::sim::{Action, AttackData, Fighter, SimState, Tune};
+use crate::sim::{Action, AttackData, Fighter, Hitbox, SimState, Tune};
 use crate::ui::menu::router::{Intent, MenuCells, Router};
 use crate::ui::themes::{dark, xp::Xp, Theme};
 
@@ -375,7 +375,7 @@ fn draw_panel(
             c |= slider(ui, &mut t.laser.autofire_dmg, 0.1..=1.0, "hold dmg x (weaker)");
             c |= slider(ui, &mut t.laser.speed, 200.0..=3000.0, "bolt speed");
             c |= islider(ui, &mut t.laser.range, 10..=240, "bolt range (f)");
-            c |= attack_sliders(ui, &mut t.laser.hit);
+            c |= hitbox_sliders(ui, &mut t.laser.hit);
         });
 
         egui::CollapsingHeader::new("items · bomb (red gun)").default_open(false).show(ui, |ui| {
@@ -386,7 +386,7 @@ fn draw_panel(
             c |= slider(ui, &mut t.bomb.proj_gravity, 0.0..=6000.0, "lob gravity");
             c |= islider(ui, &mut t.bomb.range, 20..=300, "fuse (f)");
             c |= slider(ui, &mut t.bomb.blast_r, 40.0..=400.0, "blast radius");
-            c |= attack_sliders(ui, &mut t.bomb.hit);
+            c |= hitbox_sliders(ui, &mut t.bomb.hit);
         });
 
         egui::CollapsingHeader::new("rules · kills + spawn").default_open(false).show(ui, |ui| {
@@ -708,19 +708,31 @@ fn buffer_card(ui: &mut egui::Ui, f: &Fighter, t: &Tune) {
     });
 }
 
-/// One attack's full data table: frame windows, hitbox geometry, knockback. Returns changed.
+/// One attack's full data table: startup/recovery, then each windowed hitbox. Returns changed.
 fn attack_sliders(ui: &mut egui::Ui, a: &mut AttackData) -> bool {
     let mut c = false;
     c |= islider(ui, &mut a.startup, 0..=30, "startup");
-    c |= islider(ui, &mut a.active, 1..=30, "active");
     c |= islider(ui, &mut a.recovery, 0..=40, "recovery");
-    c |= slider(ui, &mut a.off.x, -20.0..=140.0, "off.x (forward)");
-    c |= slider(ui, &mut a.off.y, -130.0..=40.0, "off.y (up = -)");
-    c |= slider(ui, &mut a.r, 6.0..=90.0, "radius");
-    c |= slider(ui, &mut a.damage, 0.0..=40.0, "damage %");
-    c |= slider(ui, &mut a.kb_base, 0.0..=1600.0, "kb_base");
-    c |= slider(ui, &mut a.kb_scale, 0.0..=20.0, "kb_scale / %");
-    c |= slider(ui, &mut a.kb_angle, 0.0..=180.0, "kb_angle°");
+    let nbox = a.nbox as usize;
+    for (i, hb) in a.boxes[..nbox].iter_mut().enumerate() {
+        ui.label(format!("hitbox {i} (id {})", hb.id));
+        c |= hitbox_sliders(ui, hb);
+    }
+    c
+}
+
+/// One windowed hitbox: its frame window, geometry, and community/PM knockback. Returns changed.
+fn hitbox_sliders(ui: &mut egui::Ui, hb: &mut Hitbox) -> bool {
+    let mut c = false;
+    c |= islider(ui, &mut hb.start, 0..=40, "start (f)");
+    c |= islider(ui, &mut hb.len, 1..=30, "len (f)");
+    c |= slider(ui, &mut hb.off.x, -20.0..=140.0, "off.x (forward)");
+    c |= slider(ui, &mut hb.off.y, -130.0..=60.0, "off.y (up = -)");
+    c |= slider(ui, &mut hb.r, 6.0..=90.0, "radius");
+    c |= slider(ui, &mut hb.damage, 0.0..=40.0, "damage %");
+    c |= slider(ui, &mut hb.angle, -120.0..=180.0, "angle° (- = spike)");
+    c |= slider(ui, &mut hb.bkb, 0.0..=120.0, "bkb (base)");
+    c |= slider(ui, &mut hb.kbg, 0.0..=160.0, "kbg (growth)");
     c
 }
 

@@ -84,6 +84,8 @@ pub enum CharState {
     SpecialU,  // up-B (recovery; ends in Helpless if it finishes airborne)
     SpecialD,  // down-B
     Helpless,  // special-fall after an up-B: drift only, no actions until you land/ledge
+    Launched,  // taking a hit: knockback slide + hitstun. Forced on connect so the interrupted
+               // attacker's remaining hitbox windows never fire (attack_for(Launched) == None).
 }
 
 
@@ -204,7 +206,12 @@ pub struct Fighter {
     pub regrab_lock: i64,  // frames before a ledge can be re-grabbed
     pub ground_plat: i32,  // index into PLATFORMS the fighter stands on (-1 = airborne)
     pub ground_ink: i8,    // index into SimState.paths when standing on drawn ink (-1 = not on ink)
-    pub attack_hit: bool,  // current attack already connected (one hit per swing)
+    // Per-hitbox, per-victim re-hit countdown: `hit_cd[box][victim] > 0` means that box of THIS
+    // fighter's current move can't hit that victim yet (it just connected, or is mid-window). A box
+    // re-arms after its `refresh`; a fresh swing zeroes the whole grid (`arm_hits`). Replaces the old
+    // `attack_hit: bool` so a 3-box jab combo / multi-hit stomp each land their own sequenced hits,
+    // and a wide box hits every overlapping victim once.
+    pub hit_cd: [[i16; MAX_PLAYERS]; MAX_HB],
     pub hitlag: i64,       // impact freeze on connect (this fighter held)
     pub damage: f32,       // accumulated % (knockback scales with this)
     pub hitstun: i64,      // frames launched/can't act (drives the hit flash + knockback slide)
@@ -258,7 +265,7 @@ impl Fighter {
             regrab_lock: 0,
             ground_plat: -1,
             ground_ink: -1,
-            attack_hit: false,
+            hit_cd: [[0; MAX_PLAYERS]; MAX_HB],
             hitlag: 0,
             damage: 0.0,
             hitstun: 0,
@@ -294,6 +301,25 @@ impl Fighter {
     #[inline]
     fn clear_lane(&mut self, l: Lane) {
         self.buf[l as usize] = Slot::default();
+    }
+
+    /// Re-arm every hitbox of a fresh swing: zero the per-box, per-victim re-hit grid so the new
+    /// move's boxes can all connect. Called on entering any attack state (replaces `attack_hit=false`).
+    #[inline]
+    pub(crate) fn arm_hits(&mut self) {
+        self.hit_cd = [[0; MAX_PLAYERS]; MAX_HB];
+    }
+
+    /// Tick the re-hit grid down one frame (called once per active frame in `advance`).
+    #[inline]
+    fn tick_hit_cd(&mut self) {
+        for row in &mut self.hit_cd {
+            for c in row {
+                if *c > 0 {
+                    *c -= 1;
+                }
+            }
+        }
     }
 
     /// Debug/inspection accessors (the panel reads these; nothing else needs the lane indices).
@@ -342,6 +368,7 @@ impl Fighter {
             CharState::SpecialU => "SPECIAL_U",
             CharState::SpecialD => "SPECIAL_D",
             CharState::Helpless => "HELPLESS",
+            CharState::Launched => "LAUNCHED",
         }
     }
 }
@@ -531,6 +558,10 @@ pub struct Tune {
     pub one_item_at_a_time: bool, // only ever one pickup on the field (projectiles don't count)
     pub spawn_iframes: i64,       // respawn invulnerability window (frames)
     pub knockback_mult: f32,      // global launch-speed multiplier (>1 = everything flies further)
+    // knockback model (community / Project-M formula; see `knockback_units`). NOT the Melee decomp.
+    pub weight: f32,              // victim weight in the KB formula (Falcon/KneeMan-ish ~104)
+    pub kb_speed: f32,            // px/s per KB unit (turns formula units into launch velocity)
+    pub kb_hitstun: f32,         // hitstun frames per KB unit (community 0.4: floor(0.4 * KB))
     pub laser: ItemConfig,
     pub bomb: ItemConfig,         // the red gun's arcing explosive (Bob-omb-ish)
     // drawn ink paths (see the `ink-paths` skill)
@@ -616,6 +647,9 @@ impl Tune {
             one_item_at_a_time: true,
             spawn_iframes: 120, // ~2s of respawn invulnerability
             knockback_mult: 1.4, // everything flies ~40% further (kills happen, kill moves matter)
+            weight: 104.0,       // Falcon/KneeMan-ish; lighter = flies further (the PM combo weight)
+            kb_speed: 6.0,       // KB units -> px/s (tuned so kill moves send ~kill distance)
+            kb_hitstun: 0.4,     // community/PM constant: hitstun = floor(0.4 * KB)
             laser: ItemConfig::LASER,
             bomb: ItemConfig::BOMB,
             pen: StrokeProps::PEN,
@@ -703,7 +737,7 @@ pub fn step(s: &SimState, inputs: &[&InputFrame], t: &Tune) -> SimState {
             }
             let aim_b = Vector2::new(inputs[b].dir, inputs[b].aim_y);
             let (fa, fb) = pair_mut(&mut n.fighters, a, b);
-            resolve_combat(fa, fb, aim_b, t); // a attacks b (victim b DIs)
+            resolve_combat(fa, b, fb, aim_b, t); // a attacks b (victim b DIs)
         }
     }
     for a in 0..np {
@@ -888,6 +922,7 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], paths: &[InkPath; MAX_DRA
             s.timer -= 1;
         }
     }
+    n.tick_hit_cd(); // age the per-box re-hit grid once per active (non-frozen) frame
     if n.coyote > 0 {
         n.coyote -= 1;
     }
@@ -1154,7 +1189,7 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], paths: &[InkPath; MAX_DRA
                 };
                 n.clear_lane(Lane::Aerial);
                 n.state = aerial_for(aim, t); // nair or dair, by the captured stick direction
-                n.attack_hit = false;
+                n.arm_hits();
             } else if want_dodge && n.air_dodges > 0 {
                 let a = dodge_aim(&n, i);
                 n.clear_lane(Lane::Movement);
@@ -1276,7 +1311,7 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], paths: &[InkPath; MAX_DRA
             // lunge: slide through the swipe carrying the lunge speed (barely any friction), then
             // brake hard once the endlag starts so the commitment still plants you. No steering.
             let atk = attack_for(t, CharState::DashAttack).unwrap();
-            let sliding = n.frame < atk.startup + atk.active; // startup + active window = the drive
+            let sliding = n.frame < atk.active_end(); // still swinging = the drive; then brake
             let fric = if sliding { t.dashstop_friction * 0.12 } else { t.dashstop_friction };
             n.vel.x = move_toward(n.vel.x, 0.0, fric * DT);
             if n.frame >= atk.total() - 1 {
@@ -1302,7 +1337,7 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], paths: &[InkPath; MAX_DRA
                 n.state = CharState::Getup; // lay too long -> stand up automatically
             } else if n.frame >= KNOCKDOWN_LOCK {
                 if i.attack {
-                    n.attack_hit = false;
+                    n.arm_hits();
                     n.state = CharState::Jab; // getup attack
                 } else if sgn != 0.0 && mag >= DASH_THRESH {
                     n.facing = sgn;
@@ -1368,6 +1403,19 @@ fn advance(f: &mut Fighter, items: &[Item; MAX_ITEMS], paths: &[InkPath; MAX_DRA
             n.vel.y += t.gravity * DT;
             if n.vel.y > t.max_fall {
                 n.vel.y = t.max_fall;
+            }
+        }
+        CharState::Launched => {
+            // Reached only if a connect set Launched but hitstun floored to 0 (a feather tap): the
+            // hitstun branch above never ran, so recover here the same way it exits (air -> Air,
+            // grounded -> Stand). Normal launches spend their time in the `hitstun > 0` branch.
+            n.tumble = false;
+            if n.pos.y < GROUND_Y {
+                n.state = CharState::Air;
+                n.ground_plat = -1;
+            } else {
+                n.state = CharState::Stand;
+                n.ground_plat = 0;
             }
         }
     }
@@ -1598,37 +1646,59 @@ fn respawn(x: f32, facing: f32, t: &Tune) -> Fighter {
 }
 
 
-/// Cross-fighter combat: `a`'s active hitbox vs `b`'s hurtbox (circle/circle), one hit per swing.
-/// On connect: damage + knockback + hitstun to `b`, impact freeze (hitlag) to BOTH (the hit "pop").
-fn resolve_combat(a: &mut Fighter, b: &mut Fighter, b_aim: Vector2, t: &Tune) {
-    let Some((hc, hr)) = active_hitbox(a, t) else { return };
-    if a.attack_hit {
-        return; // already connected this swing
-    }
+/// Cross-fighter combat: `a`'s live hitboxes vs `b`'s hurtbox (circle/circle). `vb` is `b`'s slot
+/// index (keys the per-box re-hit grid). Among `a`'s boxes live this frame, off cooldown for `b`,
+/// and overlapping, the LOWEST id wins (sweetspot beats sourspot). On connect: damage + community/PM
+/// knockback + hitstun to `b`, impact freeze (hitlag) to BOTH, and the hit forces `b` into
+/// `Launched` (cancels any move `b` was mid-swing — the interrupt). `b` re-hittable per box per
+/// `refresh`, so a 3-box jab combo / multi-hit stomp each land their own pops.
+fn resolve_combat(a: &mut Fighter, vb: usize, b: &mut Fighter, b_aim: Vector2, t: &Tune) {
     if b.invuln > 0 || b.intangible {
         return; // spawn i-frames / active dodge: no hit lands
     }
+    let Some(atk) = attack_for(t, a.state) else { return };
     let (bc, br) = hurtbox(b);
-    if (hc - bc).length() > hr + br {
-        return; // no overlap
+    // id-priority pick: lowest-id live box that is off this victim's cooldown AND overlaps.
+    let mut chosen: Option<usize> = None;
+    let mut best_id = u8::MAX;
+    for (bi, hb) in atk.live_boxes().iter().enumerate() {
+        if !hb.live_at(a.frame) || a.hit_cd[bi][vb] > 0 {
+            continue;
+        }
+        let (hc, hr) = hitbox_center(a, hb);
+        if (hc - bc).length() > hr + br {
+            continue; // no overlap
+        }
+        if hb.id < best_id {
+            best_id = hb.id;
+            chosen = Some(bi);
+        }
     }
-    let atk = attack_for(t, a.state).unwrap();
-    a.attack_hit = true;
-    // payoff comes from whichever window is live: the strong early hit or the weak lingering tail.
-    let (base_dmg, kb_base, kb_scale, kb_angle) = atk.hit_at(a.frame);
+    let Some(bi) = chosen else { return };
+    let hb = atk.boxes[bi];
+    // re-arm: a box can't re-hit this victim until `refresh` frames pass; with refresh 0 it locks for
+    // the rest of its own window (one hit per box per swing). A later box (different index) still hits.
+    let cd = if hb.refresh > 0 { hb.refresh } else { (hb.start + hb.len) - a.frame };
+    a.hit_cd[bi][vb] = cd.max(1) as i16;
+
     let dmg = if matches!(a.state, CharState::Nair | CharState::Dair) && a.autohop_aerial {
-        base_dmg * t.autohop_dmg // auto short-hop aerial: reduced damage (Ultimate)
+        hb.damage * t.autohop_dmg // auto short-hop aerial: reduced damage (Ultimate)
     } else {
-        base_dmg
+        hb.damage
     };
     b.damage += dmg;
-    // knockback scales with accumulated %, then the global multiplier (tuned > 1 so kills happen)
-    let speed = (kb_base + kb_scale * b.damage) * t.knockback_mult;
-    let ang = kb_angle.to_radians();
+    // community / Project-M knockback: units -> px/s via kb_speed, then the global multiplier.
+    let kb = knockback_units(b.damage, dmg, t.weight, &hb);
+    let speed = kb * t.kb_speed * t.knockback_mult;
+    let ang = hb.angle.to_radians();
     b.vel = Vector2::new(ang.cos() * a.facing, -ang.sin()) * speed; // launch away from attacker
     b.vel = apply_di(b.vel, b_aim, t.di_max_angle); // victim angles the trajectory (survival DI)
-    b.hitstun = (speed * 0.12) as i64; // stun scales with knockback
+    b.hitstun = (kb * t.kb_hitstun) as i64; // floor(0.4 * KB)
     b.tumble = speed > t.tumble_speed; // hard enough to knock down (or be teched) on landing
+    // hit interrupt: launch the victim, cancelling whatever move it was mid-swing. attack_for(Launched)
+    // is None, so the interrupted move's remaining windows never fire, and the shell plays the launch.
+    b.state = CharState::Launched;
+    b.frame = 0;
     let freeze = (dmg * HITLAG_PER_DMG) as i64 + 4; // both fighters pop on impact
     a.hitlag = freeze;
     b.hitlag = freeze;
@@ -1740,14 +1810,14 @@ fn try_ground_action(n: &mut Fighter, i: &InputFrame, atk: bool, grab: bool, t: 
         true
     } else if grab {
         n.clear_lane(Lane::Grab);
-        n.attack_hit = false;
+        n.arm_hits();
         n.grab_link = -1;
         n.vel.x *= 0.25; // plant feet for the reach
         n.state = CharState::Grab;
         true
     } else if atk || n.live(Lane::Attack) == Action::Attack {
         n.clear_lane(Lane::Attack);
-        n.attack_hit = false;
+        n.arm_hits();
         if matches!(n.state, CharState::Dash | CharState::Run) {
             // attacking out of momentum = a dash attack: drive a forward lunge (faster than a plain
             // run) so it carries even from a standing dash, then the arm slides it out.
@@ -2179,32 +2249,35 @@ mod di_tests {
 mod art_pass_tests {
     use super::*;
 
-    // Sex-kick nair: the strong early window pays full damage at a steep angle, then the lingering
-    // tail opens at the same hitbox with weaker damage and a shallower launch. One swing, two payoffs.
+    // Sex-kick nair: a strong early box (id 0) then a weaker, shallower tail box (id 1) at the same
+    // limb. Two windowed boxes, sequenced on the shared frame clock. One swing, two payoffs.
     #[test]
     fn nair_sex_kick_has_strong_early_weak_late() {
         let t = Tune::from_char(&CharData::KNEEMAN);
         let n = t.nair;
-        assert!(n.late.len > 0, "nair must carry a sex-kick tail");
-        // active span covers both windows; the move lasts long enough for the tail to matter.
-        assert_eq!(n.active_span(), n.active + n.late.len);
-        let early_frame = n.startup; // first active frame
-        let late_frame = n.startup + n.active; // first tail frame
-        let (e_dmg, _, _, e_ang) = n.hit_at(early_frame);
-        let (l_dmg, _, _, l_ang) = n.hit_at(late_frame);
-        assert!(e_dmg > l_dmg, "early hit ({e_dmg}) must beat the tail ({l_dmg})");
-        assert!(e_ang > l_ang, "tail launches shallower than the early pop");
+        assert_eq!(n.nbox, 2, "nair is a two-box sex kick");
+        let early = &n.boxes[0];
+        let late = &n.boxes[1];
+        // the tail opens after the early window closes (sequenced, not overlapping).
+        assert_eq!(late.start, early.start + early.len, "tail follows the early window");
+        assert!(early.damage > late.damage, "early hit must beat the tail");
+        assert!(early.angle > late.angle, "tail launches shallower than the early pop");
+        // first box opens at startup; total spans both windows + recovery.
+        let early_frame = n.startup;
+        assert!(n.box_at(early_frame).is_some(), "a box is live on the first active frame");
     }
 
-    // A single-window attack (no tail) reports the same stats across its whole active span.
+    // A single-window attack reports the same box across its whole window (no tail to switch to).
     #[test]
     fn single_window_attack_is_constant() {
         let t = Tune::from_char(&CharData::KNEEMAN);
         let j = t.jab;
-        assert_eq!(j.late.len, 0, "jab is one window");
-        let a = j.hit_at(j.startup);
-        let b = j.hit_at(j.startup + j.active - 1);
-        assert_eq!(a, b, "no tail -> identical payoff every active frame");
+        assert_eq!(j.nbox, 1, "jab is one window");
+        let b0 = j.boxes[0];
+        let a = j.box_at(b0.start).copied();
+        let b = j.box_at(b0.start + b0.len - 1).copied();
+        assert_eq!(a, b, "one box -> identical payoff every active frame");
+        assert!(j.box_at(b0.start + b0.len).is_none(), "window closes after len frames");
     }
 
     // Per-state hurtbox: crouching pulls the circle lower and smaller than standing, so a high jab

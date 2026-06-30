@@ -190,7 +190,11 @@ pub fn checksum(s: &SimState) -> u128 {
         fold(f.intangible as u64);
         fold(f.regrab_lock as u64);
         fold(f.ground_plat as u64);
-        fold(f.attack_hit as u64);
+        for row in &f.hit_cd {
+            for c in row {
+                fold(*c as u64);
+            }
+        }
         fold(f.hitlag as u64);
         fold(f.damage.to_bits() as u64);
         fold(f.hitstun as u64);

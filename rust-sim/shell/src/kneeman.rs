@@ -2199,6 +2199,14 @@ fn clip_for(f: &Fighter) -> &'static str {
         SpecialN | SpecialS | SpecialD => "jab", // reuse the swing pose until specials get art
         SpecialU => "jump",
         Helpless => "fall",
+        // launched/hitstun: tumble through the air (the sim drives the slide); rising vs falling pose.
+        Launched => {
+            if f.vel.y < 0.0 {
+                "jump"
+            } else {
+                "fall"
+            }
+        }
     }
 }
 

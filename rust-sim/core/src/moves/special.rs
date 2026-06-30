@@ -2,7 +2,7 @@
 //! routing, and the per-frame run logic. Re-exported through `moves`.
 
 use crate::{
-    airborne, move_toward, sign, Action, AttackData, CharState, Fighter, HitLate, InputFrame, Lane,
+    airborne, move_toward, sign, Action, AttackData, CharState, Fighter, Hitbox, InputFrame, Lane,
     Tune, Vector2, DT,
 };
 
@@ -61,18 +61,10 @@ impl SpecialMove {
     // Default kit (Falcon-ish): heavy neutral-B punch, a side lunge, a rising recovery, a down drive.
     pub(crate) const PUNCH: Self = Self {
         kind: SpecialKind::Punch,
-        hit: AttackData {
-            startup: 14,
-            active: 4,
-            recovery: 26,
-            off: Vector2::new(58.0, -60.0),
-            r: 46.0,
-            damage: 22.0,
-            kb_base: 900.0,
-            kb_scale: 5.0,
-            kb_angle: 38.0,
-            late: HitLate::NONE,
-        },
+        hit: AttackData::one(14, 4, 26, Hitbox {
+            off: Vector2::new(58.0, -60.0), r: 46.0, damage: 22.0,
+            angle: 38.0, bkb: 30.0, kbg: 84.0, ..Hitbox::NONE
+        }),
         // Falcon-punch surge: lunge forward into the hit, not a mid-air hover. Grounded, friction
         // bleeds it to the planted step; aerial, gravity arcs him down after the lunge.
         move_x: 380.0,
@@ -81,54 +73,30 @@ impl SpecialMove {
     };
     pub(crate) const LUNGE: Self = Self {
         kind: SpecialKind::Lunge,
-        hit: AttackData {
-            startup: 8,
-            active: 6,
-            recovery: 22,
-            off: Vector2::new(60.0, -58.0),
-            r: 42.0,
-            damage: 9.0,
-            kb_base: 520.0,
-            kb_scale: 3.6,
-            kb_angle: 55.0,
-            late: HitLate::NONE,
-        },
+        hit: AttackData::one(8, 6, 22, Hitbox {
+            off: Vector2::new(60.0, -58.0), r: 42.0, damage: 9.0,
+            angle: 55.0, bkb: 20.0, kbg: 52.0, ..Hitbox::NONE
+        }),
         move_x: 900.0,
         move_y: -120.0,
         no_gravity: false,
     };
     pub(crate) const RISE: Self = Self {
         kind: SpecialKind::Rise,
-        hit: AttackData {
-            startup: 6,
-            active: 8,
-            recovery: 22,
-            off: Vector2::new(20.0, -90.0),
-            r: 44.0,
-            damage: 7.0,
-            kb_base: 480.0,
-            kb_scale: 3.0,
-            kb_angle: 80.0,
-            late: HitLate::NONE,
-        },
+        hit: AttackData::one(6, 8, 22, Hitbox {
+            off: Vector2::new(20.0, -90.0), r: 44.0, damage: 7.0,
+            angle: 80.0, bkb: 24.0, kbg: 38.0, ..Hitbox::NONE
+        }),
         move_x: 380.0,
         move_y: -1500.0,
         no_gravity: false,
     };
     pub(crate) const DROP: Self = Self {
         kind: SpecialKind::Fall,
-        hit: AttackData {
-            startup: 8,
-            active: 10,
-            recovery: 18,
-            off: Vector2::new(24.0, 10.0),
-            r: 44.0,
-            damage: 10.0,
-            kb_base: 460.0,
-            kb_scale: 3.4,
-            kb_angle: -68.0, // downward: a spike
-            late: HitLate::NONE,
-        },
+        hit: AttackData::one(8, 10, 18, Hitbox {
+            off: Vector2::new(24.0, 10.0), r: 44.0, damage: 10.0,
+            angle: -68.0, bkb: 22.0, kbg: 42.0, ..Hitbox::NONE // downward: a spike
+        }),
         move_x: 220.0,
         move_y: 700.0,
         no_gravity: false,
@@ -160,7 +128,7 @@ pub(crate) fn try_special(n: &mut Fighter) -> bool {
         2 => CharState::SpecialU,
         _ => CharState::SpecialD,
     };
-    n.attack_hit = false;
+    n.arm_hits();
     true
 }
 
