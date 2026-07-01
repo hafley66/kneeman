@@ -8,6 +8,10 @@
 //!   SUBS_PATH          file the push subscriptions live in (default ./subscriptions.json)
 //!   PUSH_TTL_SECS      how long a push may queue at the push service (default 600)
 //!   GAME_DIR           static root for the Godot web export at /game/ (default /var/www/smash-godot)
+//!   TLS_DOMAINS        comma-sep domains -> in-process ACME/TLS on :443 (empty = plain HTTP, default)
+//!   ACME_CONTACT       email in the ACME account                       (default admin@localhost)
+//!   ACME_CACHE_DIR     where the ACME account + certs persist          (default /var/lib/smash/acme)
+//!   ACME_PRODUCTION    "1"/"true" = real Let's Encrypt, else staging   (default staging)
 
 use std::env;
 
@@ -18,7 +22,11 @@ pub struct Config {
     pub vapid_subject: String,
     pub subs_path: String,
     pub push_ttl_secs: u32,
-    pub game_dir: String, // static root for the Godot web export served at /game/
+    pub game_dir: String,        // static root for the Godot web export served at /game/
+    pub tls_domains: Vec<String>, // non-empty => terminate TLS in-process on :443 via ACME
+    pub acme_contact: String,
+    pub acme_cache_dir: String,
+    pub acme_production: bool,
 }
 
 impl Config {
@@ -40,6 +48,13 @@ impl Config {
             subs_path: env::var("SUBS_PATH").unwrap_or_else(|_| "./subscriptions.json".into()),
             push_ttl_secs: env::var("PUSH_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(600),
             game_dir: env::var("GAME_DIR").unwrap_or_else(|_| "/var/www/smash-godot".into()),
+            tls_domains: env::var("TLS_DOMAINS")
+                .ok()
+                .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+                .unwrap_or_default(),
+            acme_contact: env::var("ACME_CONTACT").unwrap_or_else(|_| "admin@localhost".into()),
+            acme_cache_dir: env::var("ACME_CACHE_DIR").unwrap_or_else(|_| "/var/lib/smash/acme".into()),
+            acme_production: env::var("ACME_PRODUCTION").map(|v| v == "1" || v == "true").unwrap_or(false),
         }
     }
 }

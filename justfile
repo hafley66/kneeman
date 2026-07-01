@@ -153,6 +153,9 @@ godot-export: godot-wasm
     cd {{proj}} && mkdir -p build/web && source ~/emsdk/emsdk_env.sh && \
       "{{godot45}}" --headless --path . --export-release "Web" build/web/index.html
     cp {{proj}}/deploy/web/sw.js {{proj}}/deploy/web/push.js {{proj}}/build/web/
+    # Precompress the big assets so the in-process server's ServeDir(.precompressed_gzip()) serves the
+    # .gz directly (no per-request CPU). -k keeps the originals for clients that don't send gzip.
+    cd {{proj}}/build/web && gzip -kf index.side.wasm smash_sim.wasm index.js index.wasm index.pck 2>/dev/null || true
 
 # push build/web to the VPS (/var/www/smash-godot), reload nginx. Run `vps-deploy` once first.
 godot-deploy: godot-export

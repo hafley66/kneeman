@@ -113,6 +113,12 @@ async fn main() {
     let cfg = Config::from_env();
     let bind = cfg.bind_addr.clone();
     let game_dir = cfg.game_dir.clone();
+    let tls = (!cfg.tls_domains.is_empty()).then(|| AcmeOpts {
+        domains: cfg.tls_domains.clone(),
+        contact: cfg.acme_contact.clone(),
+        cache_dir: cfg.acme_cache_dir.clone(),
+        production: cfg.acme_production,
+    });
     let server: Shared = Arc::new(Server {
         started: Instant::now(),
         started_unix: now_unix(),
@@ -154,12 +160,77 @@ async fn main() {
         )
         .with_state(server);
 
-    let listener = TcpListener::bind(&bind).await.expect("bind server port");
-    println!("smash server listening on http://{bind}  (game_dir={game_dir}) — build {BUILD_HASH}");
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .expect("serve");
+    let make = app.into_make_service_with_connect_info::<SocketAddr>();
+    match tls {
+        // Behind nginx (or local): plain HTTP on BIND_ADDR. The current, default mode.
+        None => {
+            let listener = TcpListener::bind(&bind).await.expect("bind server port");
+            println!("smash server: http://{bind}  (game_dir={game_dir}) — build {BUILD_HASH}");
+            axum::serve(listener, make).await.expect("serve");
+        }
+        // Flip mode: terminate TLS in-process on :443 via ACME, plus an :80 -> :443 redirect.
+        Some(opts) => {
+            println!("smash server: TLS :443 via ACME {:?} (game_dir={game_dir}) — build {BUILD_HASH}", opts.domains);
+            tokio::spawn(redirect_http_to_https());
+            serve_tls(make, opts).await;
+        }
+    }
 }
+
+/// ACME/TLS settings, present only when `TLS_DOMAINS` is set.
+struct AcmeOpts {
+    domains: Vec<String>,
+    contact: String,
+    cache_dir: String,
+    production: bool,
+}
+
+/// Serve the app over HTTPS on :443, obtaining + renewing the Let's Encrypt cert in-process
+/// (TLS-ALPN-01 on the same port). The `AcmeState` stream must be polled to drive the ACME order,
+/// so it's spawned onto its own task; the acceptor shares the resolver it feeds.
+async fn serve_tls(make: MakeSvc, opts: AcmeOpts) {
+    use futures::StreamExt;
+    use rustls_acme::{caches::DirCache, AcmeConfig};
+
+    let mut state = AcmeConfig::new(opts.domains)
+        .contact_push(format!("mailto:{}", opts.contact))
+        .cache(DirCache::new(opts.cache_dir))
+        .directory_lets_encrypt(opts.production)
+        .state();
+    let acceptor = state.axum_acceptor(state.default_rustls_config());
+    tokio::spawn(async move {
+        loop {
+            match state.next().await {
+                Some(Ok(ok)) => println!("acme: {ok:?}"),
+                Some(Err(e)) => eprintln!("acme error: {e:?}"),
+                None => break,
+            }
+        }
+    });
+    axum_server::bind(SocketAddr::from(([0, 0, 0, 0], 443)))
+        .acceptor(acceptor)
+        .serve(make)
+        .await
+        .expect("tls serve");
+}
+
+/// Minimal :80 listener that 308-redirects every request to its https:// equivalent.
+async fn redirect_http_to_https() {
+    use axum::extract::Host;
+    use axum::http::Uri;
+    use axum::response::Redirect;
+    let app = Router::<()>::new().fallback(|Host(host): Host, uri: Uri| async move {
+        let host = host.split(':').next().unwrap_or(&host).to_string();
+        let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        Redirect::permanent(&format!("https://{host}{pq}"))
+    });
+    if let Ok(l) = TcpListener::bind("0.0.0.0:80").await {
+        let _ = axum::serve(l, app).await;
+    }
+}
+
+/// The concrete make-service type shared by both serve paths (axum + axum-server).
+type MakeSvc = axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr>;
 
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
