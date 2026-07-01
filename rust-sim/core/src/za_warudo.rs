@@ -922,32 +922,31 @@ fn try_ground_action(n: &mut Fighter, i: &InputFrame, atk: bool, grab: bool, t: 
     }
 }
 
-/// Soft-platform / soft-ink drop-through with a tilt-window buffer (Melee/PM feel). A fresh Down tap
-/// on a soft surface arms `drop_buf = plat_drop_window` instead of dropping instantly; the same tap
-/// also entered Crouch via the state machine (which ran first). While the buffer counts down the
+/// Soft-platform / soft-ink drop-through with a tilt-window buffer (Melee/PM feel). Crouch-holding
+/// Down on a soft surface arms `drop_buf = plat_drop_window` and counts it down; while it counts the
 /// fighter stays crouched, so a Down+Attack in the window converts to a Dtilt — that leaves Crouch
-/// and cancels the pending drop. Returns true on the frame the window expires still crouched: that's
-/// when the drop actually happens. `soft` is false for the solid main stage / solid ink (never drops).
+/// and cancels the pending drop. Releasing Down (Crouch -> Stand) or any non-Crouch state also
+/// cancels it. Returns true on the frame the window expires still crouch-holding: that's the drop.
 ///
-/// Tune `plat_drop_window`: 1 = drop on the entry frame (frame-perfect tilt, Melee-ish); larger =
-/// longer grace to convert into a tilt (PM-ish), at the cost of that many frames of drop latency.
+/// Keyed on `down` HELD, not the `down_pressed` edge: the shell only fires `down_pressed` for the
+/// digital `ui_down` action, so a controller stick / touch stick sets `down` (via pad_down) but
+/// never the edge. Reading the held bit makes the drop fire the same from every input source.
+/// `soft` is false for the solid main stage / solid ink (never drops).
+///
+/// Tune `plat_drop_window`: 1 = drop on the crouch frame (near-instant, Melee-ish); larger = more
+/// grace to convert into a Dtilt (PM-ish), at the cost of that many frames of drop latency.
 fn drop_through(n: &mut Fighter, i: &InputFrame, t: &Tune, soft: bool) -> bool {
-    // any non-crouch action (a Dtilt from Down+Attack, a jump out of crouch, release to Stand)
-    // cancels a pending drop. Solid surfaces never drop.
-    if !soft || n.state != CharState::Crouch {
+    // only a crouch-hold on a soft surface drops. Standing up, releasing Down, or converting to a
+    // Dtilt (any non-Crouch state) clears the pending drop. Solid surfaces never drop.
+    if !soft || n.state != CharState::Crouch || !i.down {
         n.drop_buf = 0;
         return false;
     }
-    if i.down_pressed {
-        n.drop_buf = t.plat_drop_window.max(1); // arm on the fresh Down tap
+    if n.drop_buf == 0 {
+        n.drop_buf = t.plat_drop_window.max(1); // (re)arm the tilt-window on a fresh crouch-hold
     }
-    if n.drop_buf > 0 {
-        n.drop_buf -= 1;
-        if n.drop_buf == 0 {
-            return true; // window elapsed with no attack to convert it -> drop through
-        }
-    }
-    false
+    n.drop_buf -= 1;
+    n.drop_buf == 0 // window elapsed with no attack to convert it -> drop through
 }
 
 /// Consume a buffered jump/shorthop if one is live in the movement lane. Returns Some(full_hop).

@@ -251,6 +251,22 @@ fn down_tap_drops_through_a_soft_platform() {
 }
 
 #[test]
+fn holding_down_drops_even_without_a_press_edge() {
+    // Regression: the shell only fires down_pressed for the digital ui_down action, so a controller
+    // or touch stick sets down (held) but never the edge. The drop must still fire off the held bit.
+    let (mut s, t) = on_soft_platform();
+    let mut dropped = false;
+    for _ in 0..(t.plat_drop_window as usize + 6) {
+        s = step(&s, &[&press(|i| i.down = true), &idle()], &t); // down HELD, down_pressed never set
+        if s.fighters[0].state == CharState::Air && s.fighters[0].ground_plat < 0 {
+            dropped = true;
+            break;
+        }
+    }
+    assert!(dropped, "holding Down on a soft platform must drop even if down_pressed never fired");
+}
+
+#[test]
 fn down_attack_in_the_window_dtilts_instead_of_dropping() {
     let (mut s, t) = on_soft_platform();
     // Frame 0: the Down tap crouches and arms the buffer — it must NOT drop yet.
