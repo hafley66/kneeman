@@ -12,6 +12,9 @@
 //!   ACME_CONTACT       email in the ACME account                       (default admin@localhost)
 //!   ACME_CACHE_DIR     where the ACME account + certs persist          (default /var/lib/smash/acme)
 //!   ACME_PRODUCTION    "1"/"true" = real Let's Encrypt, else staging   (default staging)
+//!   EV_LOG_PATH        newline-JSON netcode event log                  (default /var/log/smash/ev.log)
+//!   EV_LOG_CAP_BYTES   TOTAL on-disk budget; rotates at half, keeps 1  (default 1073741824 = 1 GiB)
+//!   SERVER_ID          stamped on every event as `sip` (server tag)    (default the box hostname)
 
 use std::env;
 
@@ -27,6 +30,9 @@ pub struct Config {
     pub acme_contact: String,
     pub acme_cache_dir: String,
     pub acme_production: bool,
+    pub ev_log_path: String,     // newline-JSON netcode event log (empty => event logging off)
+    pub ev_log_cap_bytes: u64,   // TOTAL disk budget: rotate active file at cap/2, keep one .1 backup
+    pub server_id: String,       // stamped as `sip` on every event
 }
 
 impl Config {
@@ -55,6 +61,16 @@ impl Config {
             acme_contact: env::var("ACME_CONTACT").unwrap_or_else(|_| "admin@localhost".into()),
             acme_cache_dir: env::var("ACME_CACHE_DIR").unwrap_or_else(|_| "/var/lib/smash/acme".into()),
             acme_production: env::var("ACME_PRODUCTION").map(|v| v == "1" || v == "true").unwrap_or(false),
+            ev_log_path: env::var("EV_LOG_PATH").unwrap_or_else(|_| "/var/log/smash/ev.log".into()),
+            ev_log_cap_bytes: env::var("EV_LOG_CAP_BYTES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1024 * 1024 * 1024), // 1 GiB total
+            server_id: env::var("SERVER_ID")
+                .ok()
+                .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "server".into()),
         }
     }
 }

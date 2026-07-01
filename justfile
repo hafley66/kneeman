@@ -102,8 +102,16 @@ signaling-bin:
 signaling-deploy: signaling-bin
     scp {{proj}}/signaling/target/x86_64-unknown-linux-musl/release/smash-signaling {{vps}}:/root/.cargo/bin/smash-signaling.new
     scp deploy/nginx/rtc.conf {{vps}}:/etc/nginx/snippets/rtc.conf
+    scp deploy/nginx/ev.conf {{vps}}:/etc/nginx/snippets/ev.conf
     scp deploy/systemd/smash-signaling.service {{vps}}:/etc/systemd/system/smash-signaling.service
+    # idempotently `include` the /ev snippet in the 443 server block (right after the rtc.conf include)
+    ssh {{vps}} 'grep -q "snippets/ev.conf" /etc/nginx/sites-enabled/default || sed -i "/include snippets\/rtc.conf;/a\\    include snippets/ev.conf;" /etc/nginx/sites-enabled/default'
     ssh {{vps}} 'mv /root/.cargo/bin/smash-signaling.new /root/.cargo/bin/smash-signaling && systemctl daemon-reload && nginx -t && systemctl reload nginx && systemctl restart smash-signaling && systemctl --no-pager status smash-signaling | head -4'
+
+# tail the live netcode event firehose (client-stamped sid/cs + server-stamped t/cip/sip). Pretty via
+# jq if present. This is the "stop guessing" view: watch phase/net/session_begin/hb lines in realtime.
+analytics-tail:
+    ssh {{vps}} 'touch /var/log/smash/ev.log; tail -n 40 -f /var/log/smash/ev.log' | (jq -c . 2>/dev/null || cat)
 
 # tail the live signaling relay log (connect / matched / disconnect lines)
 signaling-logs:

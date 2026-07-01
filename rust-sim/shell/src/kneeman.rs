@@ -298,6 +298,12 @@ pub struct KneeMan {
     peer_build: Option<String>,                // opponent's build hash from the SDP handshake (None until traded)
     stale_build: bool,                         // our wasm is older than the live server build -> reload
     peer_identity: Option<Identity>,           // remote player's chosen name+color from the SDP handshake
+
+    // --- netcode event firehose (see `analytics`); its own HttpRequest so it never collides with the
+    // /status fetch above. `last_net` edge-detects transport changes so we log deltas, not every frame.
+    analytics_http: Option<Gd<HttpRequest>>,
+    ev_tick: u32,                              // frame counter: flush the buffer + heartbeat on a cadence
+    last_net: NetDebug,                        // previous transport snapshot, for change detection
 }
 
 #[godot_api]
@@ -332,6 +338,9 @@ impl INode2D for KneeMan {
             menu_btn: None,
             debug_ui: None,
             netdbg: Mutable::new(NetDebug::default()),
+            analytics_http: None,
+            ev_tick: 0,
+            last_net: NetDebug::default(),
             sig: SigCounts::default(),
             identity: Mutable::new(Identity::default()),
             saved_identity: Identity::default(),
@@ -440,6 +449,14 @@ impl INode2D for KneeMan {
         self.http = Some(http);
         self.ping_version();
 
+        // Netcode event firehose: its own HttpRequest node (no completion callback -- fire-and-forget
+        // POSTs to the relay /ev). On the web export Godot routes this through the browser fetch.
+        let mut ev_http = HttpRequest::new_alloc();
+        self.base_mut().add_child(&ev_http);
+        ev_http.set_name("AnalyticsHttp");
+        self.analytics_http = Some(ev_http);
+        crate::analytics::log("boot", &format!(r#","build":"{}""#, rtc::BUILD_HASH));
+
         // Skybox: a screen-pinned vertical gradient behind the world (deep space-blue -> horizon
         // glow). CanvasLayer at a negative layer keeps it under the stage + fighters, and a
         // full-rect anchor lets it cover any window without per-frame resizing.
@@ -529,6 +546,7 @@ impl INode2D for KneeMan {
         self.sync_identity();
         self.sync_charsel();
         self.place_tags();
+        self.pump_analytics();
     }
 
     /// Window/tab regained focus (desktop WM focus or browser tab focus on web). Re-ping the relay
@@ -974,6 +992,7 @@ impl KneeMan {
     #[func]
     fn on_connect(&mut self) {
         if self.phase == Phase::Offline {
+            crate::analytics::log("find_match", &format!(r#","build":"{}""#, rtc::BUILD_HASH));
             self.start_matchmaking();
         }
     }
@@ -1028,7 +1047,7 @@ impl KneeMan {
     /// Called on focus-in so a tab woken after a deploy notices it's running stale code.
     fn ping_version(&mut self) {
         if let Some(http) = self.http.as_mut() {
-            let _ = http.request(rtc::STATUS_URL);
+            let _ = http.request(&rtc::status_url());
         }
     }
 
@@ -1086,8 +1105,64 @@ impl KneeMan {
         self.charsel.clone()
     }
 
+    /// Once per frame: heartbeat the live phase/channel while connected (so a stall shows as repeated
+    /// lines with unchanging state), and flush the buffered events to the relay on a cadence. ~60Hz
+    /// physics tick: heartbeat every 60 frames (~1s), flush every 30 (~0.5s).
+    fn pump_analytics(&mut self) {
+        self.ev_tick = self.ev_tick.wrapping_add(1);
+        if self.phase != Phase::Offline && self.ev_tick % 60 == 0 {
+            crate::analytics::log(
+                "hb",
+                &format!(
+                    r#","phase":"{}","chan":"{}","conn":"{}","oi":{},"ai":{},"ii":{}"#,
+                    Self::phase_name(self.phase),
+                    self.last_net.channel,
+                    self.last_net.conn,
+                    self.sig.offer_in,
+                    self.sig.answer_in,
+                    self.sig.ice_in,
+                ),
+            );
+        }
+        if self.ev_tick % 30 == 0 {
+            let url = crate::rtc::event_url();
+            if let Some(h) = self.analytics_http.as_mut() {
+                crate::analytics::flush(h, &url);
+            }
+        }
+    }
+
+    /// Stable string name for a phase (shared by the NetDebug DTO and the event firehose).
+    fn phase_name(p: Phase) -> &'static str {
+        match p {
+            Phase::Offline => "offline",
+            Phase::Signaling => "signaling",
+            Phase::Running => "running",
+            Phase::Reconnecting => "reconnecting",
+        }
+    }
+
+    /// The ONLY writer of `self.phase`: logs the transition to the firehose, then sets it. Routing
+    /// every phase change through here means the event log can never miss one.
+    fn set_phase(&mut self, p: Phase) {
+        if self.phase != p {
+            let room = self.room.as_ref().map(|r| r.code.as_str()).unwrap_or("");
+            crate::analytics::log(
+                "phase",
+                &format!(
+                    r#","from":"{}","to":"{}","room":"{}","handle":{}"#,
+                    Self::phase_name(self.phase),
+                    Self::phase_name(p),
+                    room,
+                    self.local_handle,
+                ),
+            );
+        }
+        self.phase = p;
+    }
+
     /// Read the live transport states off the ws/pc/channel handles and publish them for the panel.
-    fn publish_netdbg(&self) {
+    fn publish_netdbg(&mut self) {
         let ws = self
             .ws
             .as_ref()
@@ -1106,13 +1181,8 @@ impl KneeMan {
             .as_ref()
             .map(|c| chan_name(c.get_ready_state()))
             .unwrap_or("—");
-        self.netdbg.set(NetDebug {
-            phase: match self.phase {
-                Phase::Offline => "offline",
-                Phase::Signaling => "signaling",
-                Phase::Running => "running",
-                Phase::Reconnecting => "reconnecting",
-            },
+        let nd = NetDebug {
+            phase: Self::phase_name(self.phase),
             role: match self.role {
                 Some(Role::Host) => "host",
                 Some(Role::Guest) => "guest",
@@ -1134,7 +1204,24 @@ impl KneeMan {
                 .as_deref()
                 .map(|p| !p.is_empty() && p != "unknown" && p != rtc::BUILD_HASH)
                 .unwrap_or(false),
-        });
+        };
+        // Firehose the transport state machine, edge-triggered: log only when ws/conn/gather/signal/
+        // channel actually flips, so it's deltas (channel connecting->open is the mode-A/B tell), not
+        // one line every frame.
+        let o = self.last_net;
+        if (nd.ws, nd.conn, nd.gather, nd.signal, nd.channel)
+            != (o.ws, o.conn, o.gather, o.signal, o.channel)
+        {
+            crate::analytics::log(
+                "net",
+                &format!(
+                    r#","ws":"{}","conn":"{}","gather":"{}","signal":"{}","chan":"{}","handle":{}"#,
+                    nd.ws, nd.conn, nd.gather, nd.signal, nd.channel, nd.handle,
+                ),
+            );
+        }
+        self.last_net = nd;
+        self.netdbg.set(nd);
     }
 
     // --- frame loop (local + netplay) -----------------------------------------------------------
@@ -1222,7 +1309,7 @@ impl KneeMan {
             self.room = None;
             return;
         }
-        self.phase = Phase::Signaling;
+        self.set_phase(Phase::Signaling);
         godot_print!("netplay: dialing lobby {} ...", key);
     }
 
@@ -1236,8 +1323,8 @@ impl KneeMan {
         if !self.dial(None) {
             return;
         }
-        self.phase = Phase::Signaling;
-        godot_print!("netplay: dialing {} ...", rtc::SIGNALING_URL);
+        self.set_phase(Phase::Signaling);
+        godot_print!("netplay: dialing {} ...", rtc::signaling_url());
     }
 
     /// Open a signaling socket, tagged with our identity (so the relay's /status lists us) and an
@@ -1255,7 +1342,7 @@ impl KneeMan {
         );
         let mut url = format!(
             "{}?name={}&color={}&hash={}",
-            rtc::SIGNALING_URL,
+            rtc::signaling_url(),
             url_escape(&id.name),
             hex,
             rtc::BUILD_HASH,
@@ -1477,13 +1564,27 @@ impl KneeMan {
                 self.net = Some(Box::new(GgrsNetplay::new(session, game, local_handle)));
                 self.state.set(state);
                 self.local_handle = local_handle;
-                self.phase = Phase::Running;
+                // ggrs handle assignment + build compat, the moment the session is born: this is where
+                // "world init'd but not playing" is decided (mode A never reaches here, mode B does).
+                let room = self.room.as_ref().map(|r| r.code.clone()).unwrap_or_default();
+                let peer_build = self.peer_build.clone().unwrap_or_default();
+                crate::analytics::log(
+                    "session_begin",
+                    &format!(
+                        r#","handle":{local_handle},"remote":{remote},"resumed":{},"room":"{room}","build":"{}","peer_build":"{}""#,
+                        self.resume_snapshot.is_some(),
+                        rtc::BUILD_HASH,
+                        peer_build,
+                    ),
+                );
+                self.set_phase(Phase::Running);
                 if let Some(r) = self.room.as_mut() {
                     r.deadline_ms = None; // back in a match; close the reconnect window
                 }
                 godot_print!("netplay: channel open, rollback running (handle {local_handle})");
             }
             Err(e) => {
+                crate::analytics::log("session_fail", &format!(r#","err":{}"#, crate::analytics::jstr(&format!("{e:?}"))));
                 godot_error!("netplay: session start failed: {e:?}");
                 self.reset_offline();
             }
@@ -1503,7 +1604,7 @@ impl KneeMan {
         self.resume_snapshot = None;
         self.got_resume = false;
         self.got_tune = false;
-        self.phase = Phase::Offline;
+        self.set_phase(Phase::Offline);
         godot_print!("netplay: offline");
     }
 
@@ -1557,7 +1658,7 @@ impl KneeMan {
         if let Some(r) = self.room.as_mut() {
             r.deadline_ms = Some(now_ms() + RECONNECT_WINDOW_MS);
         }
-        self.phase = Phase::Reconnecting;
+        self.set_phase(Phase::Reconnecting);
     }
 
     /// One line describing where we are in the netplay lifecycle, shown top-left every frame.

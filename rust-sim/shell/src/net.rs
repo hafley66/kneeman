@@ -77,6 +77,20 @@ fn js_eval(code: &str) -> Variant {
     }
 }
 
+/// The web page's `location.origin` ("https://host[:port]"), or `None` on native/headless. Lets the
+/// client derive the relay host from wherever the game is actually served, instead of a baked URL.
+pub(crate) fn page_origin() -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let s = js_eval("location.origin").try_to::<GString>().map(|g| g.to_string()).unwrap_or_default();
+        (!s.is_empty()).then_some(s)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
 /// Run the push subscribe flow (fires the browser permission prompt on first use).
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn push_enable() {

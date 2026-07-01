@@ -66,7 +66,7 @@ impl Screen for Network {
             );
         } else {
             ui.label(
-                RichText::new(format!("build {}  ·  relay {}", net.build_hash, crate::rtc::STATUS_URL))
+                RichText::new(format!("build {}  ·  relay {}", net.build_hash, crate::rtc::status_url()))
                     .small()
                     .weak(),
             );

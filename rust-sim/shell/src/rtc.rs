@@ -15,13 +15,42 @@ use godot::prelude::*;
 
 use smash_net::{Message, NonBlockingSocket};
 
-/// Where the browser dials for matchmaking. nginx reverse-proxies this to the signaling binary on
-/// the VPS loopback. The relay pairs two dialers and forwards their SDP/ICE.
-pub const SIGNALING_URL: &str = "wss://hafley.codes/rtc";
+/// The relay origin, derived not baked: on the web export it is the page origin (whatever host served
+/// the game -- serve from staging and it follows), on native it is `SMASH_RELAY` else a dev default.
+/// Memoized (the web path is a JS `location.origin` eval), so per-frame callers pay it once.
+pub fn relay_base() -> String {
+    thread_local! {
+        static BASE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+    BASE.with(|b| {
+        b.borrow_mut()
+            .get_or_insert_with(|| {
+                crate::net::page_origin()
+                    .or_else(|| std::env::var("SMASH_RELAY").ok())
+                    .unwrap_or_else(|| "https://hafley.codes".into())
+            })
+            .clone()
+    })
+}
 
-/// The relay's plain-HTTP status page (same host/route as `SIGNALING_URL`; the relay serves JSON
-/// when a request arrives without the WebSocket upgrade header). The debug panel fetches this.
-pub const STATUS_URL: &str = "https://hafley.codes/rtc";
+/// WebSocket signaling endpoint (`/rtc`); scheme follows the origin (https->wss, http->ws). The relay
+/// pairs two dialers and forwards their SDP/ICE.
+pub fn signaling_url() -> String {
+    let ws = relay_base().replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
+    format!("{ws}/rtc")
+}
+
+/// The relay's plain-HTTP status/JSON page (same host+route as signaling; it answers JSON without the
+/// WebSocket upgrade header). The debug panel fetches this.
+pub fn status_url() -> String {
+    format!("{}/rtc", relay_base())
+}
+
+/// Netcode event firehose sink (POST). nginx forwards this to the signaling binary's `/ev`, which
+/// stamps client IP + recv time and appends to a rotating JSON-lines log. See `analytics`.
+pub fn event_url() -> String {
+    format!("{}/ev", relay_base())
+}
 
 /// This build's git short hash, stamped by build.rs. Sent in the dial URL (so the relay's /status
 /// lists which build each client runs) and in the SDP offer/answer (so the peer can flag a version

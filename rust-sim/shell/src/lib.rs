@@ -9,6 +9,7 @@ mod identity; // local player identity: name/color + per-slot defaults + user://
 mod net; // stateless netplay support: snapshot codec, room codes, transport-state names, NetDebug DTO
 mod grid; // training-room grid backdrop
 mod rtc; // Godot WebRTC netplay transport (ggrs over a browser data channel)
+mod analytics; // netcode event firehose: buffer -> POST /ev (rotating log on the relay)
 
 // Pure sim now lives in its own crate (core/). Re-export under `sim` so the shell modules
 // keep referring to `crate::sim::*` unchanged. `gv()` is the glam->godot vector boundary.

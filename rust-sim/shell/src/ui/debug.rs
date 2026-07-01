@@ -408,7 +408,7 @@ impl DebugUi {
     fn fetch_status(&mut self) {
         if let Some(http) = self.http.as_mut() {
             self.server_status.set(String::from("fetching…"));
-            let _ = http.request(crate::rtc::STATUS_URL);
+            let _ = http.request(&crate::rtc::status_url());
         }
     }
 
@@ -719,7 +719,7 @@ fn server_card(ui: &mut egui::Ui, status: &Mutable<String>, want_status: &mut bo
         if ui.button("⟳ refresh").clicked() {
             *want_status = true;
         }
-        ui.label(egui::RichText::new(crate::rtc::STATUS_URL).color(dark::MUTED));
+        ui.label(egui::RichText::new(crate::rtc::status_url()).color(dark::MUTED));
     });
     ui.add_space(6.0);
     let body = status.get_cloned();

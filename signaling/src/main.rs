@@ -40,8 +40,10 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use web_push::SubscriptionInfo;
 
 mod config;
+mod events;
 mod push;
 use config::Config;
+use events::EventLog;
 use push::PushState;
 
 const BUILD_HASH: &str = env!("BUILD_HASH");
@@ -83,6 +85,8 @@ struct Server {
     clients: Mutex<BTreeMap<u64, ClientInfo>>,
     lobby: Lobby,
     push: PushState,
+    events: EventLog,   // netcode event sink (POST /ev -> rotating JSON-lines file)
+    server_id: String,  // stamped as `sip` on every event
 }
 
 type Shared = Arc<Server>;
@@ -119,6 +123,8 @@ async fn main() {
         cache_dir: cfg.acme_cache_dir.clone(),
         production: cfg.acme_production,
     });
+    let events = EventLog::spawn(cfg.ev_log_path.clone(), cfg.ev_log_cap_bytes);
+    let server_id = cfg.server_id.clone();
     let server: Shared = Arc::new(Server {
         started: Instant::now(),
         started_unix: now_unix(),
@@ -126,6 +132,8 @@ async fn main() {
         clients: Mutex::new(BTreeMap::new()),
         lobby: Mutex::new(HashMap::new()),
         push: PushState::new(cfg),
+        events,
+        server_id,
     });
 
     // Static host for the Godot export: serve precompressed `.gz` when present (the 40MB engine wasm
@@ -149,6 +157,7 @@ async fn main() {
         .route("/", get(status))
         .route("/vapid", get(vapid))
         .route("/subscribe", post(subscribe))
+        .route("/ev", post(events::ev))
         .nest_service("/game", game)
         // Browser reads /status etc. cross-origin; keep the old permissive CORS. Also answers the
         // OPTIONS preflight the hand-rolled server used to special-case.
