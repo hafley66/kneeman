@@ -4,11 +4,21 @@ After=network.target
 
 [Service]
 Type=simple
-# Binds 127.0.0.1:3537; nginx terminates TLS and proxies wss://hafley.codes/rtc -> here. Pairs two
-# browsers and forwards their SDP/ICE; never sees gameplay (that is direct WebRTC P2P).
+# Two modes, chosen by env (see config.rs):
+#   default        binds 127.0.0.1:3537; nginx terminates TLS + serves /game (mode 1, today).
+#   TLS_DOMAINS set  binds :80 (redirect) + :443, terminates TLS in-process via ACME, serves /game
+#                    itself -> nginx + matchbox retired (mode 2, the flip). Set TLS_DOMAINS +
+#                    ACME_PRODUCTION in the EnvironmentFile to switch.
+# Pairs two browsers and forwards their SDP/ICE; never sees gameplay (that is direct WebRTC P2P).
 ExecStart=/root/.cargo/bin/smash-signaling
 Restart=on-failure
 RestartSec=2
+# Serve the Godot export from here in mode 2; harmless in mode 1 (route just isn't proxied yet).
+Environment=GAME_DIR=/var/www/smash-godot
+# ACME account + issued certs persist here (under StateDirectory) so restarts reuse the cert.
+Environment=ACME_CACHE_DIR=/var/lib/smash-signaling/acme
+# Bind :80/:443 without running as root (no-op while it runs as root, ready if we drop privileges).
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 # All push/runtime config is env-driven (12-factor). The file is optional (leading '-'): with no
 # VAPID_PRIVATE_PEM the relay still runs, push just no-ops. `just vapid-keygen` writes the key + this
 # env file. StateDirectory gives /var/lib/smash-signaling for the subscription store (SUBS_PATH
