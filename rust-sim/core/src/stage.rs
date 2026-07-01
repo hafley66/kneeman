@@ -116,6 +116,38 @@ impl StrokeProps {
     };
 }
 
+/// Index into a `StrokeRegistry`'s preset table. Plain `u8` so it rides inside `Item`/`SimState` as
+/// Copy data (no trait object: replay stores what HAPPENED, so the material must be resolvable from
+/// data alone, not a boxed algorithm). Row 0 is always the default.
+pub type StrokeId = u8;
+
+/// How many named stroke presets the registry holds. Tune isn't in the per-frame rollback checksum
+/// (it's constant config), so this can be decently wide without touching sync cost.
+pub const STROKE_SLOTS: usize = 16;
+
+/// The named-preset table of stroke materials — the "registry" a `StrokeId` resolves against. Think
+/// CSS: `StrokeProps` is the property bag, this is the stylesheet, row 0 is the cascade root/default.
+/// Owned by `Tune` (panel-editable), Copy + serde so it round-trips with the rest of config.
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StrokeRegistry {
+    pub presets: [StrokeProps; STROKE_SLOTS],
+}
+
+impl StrokeRegistry {
+    /// Every slot starts at the baseline pen; row 0 is the default. Panels/serde override rows later.
+    pub const DEFAULT: Self = Self { presets: [StrokeProps::PEN; STROKE_SLOTS] };
+
+    /// Resolve a `StrokeId` to its material, falling back to the default row (0) on an out-of-range id.
+    pub fn get(&self, id: StrokeId) -> StrokeProps {
+        *self.presets.get(id as usize).unwrap_or(&self.presets[0])
+    }
+
+    /// The default stroke material (row 0) — the cascade root every unstyled path inherits.
+    pub fn default_props(&self) -> StrokeProps {
+        self.presets[0]
+    }
+}
+
 /// Which drawing tool an ink item is. Stored as plain data; behavior is static-dispatched through the
 /// `DrawTool` trait so `SimState` never holds a trait object (stays `Copy` + checksummable).
 #[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
@@ -126,13 +158,11 @@ pub enum ToolKind {
     StrokeRuler, // one straight stroke per press, aimed by the stick, length = remaining budget
 }
 
-/// A drawing tool's behavior. Implemented on a zero-sized marker per kind; the sim calls through the
-/// `tool_*` shims (which `match` on `ToolKind`) so dispatch is static and state stays plain data.
-/// Pure: every method is value-in / value-out. Add a tool = add a variant + a marker impl + a match
-/// arm in the two shims. See the `ink-paths` skill.
+/// A drawing tool's node-placement behavior. Implemented on a zero-sized marker per kind; the sim
+/// calls through the `tool_sample` shim (which `match`es on `ToolKind`) so dispatch is static and
+/// state stays plain data. Material is NOT a tool concern anymore — it comes from the `StrokeRegistry`
+/// keyed by the item's `StrokeId`. Add a tool = add a variant + a marker impl + a `tool_sample` arm.
 pub trait DrawTool {
-    /// The material this tool stamps on the nodes it lays.
-    fn props(t: &Tune) -> StrokeProps;
     /// Where (if anywhere) this tool plants a new node THIS frame, given the drawer, their input, and
     /// the path so far. `None` = lay nothing this frame. The caller enforces the length budget.
     fn sample(f: &Fighter, i: &InputFrame, path: &InkPath, t: &Tune) -> Option<Vector2>;
@@ -143,56 +173,38 @@ pub struct CursorBrush;
 pub struct StrokeRuler;
 
 impl DrawTool for TrailPen {
-    fn props(t: &Tune) -> StrokeProps {
-        t.pen
-    }
-    fn sample(f: &Fighter, _i: &InputFrame, path: &InkPath, t: &Tune) -> Option<Vector2> {
+    fn sample(f: &Fighter, _i: &InputFrame, path: &InkPath, _t: &Tune) -> Option<Vector2> {
         // lay a node at the feet once we've moved at least one segment-length from the last node.
         let here = f.pos;
         match path.last() {
-            Some(prev) if (here - prev).length() < t.pen.min_seg => None,
+            Some(prev) if (here - prev).length() < path.props.min_seg => None,
             _ => Some(here),
         }
     }
 }
 
 impl DrawTool for CursorBrush {
-    fn props(t: &Tune) -> StrokeProps {
-        t.pen
-    }
     fn sample(f: &Fighter, i: &InputFrame, path: &InkPath, t: &Tune) -> Option<Vector2> {
         // a cursor floats off the body in the stick direction; plant where it points.
         let aim = Vector2::new(i.dir, i.aim_y);
         let cursor = f.pos + aim * t.ink_cursor_reach;
         match path.last() {
-            Some(prev) if (cursor - prev).length() < t.pen.min_seg => None,
+            Some(prev) if (cursor - prev).length() < path.props.min_seg => None,
             _ => Some(cursor),
         }
     }
 }
 
 impl DrawTool for StrokeRuler {
-    fn props(t: &Tune) -> StrokeProps {
-        t.pen
-    }
-    fn sample(f: &Fighter, i: &InputFrame, path: &InkPath, t: &Tune) -> Option<Vector2> {
+    fn sample(f: &Fighter, i: &InputFrame, path: &InkPath, _t: &Tune) -> Option<Vector2> {
         // straight stroke: from the body, step one min_seg in the aimed direction each frame until
         // budget runs out (the caller stops us). First node anchors at the body.
         let aim = Vector2::new(i.dir, i.aim_y);
         let dir = if aim.length() > 0.3 { aim / aim.length() } else { Vector2::new(f.facing, 0.0) };
         match path.last() {
             None => Some(f.pos),
-            Some(prev) => Some(prev + dir * t.pen.min_seg),
+            Some(prev) => Some(prev + dir * path.props.min_seg),
         }
-    }
-}
-
-/// Static-dispatch shim: a tool's stroke material.
-pub fn tool_props(k: ToolKind, t: &Tune) -> StrokeProps {
-    match k {
-        ToolKind::TrailPen => TrailPen::props(t),
-        ToolKind::CursorBrush => CursorBrush::props(t),
-        ToolKind::StrokeRuler => StrokeRuler::props(t),
     }
 }
 
@@ -342,6 +354,56 @@ pub(crate) fn ink_floor_y_at(p: &InkPath, x: f32) -> Option<f32> {
     best
 }
 
+/// Swept horizontal block against a path's cached `Wall` segments. `prev_x`/`pos` are the fighter's
+/// feet-x before and after this frame's motion; `half_w`/`half_h` the ECB half-extents. For the
+/// near-vertical Wall segment spanning the ECB's center height (`pos.y - half_h`), returns the
+/// corrected feet-x (the leading side vert pinned flush to the wall) and the wall's outward normal x
+/// (toward the fighter's side). The prev_x sweep catches a fast body that would tunnel entirely past
+/// the wall in one frame — it's still pinned to the side it came from. Reads cached `class[]` only; a
+/// path still being drawn isn't collidable. Mirrors the solid-stage side-wall block.
+pub(crate) fn ink_wall_block(
+    p: &InkPath,
+    prev_x: f32,
+    pos: Vector2,
+    half_w: f32,
+    half_h: f32,
+) -> Option<(f32, f32)> {
+    if !p.active() || p.drawing {
+        return None;
+    }
+    let cy = pos.y - half_h; // ECB center height (matches the stage side-wall test)
+    let n = p.len as usize;
+    for s in 0..n.saturating_sub(1) {
+        if p.class[s] != SegClass::Wall {
+            continue;
+        }
+        let (a, b) = (p.pts[s], p.pts[s + 1]);
+        let (lo, hi) = if a.y <= b.y { (a, b) } else { (b, a) }; // order by y
+        if cy < lo.y || cy > hi.y {
+            continue; // ECB center above/below this wall's vertical span
+        }
+        let span = hi.y - lo.y;
+        // Wall class guarantees dy dominates, so x(y) along the segment is single-valued.
+        let wx = if span < 1e-3 { lo.x.min(hi.x) } else { lo.x + (hi.x - lo.x) * (cy - lo.y) / span };
+        // Approaching from the left: was fully left (right vert not past wx), now the right vert reaches
+        // it. Pin the right vert to the wall. Symmetric for the right side. Tunneling (prev fully on one
+        // side, now fully on the other) is caught by these same two tests, so it can't slip through.
+        if prev_x + half_w <= wx && pos.x + half_w > wx {
+            return Some((wx - half_w, -1.0));
+        }
+        if prev_x - half_w >= wx && pos.x - half_w < wx {
+            return Some((wx + half_w, 1.0));
+        }
+        // Already overlapping the wall this frame (spawned inside, or a decayed reclassify): shove out
+        // toward whichever side the fighter was on last frame.
+        if pos.x - half_w < wx && pos.x + half_w > wx {
+            let normal = if prev_x >= wx { 1.0 } else { -1.0 };
+            return Some((wx + normal * half_w, normal));
+        }
+    }
+    None
+}
+
 /// Smallest absolute angle between two headings (radians), in 0..π.
 fn ang_diff(a: f32, b: f32) -> f32 {
     let mut d = (a - b).abs() % (std::f32::consts::TAU);
@@ -376,7 +438,7 @@ pub(crate) fn update_paths(n: &mut SimState, inputs: &[&InputFrame], t: &Tune) {
                     };
                     let mut fresh = InkPath::EMPTY;
                     fresh.kind = tool;
-                    fresh.props = tool_props(tool, t);
+                    fresh.props = t.strokes.get(n.items[holding as usize].stroke); // registry lookup by StrokeId
                     fresh.owner = idx as i8;
                     fresh.drawing = true;
                     // Each stroke draws from the pen's remaining gas (its total ink), not a fresh

@@ -10,7 +10,7 @@ use crate::{
     KNOCKDOWN_LOCK, LEDGE_FALL_EPS, LEDGE_REACH_X, MAX_DRAWN, MAX_ITEMS, PLATFORMS, STAGE_BOTTOM,
     STOP_EPS, WALK_THRESH, WALL_TILT_FRAMES,
     aerial_for, air_drift, airborne, attack_for, do_airdodge, dodge_aim, grab_ledge,
-    ink_floor_y_at, is_special, move_toward, nearest_pickup, out_of_bounds, respawn,
+    ink_floor_y_at, ink_wall_block, is_special, move_toward, nearest_pickup, out_of_bounds, respawn,
     run_special, sign, try_special,
 };
 
@@ -840,6 +840,23 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
                     n.pos.x = p.right;
                     n.vel.x = 0.0;
                 }
+            }
+        }
+    }
+
+    // drawn ink walls: block horizontal like the solid-stage side faces. A near-vertical Wall
+    // segment stops the ECB's leading side vert; a launched (tumbling) body bounces off with
+    // wall_bounce restitution, everyone else dead-stops (reflect e=0). Skipped while hanging a ledge.
+    if !is_ledge(n.state) {
+        for p in paths.iter() {
+            if let Some((px, nx)) = ink_wall_block(p, f.pos.x, n.pos, ECB_HALF_W, ECB_HALF_H) {
+                n.pos.x = px;
+                if n.vel.x * nx < 0.0 {
+                    // moving into the wall: reflect (outward normal (nx,0)); e=0 dead-stops that axis
+                    let e = if n.tumble { t.wall_bounce } else { 0.0 };
+                    n.vel = geo::reflect(n.vel, Vector2::new(nx, 0.0), e);
+                }
+                break;
             }
         }
     }

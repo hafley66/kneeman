@@ -3,7 +3,7 @@
 //! live. Split out of `lib` as plain config -- not sim state, not history.
 
 use crate::physics::{acc, vel};
-use crate::{AttackData, ItemConfig, SpecialMove, StrokeProps, ThrowData};
+use crate::{AttackData, ItemConfig, SpecialMove, StrokeRegistry, ThrowData};
 
 /// Per-character attributes in SOURCE UNITS (units/frame @ 60fps; frames are integers).
 /// This is the canonical character definition; `Tune` (pixel-space) is derived from it.
@@ -159,8 +159,8 @@ pub struct Tune {
     pub kb_hitstun: f32,         // hitstun frames per KB unit (community 0.4: floor(0.4 * KB))
     pub laser: ItemConfig,
     pub bomb: ItemConfig,         // the red gun's arcing explosive (Bob-omb-ish)
-    // drawn ink paths (see the `ink-paths` skill)
-    pub pen: StrokeProps,         // baseline stroke material every drawing tool stamps (panel-editable)
+    // drawn stroke paths
+    pub strokes: StrokeRegistry,  // named stroke-material presets; row 0 = default (panel-editable)
     pub ink_budget: f32,          // total path length (px) a fresh ink item can lay before it's spent
     pub ink_cursor_reach: f32,    // CursorBrush: how far the drawing cursor floats off the body (px)
     pub ink_spawn_weight: f32,    // relative spawn chance of a pen vs the guns (0 = never random-spawns)
@@ -250,7 +250,7 @@ impl Tune {
             kb_hitstun: 0.4,     // community/PM constant: hitstun = floor(0.4 * KB)
             laser: ItemConfig::LASER,
             bomb: ItemConfig::BOMB,
-            pen: StrokeProps::PEN,
+            strokes: StrokeRegistry::DEFAULT,
             ink_budget: 900.0, // ~the main stage width of drawable line per pickup
             ink_cursor_reach: 140.0,
             ink_spawn_weight: 0.6,

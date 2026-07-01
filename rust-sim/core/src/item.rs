@@ -3,7 +3,7 @@
 //! for the slot type carried in `SimState.items`. Pure; re-exported at the crate root.
 
 use crate::{
-    airborne, hurtbox, knockback_units, Fighter, Hitbox, SimState, ToolKind, Tune, Vector2, DT,
+    airborne, hurtbox, knockback_units, Fighter, Hitbox, SimState, StrokeId, ToolKind, Tune, Vector2, DT,
     FLOOR_LEFT, FLOOR_RIGHT, GROUND_Y, HITLAG_PER_DMG, MAX_ITEMS,
 };
 use serde::{Deserialize, Serialize};
@@ -116,6 +116,7 @@ pub struct Item {
     pub timer: i64,
     pub facing: f32,
     pub tool: ToolKind, // which drawing tool, when `kind == Pen` (ignored otherwise)
+    pub stroke: StrokeId, // which StrokeRegistry preset this pen stamps (row 0 = default)
 }
 
 impl Item {
@@ -129,6 +130,7 @@ impl Item {
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen,
+        stroke: 0,
     };
     pub fn active(&self) -> bool {
         !matches!(self.kind, ItemKind::None)
@@ -223,6 +225,7 @@ pub(crate) fn maybe_spawn_item(n: &mut SimState, t: &Tune) {
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen, // todo: roll a random tool when more than one pen ships
+        stroke: 0, // default preset; roll/assign a StrokeId when more materials ship
     };
 }
 
@@ -254,6 +257,7 @@ pub fn spawn_kind(n: &mut SimState, kind: ItemKind, t: &Tune) {
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen,
+        stroke: 0,
     };
 }
 
@@ -322,6 +326,7 @@ pub(crate) fn fire_gun(n: &mut SimState, idx: usize, auto: bool, t: &Tune) {
             timer: cfg.range,
             facing: f.facing,
             tool: ToolKind::TrailPen,
+            stroke: 0,
         };
     }
     n.items[k].gas -= 1.0;

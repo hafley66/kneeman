@@ -320,6 +320,64 @@ fn fighter_lands_and_stands_on_a_drawn_ink_floor() {
 }
 
 #[test]
+fn a_drawn_ink_wall_blocks_horizontal_movement() {
+    let (mut s, t) = settled();
+    let start = s.fighters[0].pos;
+    let wall_x = start.x + 60.0; // just to the right, within a few walk-frames
+    // a near-vertical finalized ink stroke spanning the fighter's torso (feet at start.y, ECB ~140 tall).
+    let mut wall = InkPath::EMPTY;
+    wall.props = StrokeProps::PEN;
+    wall.owner = 0;
+    wall.pts[0] = Vector2::new(wall_x, start.y - 200.0);
+    wall.pts[1] = Vector2::new(wall_x, start.y + 40.0);
+    wall.len = 2;
+    classify(&mut wall);
+    assert_eq!(wall.class[0], SegClass::Wall, "vertical stroke classifies as a wall");
+    s.paths[0] = wall;
+    // walk right into the wall for a while; the ECB right vert (38px) must stop at wall_x.
+    for _ in 0..40 {
+        s = step(&s, &[&press(|i| i.dir = 1.0), &idle()], &t);
+    }
+    let f = &s.fighters[0];
+    assert!(
+        f.pos.x <= wall_x - 38.0 + 1.0,
+        "fighter should be pinned left of the ink wall (wall {wall_x}, got {})",
+        f.pos.x
+    );
+    assert!(f.pos.x > start.x, "but should have walked right up to the wall, not stayed put");
+}
+
+#[test]
+fn stroke_registry_resolves_by_id_and_falls_back_to_default() {
+    let mut reg = StrokeRegistry::DEFAULT;
+    reg.presets[1] = StrokeProps { solid: true, ..StrokeProps::PEN };
+    assert!(reg.get(1).solid, "id 1 resolves to its own preset");
+    assert!(!reg.get(0).solid, "row 0 is the untouched default");
+    assert!(!reg.get(99).solid, "an out-of-range id falls back to the default row");
+}
+
+#[test]
+fn a_pen_stamps_its_registry_preset_onto_the_path() {
+    let (mut s, mut t) = settled();
+    // preset row 2 differs from the default (solid); the pen selects it via StrokeId.
+    t.strokes.presets[2] = StrokeProps { solid: true, ..StrokeProps::PEN };
+    s.fighters[0].holding = 0;
+    s.items[0] = Item {
+        kind: ItemKind::Pen,
+        owner: 0,
+        gas: t.ink_budget,
+        gas_max: t.ink_budget,
+        stroke: 2,
+        ..Item::EMPTY
+    };
+    for _ in 0..20 {
+        s = step(&s, &[&press(|i| { i.attack_held = true; i.dir = 1.0; }), &idle()], &t);
+    }
+    let path = s.paths.iter().find(|p| p.active() && p.owner == 0).expect("pen laid a path");
+    assert!(path.props.solid, "the path should inherit preset 2's material (solid), not the default");
+}
+
+#[test]
 fn holding_a_pen_and_attacking_lays_an_ink_path() {
     let (mut s, t) = settled();
     s.fighters[0].holding = 0;
@@ -356,6 +414,7 @@ fn attack_over_gun_picks_it_up() {
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen,
+        stroke: 0,
     };
     let after = step(&s, &[&press(|i| i.attack = true), &idle()], &t);
     assert_eq!(after.fighters[0].holding, 0, "attack over an unowned gun should pick it up");
@@ -375,6 +434,7 @@ fn grab_over_an_item_picks_it_up() {
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen,
+        stroke: 0,
     };
     let after = step(&s, &[&press(|i| i.grab = true), &idle()], &t);
     assert_eq!(after.fighters[0].holding, 0, "grab over an unowned item should pick it up");
@@ -396,6 +456,7 @@ fn firing_a_held_gun_spawns_a_bolt_and_spends_ammo() {
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen,
+        stroke: 0,
     };
     let after = step(&s, &[&press(|i| i.attack = true), &idle()], &t);
     let bolts = after.items.iter().filter(|x| x.kind == ItemKind::LaserBolt).count();
@@ -418,6 +479,7 @@ fn grab_drops_a_held_gun() {
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen,
+        stroke: 0,
     };
     let after = step(&s, &[&press(|i| i.grab = true), &idle()], &t);
     assert_eq!(after.fighters[0].holding, -1, "grab should drop the held item");

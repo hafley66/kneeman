@@ -426,19 +426,20 @@ fn draw_panel(
                 },
             );
         }
-        egui::CollapsingHeader::new("ink · pen").default_open(false).show(ui, |ui| {
+        egui::CollapsingHeader::new("stroke · default (registry row 0)").default_open(false).show(ui, |ui| {
             c |= slider(ui, &mut t.ink_budget, 100.0..=2000.0, "budget (px of line per pickup)");
             c |= slider(ui, &mut t.ink_spawn_weight, 0.0..=3.0, "spawn weight (0 = never)");
             c |= slider(ui, &mut t.ink_cursor_reach, 40.0..=300.0, "cursor reach (CursorBrush)");
-            let mut node_life = t.pen.node_life as f32;
+            let d = &mut t.strokes.presets[0];
+            let mut node_life = d.node_life as f32;
             if slider(ui, &mut node_life, 30.0..=900.0, "node life (frames before fade)") {
-                t.pen.node_life = node_life as i64;
+                d.node_life = node_life as i64;
                 c = true;
             }
-            c |= slider(ui, &mut t.pen.floor_tol, 0.0..=1.5, "floor tol (rad, ≤ = walkable)");
-            c |= slider(ui, &mut t.pen.wall_tol, 0.0..=1.57, "wall tol (rad, ≥ = wall)");
-            c |= slider(ui, &mut t.pen.ledge_curve, 0.0..=1.57, "ledge curve (rad corner = grabbable)");
-            c |= slider(ui, &mut t.pen.min_seg, 4.0..=60.0, "min segment (px)");
+            c |= slider(ui, &mut d.floor_tol, 0.0..=1.5, "floor tol (rad, ≤ = walkable)");
+            c |= slider(ui, &mut d.wall_tol, 0.0..=1.57, "wall tol (rad, ≥ = wall)");
+            c |= slider(ui, &mut d.ledge_curve, 0.0..=1.57, "ledge curve (rad corner = grabbable)");
+            c |= slider(ui, &mut d.min_seg, 4.0..=60.0, "min segment (px)");
         });
         egui::CollapsingHeader::new("knockback").default_open(false).show(ui, |ui| {
             c |= slider(ui, &mut t.di_max_angle, 0.0..=30.0, "di_max_angle° (survival DI)");

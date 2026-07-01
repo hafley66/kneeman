@@ -220,6 +220,7 @@ pub fn checksum(s: &SimState) -> u128 {
         fold(it.gas_max.to_bits() as u64);
         fold(it.timer as u64);
         fold(it.facing.to_bits() as u64);
+        fold(it.stroke as u64);
     }
     h as u128
 }
