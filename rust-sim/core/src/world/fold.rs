@@ -4,7 +4,7 @@
 //! restarts from a cached World (that is snapshot restore AND compaction). No IO, no clock, no RNG,
 //! deterministic iteration (BTreeMap). The rxjs analogue is `events$.pipe(scan(apply, genesis))`.
 
-use crate::world::{canon, event_id, BuildVersion, EventId, Node, PlayerId, Schema, Seq, WorldEvent};
+use crate::world::{canon, event_id, AssetId, BuildVersion, EventId, Node, PlayerId, Schema, Seq, WorldEvent};
 use serde::{Deserialize, Serialize};
 use crate::{SegClass, Vector2};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -37,6 +37,7 @@ pub struct World {
     pub players: BTreeMap<PlayerId, Player>, // players ARE world state; ink is owned by them
     pub platforms: BTreeMap<EventId, Plat>,
     pub rules: BTreeMap<u16, f32>,
+    pub bg: Option<AssetId>,            // content-addressed background; None = the stage's own backdrop
 }
 
 impl World {
@@ -46,6 +47,7 @@ impl World {
             players: BTreeMap::new(),
             platforms: BTreeMap::new(),
             rules: BTreeMap::new(),
+            bg: None,
         }
     }
 }
@@ -80,6 +82,9 @@ pub fn apply(w: &mut World, n: &Node) {
             if let Some(p) = w.players.get_mut(player) {
                 p.online = false; // keep the entity + their owned geometry; just mark offline
             }
+        }
+        WorldEvent::SetBackground { bg } => {
+            w.bg = *bg; // owner changed the backdrop; last write wins (folded, not the frozen seed)
         }
     }
 }
@@ -284,6 +289,20 @@ mod tests {
         assert_eq!(p.name, "kip"); // display data preserved
         assert_eq!(w.platforms.len(), 1); // logging off is NOT a delete — their ink stays
         assert_eq!(w.platforms.values().next().unwrap().owner, pid); // still owned by them
+    }
+
+    #[test]
+    fn set_background_folds_last_write_wins() {
+        let a = AssetId([1u8; 32]);
+        let b = AssetId([2u8; 32]);
+        let nodes = chain(&[
+            WorldEvent::SetBackground { bg: Some(a) },
+            WorldEvent::SetBackground { bg: Some(b) }, // owner changes it -> newer wins
+        ]);
+        assert_eq!(fold(B, &nodes).bg, Some(b));
+        // clearing back to the stage default is just another event
+        let cleared = chain(&[WorldEvent::SetBackground { bg: Some(a) }, WorldEvent::SetBackground { bg: None }]);
+        assert_eq!(fold(B, &cleared).bg, None);
     }
 
     #[test]
