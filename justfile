@@ -141,10 +141,11 @@ web-deploy: web
 
 godot45 := "$HOME/godot45/Godot.app/Contents/MacOS/Godot"
 
-# build the gdext sim for the web target (release). Needs emsdk sourced + nightly + 4.5 binary.
+# build the gdext sim for the web target (release). The nightly is PINNED by rust-sim/rust-toolchain.toml
+# (no `+nightly` -- that would pull the rolling nightly and defeat the pin). Needs emsdk sourced + 4.5.
 godot-wasm:
     cd {{proj}}/rust-sim && source ~/emsdk/emsdk_env.sh && \
-      GODOT4_BIN="{{godot45}}" cargo +nightly build -p smash_sim -Zbuild-std \
+      GODOT4_BIN="{{godot45}}" cargo build -p smash_sim -Zbuild-std \
       --target wasm32-unknown-emscripten --release
 
 # export the Godot "Web" preset to build/web (runs the 4.5 editor headless), then drop in the push
@@ -163,11 +164,29 @@ godot-deploy: godot-export
     ssh {{vps}} 'nginx -t && systemctl reload nginx'
     @echo "live at https://hafley.codes/game/"
 
-# ship EVERYTHING: rollback-determinism gate, then push the nginx snippets (cache/COOP headers,
-# relay routes) AND compile + export + deploy the game. `vps-deploy` is idempotent, so folding it in
-# means one command never leaves the server config drifting behind the build.
-# Use this (not raw godot-deploy) for any change that touches the sim or netplay path.
-ship: net-test vps-deploy godot-deploy
+# THE deploy. One command: gate, build BOTH artifacts (game wasm + relay binary) here, push
+# everything, restart. Idempotent + cached like a container build, without the daemon:
+#   - cargo's target/ cache rebuilds only what changed (incremental); Cargo.lock pins every dep, so a
+#     clean checkout builds the same bytes -- that's the "reproducible image" part.
+#   - the relay ships as a STATIC musl binary: zero shared-lib deps, runs on the box like a FROM
+#     scratch image. The 1-core/1GB box NEVER compiles; it only receives artifacts + restarts.
+#   - rsync --delete delta-transfers only changed export files; re-running with no changes is a near
+#     no-op (cargo no-ops, rsync sends nothing, restart is the only always-effect).
+# Every step is safe to re-run. This is the whole deploy for the current (nginx-fronted) setup; after
+# the TLS flip (plans/server-flip-runbook.md) the nginx steps drop and the relay serves everything.
+ship: net-test signaling-bin godot-export
+    # 1. static game export (wasm + gzipped assets) -> web root, delta transfer
+    rsync -az --delete {{proj}}/build/web/ {{vps}}:/var/www/smash-godot/
+    # 2. relay binary + its unit + the /game + /rtc nginx snippets
+    scp {{proj}}/signaling/target/x86_64-unknown-linux-musl/release/smash-signaling {{vps}}:/root/.cargo/bin/smash-signaling.new
+    scp {{proj}}/deploy/systemd/smash-signaling.service {{vps}}:/etc/systemd/system/smash-signaling.service
+    scp {{proj}}/deploy/nginx/godot.conf {{proj}}/deploy/nginx/rtc.conf {{vps}}:/etc/nginx/snippets/
+    # 3. atomically swap the binary, restart the relay, reload nginx (config-tested first)
+    ssh {{vps}} 'mv /root/.cargo/bin/smash-signaling.new /root/.cargo/bin/smash-signaling && \
+        systemctl daemon-reload && systemctl restart smash-signaling && \
+        nginx -t && systemctl reload nginx && \
+        echo "relay=$(systemctl is-active smash-signaling)"'
+    @echo "shipped -> https://hafley.codes/game/"
 
 # --- submodules / assets ---
 

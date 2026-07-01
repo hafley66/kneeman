@@ -1,0 +1,9 @@
+# Pin the exact nightly the wasm build uses, so `cargo build -Zbuild-std` produces the same bytes on
+# any machine (the "reproducible base image" without a Dockerfile). rustup auto-installs this exact
+# toolchain on first use. `rust-src` is required for -Zbuild-std; the emscripten target is preloaded
+# so `godot-wasm` doesn't need `rustup target add`. Bump the date deliberately, commit, and every
+# checkout rebuilds identically. (signaling/ is a separate tree on stable + zigbuild, unaffected.)
+[toolchain]
+channel = "nightly-2026-05-18"
+components = ["rust-src", "rustfmt", "clippy"]
+targets = ["wasm32-unknown-emscripten"]
