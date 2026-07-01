@@ -5,6 +5,7 @@ use crate::{
     airborne, move_toward, sign, Action, AttackData, CharState, Fighter, Hitbox, InputFrame, Lane,
     Tune, Vector2, DT,
 };
+use serde::{Deserialize, Serialize};
 
 /// Special states map to a slot in `Tune.specials` (the seed for swappable move loadouts).
 pub(crate) fn special_slot(st: CharState) -> Option<usize> {
@@ -37,7 +38,7 @@ pub(crate) fn special_dir(aim: Vector2) -> usize {
 /// How a special moves the fighter while it runs. The hitbox/frames/knockback live in `hit`
 /// (reuses the whole attack pipeline: `attack_for` -> `active_hitbox` -> `resolve_combat`).
 /// This is the seed for swappable move loadouts: a character's 4 B-slots are just `SpecialMove`s.
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SpecialKind {
     Punch, // planted heavy hit (neutral-B): brakes to a stop, no travel
     Lunge, // forward burst (side-B)
@@ -45,7 +46,7 @@ pub enum SpecialKind {
     Fall,  // downward drive (down-B)
 }
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpecialMove {
     pub kind: SpecialKind,
     pub hit: AttackData, // frames + hitbox + knockback

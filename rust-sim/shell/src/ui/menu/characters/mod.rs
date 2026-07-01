@@ -14,29 +14,35 @@ impl Screen for Charss {
         let n = names.len().max(1) as i64;
         ui.label("Pick each fighter.");
         ui.add_space(6.0);
-        for slot in 0..2usize {
-            let cur = cx.charsel[slot].rem_euclid(n);
-            let name = names.get(cur as usize).map(String::as_str).unwrap_or("?");
-            ui.horizontal(|ui| {
-                ui.label(format!("P{}", slot + 1));
-                if theme.button(ui, "◀").clicked() {
-                    out.push(Intent::SetChar {
-                        slot,
-                        idx: (cur - 1).rem_euclid(n),
-                    });
-                }
-                ui.label(egui::RichText::new(name).strong());
-                if theme.button(ui, "▶").clicked() {
-                    out.push(Intent::SetChar {
-                        slot,
-                        idx: (cur + 1).rem_euclid(n),
-                    });
-                }
-                if theme.button(ui, "Edit").clicked() {
-                    out.push(Intent::Nav(Route::CharEdit { slot: slot as u8 }));
+        // Grid gives buttons in each row defined column rects so egui's geometric directional
+        // focus (arrow keys) can navigate L/R across ◀ ▶ Edit within a row and U/D between rows.
+        egui::Grid::new("charss_slots")
+            .num_columns(5)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                for slot in 0..2usize {
+                    let cur = cx.charsel[slot].rem_euclid(n);
+                    let name = names.get(cur as usize).map(String::as_str).unwrap_or("?");
+                    ui.label(format!("P{}", slot + 1));
+                    if theme.button(ui, "◀").clicked() {
+                        out.push(Intent::SetChar {
+                            slot,
+                            idx: (cur - 1).rem_euclid(n),
+                        });
+                    }
+                    ui.label(egui::RichText::new(name).strong());
+                    if theme.button(ui, "▶").clicked() {
+                        out.push(Intent::SetChar {
+                            slot,
+                            idx: (cur + 1).rem_euclid(n),
+                        });
+                    }
+                    if theme.button(ui, "Edit").clicked() {
+                        out.push(Intent::Nav(Route::CharEdit { slot: slot as u8 }));
+                    }
+                    ui.end_row();
                 }
             });
-        }
     }
 }
 

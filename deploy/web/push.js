@@ -1,4 +1,5 @@
-// Lobby push opt-in. Loaded `defer` so it never blocks the Godot canvas boot.
+// Lobby push opt-in, driven from INSIDE the game (the Network page in the pause menu) instead of a
+// floating DOM chip. Loaded `defer` so it never blocks the Godot canvas boot.
 //
 // Nothing about the deployment is baked in here:
 //   - the VAPID public key is fetched from `/vapid` at runtime (server derives it from its private
@@ -6,12 +7,23 @@
 //   - the API origin is same-origin by default but can be overridden at build/deploy time by setting
 //     window.PUSH_API_BASE (e.g. via the export head_include) for a split-host setup;
 //   - the room comes from the `?room=` query, matching how the game itself reads it.
-
+//
+// The game reads `window.smashPush.label` each frame (while the Network page is open) and calls
+// `window.smashPush.enable()` when the in-menu button is pressed, both via Godot's JavaScriptBridge.
 (() => {
   const API = (window.PUSH_API_BASE || '').replace(/\/$/, ''); // '' => same origin
   const room = new URLSearchParams(location.search).get('room') || 'default';
 
-  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+  // The API the game drives. `label` is the human status the Network page mirrors; `enable` runs the
+  // subscribe flow. Present on every browser so the game can feature-detect off `label`.
+  const api = { label: '', enabled: false, enable };
+  window.smashPush = api;
+
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    api.label = 'push unsupported on this browser';
+    api.enable = () => {};
+    return;
+  }
 
   const b64ToBytes = (s) => {
     const pad = '='.repeat((4 - (s.length % 4)) % 4);
@@ -19,25 +31,16 @@
     return Uint8Array.from(raw, (c) => c.charCodeAt(0));
   };
 
-  // Top-left, tucked just under the in-game status chip (which sits at ~14,10). Keeping it up here
-  // leaves the bottom corners clear for the mobile stick + buttons.
-  const btn = document.createElement('button');
-  btn.textContent = '🔔 ping me on lobby';
-  btn.style.cssText =
-    'position:fixed;left:14px;top:50px;z-index:9999;padding:6px 10px;border:0;border-radius:8px;' +
-    'background:#1b2a4a;color:#cfe0ff;font:600 12px system-ui;cursor:pointer;opacity:.85';
-  const setLabel = (t, off) => { btn.textContent = t; btn.style.opacity = off ? '.5' : '.85'; };
-
   async function enable() {
-    setLabel('…', true);
+    api.label = 'subscribing…';
     try {
       const key = (await (await fetch(`${API}/vapid`)).json()).publicKey;
-      if (!key) { setLabel('push off (server)', true); btn.disabled = true; return; }
+      if (!key) { api.label = 'push off (server has no VAPID key)'; return; }
 
       const reg = await navigator.serviceWorker.register('sw.js'); // scope = /game/
       await navigator.serviceWorker.ready;
 
-      if ((await Notification.requestPermission()) !== 'granted') { setLabel('🔔 ping me on lobby'); return; }
+      if ((await Notification.requestPermission()) !== 'granted') { api.label = 'notifications blocked'; return; }
 
       const sub =
         (await reg.pushManager.getSubscription()) ||
@@ -48,14 +51,14 @@
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ room, subscription: sub.toJSON() }),
       });
-      setLabel(r.ok ? `✅ pinging for '${room}'` : 'subscribe failed', !r.ok);
+      api.label = r.ok ? `pinging for '${room}'` : 'subscribe failed';
+      api.enabled = r.ok;
     } catch (e) {
       console.error('[push]', e);
-      setLabel('push failed', true);
+      api.label = 'push failed';
     }
   }
 
-  btn.addEventListener('click', enable);
   // If already subscribed in this browser, re-register the (possibly new) room silently and reflect it.
   navigator.serviceWorker.getRegistration().then(async (reg) => {
     const sub = reg && (await reg.pushManager.getSubscription());
@@ -65,8 +68,7 @@
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ room, subscription: sub.toJSON() }),
     }).catch(() => {});
-    setLabel(`✅ pinging for '${room}'`);
+    api.label = `pinging for '${room}'`;
+    api.enabled = true;
   });
-
-  addEventListener('DOMContentLoaded', () => document.body.appendChild(btn));
 })();

@@ -1,5 +1,6 @@
 use godot::classes::{
-    Camera2D, HttpRequest, INode, Input, InputEvent, InputEventJoypadButton, InputEventKey, Node,
+    Camera2D, CanvasLayer, HttpRequest, INode, Input, InputEvent, InputEventJoypadButton,
+    InputEventKey, Node,
 };
 use godot::global::{JoyButton, Key};
 use godot::prelude::*;
@@ -8,7 +9,7 @@ use futures_signals::signal::Mutable;
 
 use crate::identity::Identity;
 use crate::kneeman::KneeMan;
-use crate::net::NetDebug;
+use crate::net::{push_enable, push_label, NetDebug};
 use crate::sim::{Action, AttackData, Fighter, Hitbox, SimState, Tune};
 use crate::ui::menu::router::{Intent, MenuCells, Route, Router};
 use crate::ui::themes::{dark, xp::Xp, Theme};
@@ -25,6 +26,11 @@ enum Tab {
     Gamepad,
     Server,
 }
+
+/// Initial delay (s) before dpad direction starts repeating when held.
+const PAD_INITIAL_DELAY_S: f64 = 0.35;
+/// Interval (s) between repeat firings once the initial delay has elapsed.
+const PAD_REPEAT_INTERVAL_S: f64 = 0.10;
 
 /// Hosts the egui bridge and draws "our stuff" panel by reading/writing the KneeMan
 /// BehaviorSubjects. Cmd+Shift+J toggles the panel; Cmd+Shift+R reloads the scene.
@@ -43,7 +49,14 @@ pub struct DebugUi {
     server_status: Mutable<String>,   // latest status body (or a fetching/error message)
     router: Router,                   // XP menu nav state (memory-router); independent of the panel
     menu_esc: bool,                   // an Esc was pressed; the next process() resolves it (deferred)
-    lobbies: Vec<crate::net::LobbyRow>, // shell-held lobby list the Network grid renders (P2: relay feed)
+    lobbies: Vec<crate::net::LobbyRow>, // relay-fed rows for OTHER hosts (P2 feed); never holds the "you" row
+    my_lobby_key: Option<String>,       // room we dialed via Open/Join; the "you" row is DERIVED from (net.phase, this)
+    push_status: String,                // web-push opt-in label mirrored from JS, shown on the Network page
+    // Dpad hold-to-repeat state. Tracks which direction is currently held and drives
+    // synthetic arrow key repeats from process(dt) at PAD_INITIAL_DELAY_S + PAD_REPEAT_INTERVAL_S cadence.
+    pad_held: Option<JoyButton>,
+    pad_hold_secs: f64,
+    pad_repeats_fired: u32,
 }
 
 #[godot_api]
@@ -62,12 +75,20 @@ impl INode for DebugUi {
             router: Router::default(),
             menu_esc: false,
             lobbies: Vec::new(),
+            my_lobby_key: None,
+            push_status: String::new(),
+            pad_held: None,
+            pad_hold_secs: 0.0,
+            pad_repeats_fired: 0,
         }
     }
 
     fn ready(&mut self) {
         let bridge = gdext_egui::EguiBridge::new_alloc();
         bridge.bind().setup_context(|ctx| dark::Dark.install(ctx)); // stylesheet, once
+        // Pin the egui CanvasLayer above the HUD (damage panel = layer 1) and the touch/MENU strip
+        // (layer 50) so the pause menu + its scrim always sit on top instead of under the % boxes.
+        bridge.clone().upcast::<CanvasLayer>().set_layer(100);
         let node = bridge.clone().upcast::<Node>();
         self.base_mut().add_child(&node);
         self.egui = Some(bridge);
@@ -128,9 +149,11 @@ impl INode for DebugUi {
         // Esc drives the XP menu: opens the pause menu in game, else backs out / closes a dialog.
         // Resolved in process() (egui can't be poked here), like the want_status deferral.
         if key.get_keycode() == Key::ESCAPE {
-            // menu open -> back out of it; else if the debug panel is up, Esc closes that.
+            // Menu open: the XP menu consumes Escape itself (in `menu()`), so egui's focus-release
+            // can't swallow it first — nothing to do here. Menu closed: close the debug panel if it's
+            // up, else open the pause menu.
             if self.is_menu_open() {
-                self.menu_esc = true;
+                // handled inside egui
             } else if self.show {
                 self.show = false;
             } else {
@@ -151,7 +174,7 @@ impl INode for DebugUi {
         }
     }
 
-    fn process(&mut self, _dt: f64) {
+    fn process(&mut self, dt: f64) {
         let (Some(bridge), Some(mut fighter)) = (self.egui.clone(), self.fighter.clone()) else {
             return;
         };
@@ -170,12 +193,37 @@ impl INode for DebugUi {
                 charsel: &charsel_cell,
                 net: &net_cell,
             };
-            // resolve a pending Esc BEFORE drawing so the route change shows this frame
+            // resolve a pending Esc BEFORE drawing so the route change shows this frame;
+            // clear held dpad state so repeat timers don't fire after the menu closes.
             if std::mem::take(&mut self.menu_esc) {
+                self.pad_held = None;
+                self.pad_hold_secs = 0.0;
+                self.pad_repeats_fired = 0;
                 self.router.apply(vec![Intent::Esc], &cells);
             }
+            // Drive dpad hold-to-repeat: inject synthetic arrow key events so egui
+            // processes them in this frame's begin_pass before the menu is drawn.
+            if self.is_menu_open() {
+                self.tick_pad_repeat(dt);
+            }
+            // Mirror the JS push status into the menu while the Network page is open (skip the JS
+            // bridge call on every other screen). No-op/empty on the native build.
+            if matches!(self.router.location().base, Route::Network) {
+                self.push_status = push_label();
+            }
             let mut out: Vec<Intent> = Vec::new();
-            crate::ui::menu::menu(&ctx, &Xp, &mut self.router, &cells, &self.lobbies, &mut out);
+            // Derive the grid rows fresh each frame: relay-fed rows + a "you" row synthesized from the
+            // live net phase, so going offline drops it (no persisted phantom).
+            let display_lobbies = self.display_lobbies(net_cell.get().phase);
+            crate::ui::menu::menu(
+                &ctx,
+                &Xp,
+                &mut self.router,
+                &cells,
+                &display_lobbies,
+                &self.push_status,
+                &mut out,
+            );
             // Intercept the shell-driven intents before Router::apply so the pure router never sees
             // them: OpenDebugPanel toggles this panel; Find/LeaveMatch drive KneeMan's netplay; the
             // lobby intents mutate the shell-held `self.lobbies` (local UI state, not the transport).
@@ -205,6 +253,10 @@ impl INode for DebugUi {
                     join_key = Some(key.clone());
                     false
                 }
+                Intent::PushSubscribe => {
+                    push_enable(); // JS bridge (web-only); fires the browser permission prompt
+                    false
+                }
                 _ => true,
             });
             if open_panel {
@@ -215,15 +267,17 @@ impl INode for DebugUi {
             }
             if leave_match {
                 fighter.bind_mut().leave_match();
+                self.my_lobby_key = None; // dropping the transport drops the derived "you" row
             }
             // Lobby = a named relay room. Opening hosts the versioned room AND shows a local grid row;
             // both actions just dial `matchmake_room`, so two clients on the same key pair over the
             // existing 1v1 transport. The mock `active` count bump is gone (no more self-join inflation).
             if let Some(key) = open_lobby_key {
-                self.open_lobby(&key);
+                self.my_lobby_key = Some(key.clone());
                 fighter.bind_mut().matchmake_room(&key);
             }
             if let Some(key) = join_key {
+                self.my_lobby_key = Some(key.clone());
                 fighter.bind_mut().matchmake_room(&key);
             }
             self.router.apply(out, &cells);
@@ -279,25 +333,76 @@ impl DebugUi {
         self.menu_esc = true;
     }
 
-    /// Map one gamepad button to a synthetic key event and re-inject it via Godot's input queue, so
-    /// egui's own focus navigation (and this handler's Esc) drive the pause menu: dpad down/up =
-    /// Tab / Shift+Tab (focus next/prev), A = Enter (activate), B = Esc (back one level).
+    /// Handle a gamepad button event while the pause menu is open.
+    ///
+    /// Presses: dpad directions start hold tracking and emit the initial arrow key event;
+    ///   A emits Enter (activate focused widget); B sets menu_esc (back one level, no synthetic
+    ///   Esc injected so egui never clears focus inadvertently).
+    /// Releases: clear the held direction so repeat timers stop.
+    /// Echo events are ignored (Godot joypad buttons do not echo; guard is defensive).
     fn gamepad_menu_nav(&mut self, pad: Gd<InputEventJoypadButton>) {
-        if !pad.is_pressed() || pad.is_echo() {
-            return;
+        let btn = pad.get_button_index();
+        if pad.is_pressed() && !pad.is_echo() {
+            match btn {
+                JoyButton::DPAD_DOWN | JoyButton::DPAD_UP
+                | JoyButton::DPAD_LEFT | JoyButton::DPAD_RIGHT => {
+                    self.pad_held = Some(btn);
+                    self.pad_hold_secs = 0.0;
+                    self.pad_repeats_fired = 0;
+                    Self::emit_nav_arrow(btn);
+                }
+                JoyButton::A => Self::emit_key(Key::ENTER),
+                JoyButton::B => { self.menu_esc = true; }
+                _ => {}
+            }
+        } else if !pad.is_pressed() {
+            if matches!(btn, JoyButton::DPAD_DOWN | JoyButton::DPAD_UP
+                            | JoyButton::DPAD_LEFT | JoyButton::DPAD_RIGHT)
+                && self.pad_held == Some(btn)
+            {
+                self.pad_held = None;
+                self.pad_hold_secs = 0.0;
+                self.pad_repeats_fired = 0;
+            }
         }
-        let (keycode, shift) = match pad.get_button_index() {
-            JoyButton::DPAD_DOWN | JoyButton::DPAD_RIGHT => (Key::TAB, false),
-            JoyButton::DPAD_UP | JoyButton::DPAD_LEFT => (Key::TAB, true),
-            JoyButton::A => (Key::ENTER, false),
-            JoyButton::B => (Key::ESCAPE, false),
+    }
+
+    /// Advance the hold-repeat timer by `dt` seconds and fire synthetic arrow key events for
+    /// any repeat intervals that have elapsed. Called from process() while the menu is open.
+    fn tick_pad_repeat(&mut self, dt: f64) {
+        let Some(btn) = self.pad_held else { return; };
+        self.pad_hold_secs += dt;
+        let due: u32 = if self.pad_hold_secs < PAD_INITIAL_DELAY_S {
+            0
+        } else {
+            1 + ((self.pad_hold_secs - PAD_INITIAL_DELAY_S) / PAD_REPEAT_INTERVAL_S) as u32
+        };
+        let to_fire = due.saturating_sub(self.pad_repeats_fired);
+        for _ in 0..to_fire {
+            Self::emit_nav_arrow(btn);
+            self.pad_repeats_fired += 1;
+        }
+    }
+
+    /// Inject a synthetic arrow key event (pressed=true) for a dpad direction. egui reads arrow
+    /// keys as directional FocusDirection (Up/Down/Left/Right), enabling 2D geometric focus nav.
+    fn emit_nav_arrow(btn: JoyButton) {
+        let key = match btn {
+            JoyButton::DPAD_DOWN => Key::DOWN,
+            JoyButton::DPAD_UP => Key::UP,
+            JoyButton::DPAD_LEFT => Key::LEFT,
+            JoyButton::DPAD_RIGHT => Key::RIGHT,
             _ => return,
         };
-        let mut key = InputEventKey::new_gd();
-        key.set_keycode(keycode);
-        key.set_pressed(true);
-        key.set_shift_pressed(shift);
-        Input::singleton().parse_input_event(&key);
+        Self::emit_key(key);
+    }
+
+    /// Inject a synthetic key-press event into Godot's input pipeline (feeds the egui bridge).
+    fn emit_key(keycode: Key) {
+        let mut ev = InputEventKey::new_gd();
+        ev.set_keycode(keycode);
+        ev.set_pressed(true);
+        Input::singleton().parse_input_event(&ev);
     }
 
     /// Kick off a GET of the relay's /status page (the server-status tab's refresh button).
@@ -330,19 +435,25 @@ impl DebugUi {
         format!("lobby-{}", crate::rtc::BUILD_HASH)
     }
 
-    /// Host a lobby for the current build version: add the local "you" grid row (idempotent). The
-    /// actual transport (dialing the room) is done by the caller via `KneeMan::matchmake_room`.
-    fn open_lobby(&mut self, key: &str) {
-        if self.lobbies.iter().any(|l| l.host == "you") {
-            return;
+    /// Rows the Network grid renders: the relay-fed OTHER hosts (`self.lobbies`) with the "you" row
+    /// DERIVED from live net state prepended. The you-row exists only while `net.phase != "offline"`
+    /// and we hold a dialed key -- so a dropped connection removes it instead of leaving a phantom
+    /// "Joined" row (the old bug: a persisted row that never cleared when we went offline).
+    fn display_lobbies(&self, phase: &str) -> Vec<crate::net::LobbyRow> {
+        let mut rows = Vec::with_capacity(self.lobbies.len() + 1);
+        if phase != "offline" {
+            if let Some(key) = &self.my_lobby_key {
+                rows.push(crate::net::LobbyRow {
+                    key: key.clone(),
+                    host: "you".into(),
+                    active: if phase == "running" { 2 } else { 1 },
+                    cap: crate::sim::MAX_PLAYERS as u8,
+                    empty_since_ms: None,
+                });
+            }
         }
-        self.lobbies.push(crate::net::LobbyRow {
-            key: key.into(),
-            host: "you".into(),
-            active: 1,
-            cap: crate::sim::MAX_PLAYERS as u8,
-            empty_since_ms: None,
-        });
+        rows.extend(self.lobbies.iter().cloned());
+        rows
     }
 }
 
@@ -494,9 +605,9 @@ fn draw_panel(
             c |= slider(ui, &mut t.ink_spawn_weight, 0.0..=3.0, "spawn weight (0 = never)");
             c |= slider(ui, &mut t.ink_cursor_reach, 40.0..=300.0, "cursor reach (CursorBrush)");
             let d = &mut t.strokes.presets[0];
-            let mut node_life = d.node_life as f32;
-            if slider(ui, &mut node_life, 30.0..=900.0, "node life (frames before fade)") {
-                d.node_life = node_life as i64;
+            let mut stroke_life = d.stroke_life as f32;
+            if slider(ui, &mut stroke_life, 30.0..=900.0, "stroke life (frames before it exits)") {
+                d.stroke_life = stroke_life as i64;
                 c = true;
             }
             c |= slider(ui, &mut d.floor_tol, 0.0..=1.5, "floor tol (rad, ≤ = walkable)");

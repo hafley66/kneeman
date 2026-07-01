@@ -14,6 +14,9 @@ use crate::{
     run_special, sign, try_special,
 };
 
+/// Downhill pull (px/s² of horizontal accel) applied while grounded on a sloped ink Floor whose tilt
+/// exceeds the stroke's `floor_tol`. Flat floors (tilt ≤ floor_tol) don't slide, so you just stand.
+const SLOPE_SLIDE_ACCEL: f32 = 900.0;
 
 /// Advance ONE fighter by one frame from its own input: buffer, state machine, integrate +
 /// stage collision. No cross-fighter combat (that is `resolve_combat`). Mutates in place.
@@ -63,6 +66,7 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
         n.pos += n.vel * DT;
         n.vel.x = move_toward(n.vel.x, 0.0, DUMMY_FRICTION * DT);
         let mut landed = false;
+        let mut impact_vy = 0.0; // descending speed at floor contact, captured before the clamp zeroes it
         let over_stage = n.pos.x >= FLOOR_LEFT && n.pos.x <= FLOOR_RIGHT;
         if n.pos.y < GROUND_Y || !over_stage {
             // arc back down; keep falling past the edge when off the stage (no invisible floor —
@@ -71,6 +75,7 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
         } else {
             if was_air {
                 landed = true; // crossed into the floor this frame
+                impact_vy = n.vel.y; // remember the spike speed for the floor-bounce check below
             }
             n.pos.y = GROUND_Y;
             n.vel.y = 0.0;
@@ -112,6 +117,15 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
             n.wall_hit -= 1;
         }
         n.hitstun -= 1;
+
+        // spiked into the floor mid-launch: a fast downward tumble (dair stomp) rebounds instead of
+        // landing, mirroring the airborne funny-bounce (see the platform/ink branches below) so an
+        // in-match dair stomp bounces the victim off the floor rather than dead-stopping to knockdown.
+        if landed && n.tumble && impact_vy > t.tumble_speed {
+            n.pos.y = GROUND_Y;
+            n.vel.y = -impact_vy * t.floor_bounce; // still launched + tumbling; hitstun keeps ticking
+            landed = false; // consumed the landing as a bounce; skip the tech/knockdown resolution
+        }
 
         // hard launch hitting the floor: tech it (intangible recovery) or eat a knockdown.
         if landed && n.tumble {
@@ -817,6 +831,20 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
             (false, Some(y)) => {
                 n.pos.y = y;
                 n.vel.y = 0.0;
+                // Downslope slide: sample the surface just ahead/behind for its local tilt. Past the
+                // stroke's floor_tol the fighter is pulled downhill (accel toward the lower side); a
+                // flat floor (tilt ≤ floor_tol) adds nothing, so you stand. `sign(dy)` is the downhill
+                // x-direction (y grows downward, so a surface that drops to the right slides you right).
+                let eps = 6.0;
+                if let (Some(ya), Some(yb)) =
+                    (ink_floor_y_at(&p, n.pos.x - eps), ink_floor_y_at(&p, n.pos.x + eps))
+                {
+                    let dy = yb - ya;
+                    let tilt = dy.atan2(2.0 * eps).abs();
+                    if tilt > p.props.floor_tol {
+                        n.vel.x += dy.signum() * SLOPE_SLIDE_ACCEL * DT;
+                    }
+                }
             }
             _ => {
                 n.state = CharState::Air;

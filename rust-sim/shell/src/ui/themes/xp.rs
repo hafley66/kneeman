@@ -20,7 +20,7 @@ pub struct Xp;
 
 impl super::Theme for Xp {
     fn window(&self, ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-        frame_window(ctx, title, Order::Middle, add);
+        frame_window(ctx, "xp_win", title, Order::Middle, add);
     }
 
     fn dialog(&self, ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui)) {
@@ -33,7 +33,7 @@ impl super::Theme for Xp {
                 ui.painter()
                     .rect_filled(screen, 0.0, Color32::from_black_alpha(120));
             });
-        frame_window(ctx, title, Order::Foreground, add);
+        frame_window(ctx, "xp_dialog", title, Order::Foreground, add);
     }
 
     fn button(&self, ui: &mut egui::Ui, label: &str) -> egui::Response {
@@ -47,8 +47,11 @@ impl super::Theme for Xp {
 
 /// A centered XP window at the given layer: beige body, blue border, rounded top, captioned bar.
 /// Body text is forced dark so labels read on the beige face despite the global dark Visuals.
-fn frame_window(ctx: &egui::Context, title: &str, order: Order, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Area::new(egui::Id::new(("xp_win", title)))
+///
+/// `area_id` is a stable string key for the egui Area; it must NOT include the route title so
+/// that widget IDs remain stable across route changes (otherwise focus resets on every nav).
+fn frame_window(ctx: &egui::Context, area_id: &'static str, title: &str, order: Order, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Area::new(egui::Id::new(area_id))
         .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .order(order)
         .show(ctx, |ui| {

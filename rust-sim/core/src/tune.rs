@@ -4,6 +4,7 @@
 
 use crate::physics::{acc, vel};
 use crate::{AttackData, ItemConfig, SpecialMove, StrokeRegistry, ThrowData, ThrowItem};
+use serde::{Deserialize, Serialize};
 
 /// Per-character attributes in SOURCE UNITS (units/frame @ 60fps; frames are integers).
 /// This is the canonical character definition; `Tune` (pixel-space) is derived from it.
@@ -94,7 +95,7 @@ impl CharData {
 
 /// Live "feel" config in PIXEL SPACE (egui sliders write this). Derived from CharData by the
 /// unit conversion; jump velocities are negative (up). Separate from SimState: tuning, not history.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Serialize, Deserialize)]
 pub struct Tune {
     pub gravity: f32,
     pub max_fall: f32,

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// Per-item-kind config (spawn rate + behavior + model). Lives in Tune so the panel edits it live.
 /// `hit` reuses AttackData for the projectile's damage/knockback (startup/active/recovery unused).
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Serialize, Deserialize)]
 pub struct ItemConfig {
     pub spawn_weight: f32, // relative spawn chance vs other kinds (0 = never spawns)
     pub ammo: i64,         // shots a fresh gun carries
@@ -68,7 +68,7 @@ impl ItemConfig {
 /// `hit` the armed item deals to a non-thrower it touches. Lives in Tune so the panel edits it live.
 /// Knockback runs through the same `knockback_units` formula as a fighter's hitboxes, so the box's
 /// `bkb`/`kbg`/`angle` give "any amount of knockback" the user wants.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Serialize, Deserialize)]
 pub struct ThrowItem {
     pub fwd_speed: f32,  // px/s launched forward (toward facing)
     pub back_speed: f32, // px/s launched behind

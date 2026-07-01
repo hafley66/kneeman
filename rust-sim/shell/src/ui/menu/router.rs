@@ -164,6 +164,7 @@ pub struct MenuCtx<'a> {
     pub route: Route,
     pub net: &'a NetDebug, // transport snapshot for the Network page
     pub lobbies: &'a [crate::net::LobbyRow], // shell-held lobby list for the Network page's grid
+    pub push_status: &'a str, // web-push opt-in status ("pinging for '<room>'"), mirrored from JS
 }
 
 /// The writable cells the effect layer drains into. Borrowed from KneeMan for the frame.
@@ -196,6 +197,8 @@ pub enum Intent {
     /// the current version; `JoinLobby` dials an existing one by its key. Wired to the mesh in P2.
     OpenLobby,
     JoinLobby(String),
+    /// Web-push opt-in (shell-intercepted): the shell calls the JS bridge to run the subscribe flow.
+    PushSubscribe,
 }
 
 /// Wraps the pure [`Nav`] and interprets [`Intent`]s: nav edges go through `Nav::reduce`, app edges
@@ -239,7 +242,8 @@ impl Router {
             | Intent::FindMatch
             | Intent::LeaveMatch
             | Intent::OpenLobby
-            | Intent::JoinLobby(_) => {}
+            | Intent::JoinLobby(_)
+            | Intent::PushSubscribe => {}
         }
     }
 

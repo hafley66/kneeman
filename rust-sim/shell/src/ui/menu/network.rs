@@ -86,6 +86,27 @@ impl Screen for Network {
             }
         });
 
+        // Lobby push opt-in (moved off the floating DOM chip into the menu). Web-only: on native the
+        // status stays empty and the subscribe is a no-op. Tapping it fires the browser permission
+        // prompt; once subscribed the relay pings this device when someone parks in the room.
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let label = if cx.push_status.starts_with("pinging") {
+                "🔔 Re-subscribe to lobby pings"
+            } else {
+                "🔔 Ping me when a lobby opens"
+            };
+            if theme.button(ui, label).clicked() {
+                out.push(Intent::PushSubscribe);
+            }
+            if !cx.push_status.is_empty() {
+                let good = cx.push_status.starts_with("pinging");
+                let col = if good { Color32::from_rgb(120, 200, 130) } else { Color32::from_rgb(230, 180, 70) };
+                let prefix = if good { "✅ " } else { "" };
+                ui.label(RichText::new(format!("{prefix}{}", cx.push_status)).color(col));
+            }
+        });
+
         ui.add_space(12.0);
         ui.label(RichText::new("Lobbies").strong());
         ui.add_space(4.0);

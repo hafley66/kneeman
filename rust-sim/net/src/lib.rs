@@ -7,6 +7,8 @@
 //! and compares state checksums. Any non-determinism in `step` makes it return MismatchedChecksum
 //! and the test fails. Run it after touching the sim.
 
+pub mod lobby;
+
 use bitflags::bitflags;
 use ggrs::{Config, GgrsRequest, PlayerType, PredictRepeatLast, SessionBuilder, SyncTestSession};
 use serde::de::DeserializeOwned;

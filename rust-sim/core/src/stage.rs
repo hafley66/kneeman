@@ -94,25 +94,30 @@ pub enum SegClass {
 /// (and is editable per-tool via `DrawTool::props`).
 #[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StrokeProps {
-    pub node_life: i64,   // frames each NODE survives once laid (the "nodes go away after time N" decay)
+    pub stroke_life: i64, // frames the whole stroke survives after it's FINISHED, then it exits at once
     pub floor_tol: f32,   // |slope angle| ≤ this ⇒ Floor (radians)
     pub wall_tol: f32,    // |slope angle| ≥ this ⇒ Wall (radians)
     pub ledge_curve: f32, // Δangle between adjacent segments at a Floor tip ≥ this ⇒ grabbable Ledge
     pub min_seg: f32,     // segments shorter than this (px) classify as None
     pub bounce: f32,      // wall restitution if `solid`
     pub solid: bool,      // true = blocks all sides; false = soft (land from above, drop through w/ down)
+    pub force_wall: bool, // classify EVERY segment as Wall (ignore slope) — a pure wall pen, no hollow bits
 }
 
 impl StrokeProps {
-    /// Baseline pen: soft platform with grabbable lips, fades a few seconds after each node is laid.
+    /// Baseline pen: a SOLID draw-everything pen. Classifies by slope — flat is Floor (stand on it),
+    /// near-vertical is Wall (blocks), the middle band is a sloped Floor (stand/slide, never a hole).
+    /// `solid` means you land on it and never fade/drop through. The stroke exits a few seconds after
+    /// finish. No segment is left as an empty None surface, so the whole stroke is a real collision face.
     pub const PEN: Self = Self {
-        node_life: 240, // ~4s at 60fps before a node fades
-        floor_tol: 0.55, // ~31° — walkable
-        wall_tol: 1.20,  // ~69° — wall
+        stroke_life: 240, // ~4s at 60fps after the stroke is finished, then it vanishes whole
+        floor_tol: 0.55, // ~31° — flat enough to just stand
+        wall_tol: 1.20,  // ~69° — steep enough to be a blocking wall
         ledge_curve: 0.7, // ~40° corner makes a lip grabbable
         min_seg: 10.0,
         bounce: 0.4,
-        solid: false, // soft + grabbable lips (the chosen default)
+        solid: true,       // solid surface: land on it, never fade/drop through
+        force_wall: false, // classify by slope (flat Floor / steep Wall / mid sloped Floor)
     };
 }
 
@@ -294,18 +299,23 @@ pub fn classify(p: &mut InkPath) {
     if n < 2 {
         return;
     }
-    // base pass: each segment is Floor / Wall / None by its own slope.
+    // base pass: each segment is Floor / Wall / None by its own slope. A `force_wall` stroke (the wall
+    // pen) skips the slope test entirely — every real segment is Wall, so there are no hollow bits and
+    // no grabbable lips (the ledge pass below is a no-op since nothing classifies as Floor).
     for s in 0..n - 1 {
         let d = p.pts[s + 1] - p.pts[s];
         let slope = d.y.atan2(d.x.abs()).abs();
         p.class[s] = if d.length() < p.props.min_seg {
             SegClass::None
-        } else if slope <= p.props.floor_tol {
-            SegClass::Floor
+        } else if p.props.force_wall {
+            SegClass::Wall
         } else if slope >= p.props.wall_tol {
             SegClass::Wall
         } else {
-            SegClass::None // a ramp too steep to stand on but not vertical: slide-off, no surface
+            // Flat OR mid-slope: a Floor either way. Flat you stand on; a ramp between floor_tol and
+            // wall_tol is a sloped Floor you stand/slide on — NOT a hole. `floor_tol` now only splits
+            // "flat" from "sloped" for the slide accel (see the grounded-ink branch), not floor vs void.
+            SegClass::Floor
         };
     }
     // ledge pass: a Floor segment whose join to the NEXT segment turns sharply (a corner, not a smooth
@@ -473,25 +483,17 @@ pub(crate) fn update_paths(n: &mut SimState, inputs: &[&InputFrame], t: &Tune) {
         }
     }
 
-    // per-node decay: the oldest nodes fade first ("nodes go away after time N"); reclassify a
-    // finalized path whose geometry changed, and free a slot that emptied out.
+    // whole-stroke decay: a FINISHED stroke lives `stroke_life` frames past its last-laid node, then
+    // exits all at once (the shell shows the countdown above it). Still-drawing strokes and baked
+    // stage strokes (owner < 0) never expire. The timer is anchored on the newest node's birth, so it
+    // starts counting from the moment the owner stops extending the stroke.
     for p in n.paths.iter_mut() {
-        if !p.active() || p.owner < 0 {
-            continue; // owner<0 = baked stage stroke: permanent, classified at load
+        if !p.active() || p.owner < 0 || p.drawing {
+            continue;
         }
-        let before = p.len;
-        let life = p.props.node_life as u64;
-        let mut dead = 0;
-        while (dead as usize) < p.len as usize && tick.saturating_sub(p.born[dead as usize]) > life {
-            dead += 1;
-        }
-        if dead > 0 {
-            p.trim_front(dead);
-        }
-        if p.len == 0 {
+        let newest = p.born[p.len as usize - 1];
+        if tick.saturating_sub(newest) > p.props.stroke_life as u64 {
             *p = InkPath::EMPTY;
-        } else if p.len != before && !p.drawing {
-            classify(p);
         }
     }
 }

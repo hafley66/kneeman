@@ -5,15 +5,15 @@ use godot::classes::web_socket_peer::State as WsState;
 use godot::classes::{
     AnimatedSprite2D, Button, Camera2D, CanvasLayer, ColorRect, Gradient, GradientTexture2D,
     HttpRequest, INode2D, Input, InputEvent, InputEventScreenDrag, InputEventScreenTouch, Label,
-    Node2D, Panel, Polygon2D, StyleBoxFlat, TextureRect, WebRtcDataChannel, WebRtcPeerConnection,
-    WebSocketPeer,
+    Node2D, Panel, Polygon2D, StyleBoxFlat, TextureRect, ThemeDb, WebRtcDataChannel,
+    WebRtcPeerConnection, WebSocketPeer,
 };
 use godot::prelude::*;
 
 use crate::identity::{load_identity, save_identity, slot_color, slot_name, Identity};
 use crate::net::{
-    chan_name, conn_name, decode_state, encode_state, gather_name, mint_room_code, now_ms,
-    signal_name, ws_name, NetDebug,
+    chan_name, conn_name, decode_state, decode_tune, encode_state, encode_tune, gather_name,
+    mint_room_code, now_ms, signal_name, ws_name, NetDebug,
 };
 use crate::roster::roster;
 use crate::rtc::{self, Role, RtcSocket};
@@ -291,6 +291,7 @@ pub struct KneeMan {
     room: Option<Room>,                        // match's room identity; survives a drop so we can rejoin
     resume_snapshot: Option<SimState>,         // sim state captured at a drop, to resume the rebuilt session from
     got_resume: bool,                          // guest: received the host's resume snapshot this reconnect
+    got_tune: bool,                            // guest: adopted the host's authoritative ruleset (Tune) this match
 
     // --- version compatibility (build-hash ping; see rtc::BUILD_HASH) ---
     http: Option<Gd<HttpRequest>>,             // refetches the relay /status on refocus to spot a stale build
@@ -347,6 +348,7 @@ impl INode2D for KneeMan {
             room: None,
             resume_snapshot: None,
             got_resume: false,
+            got_tune: false,
             http: None,
             peer_build: None,
             stale_build: false,
@@ -479,20 +481,24 @@ impl INode2D for KneeMan {
     }
 
     fn physics_process(&mut self, _delta: f64) {
-        // MENU pause freezes the sim locally. Netplay (Running) keeps advancing so ggrs
-        // doesn't stall the session; a synced pause needs a dedicated pause-input.
+        // MENU pause freezes the LOCAL sim, but a live netplay handshake/session must keep pumping:
+        // a lobby opened from the Network page (menu still up) has to finish connecting, and a running
+        // match can't stall ggrs. The old early-return here skipped pump_signaling while paused, so a
+        // lobby dialed with the menu open parked at the relay forever and neither side ever joined.
         let menu_open = self.debug_ui.as_ref().map(|d| d.bind().is_menu_open()).unwrap_or(false);
-        if menu_open && self.phase != Phase::Running {
-            self.update_status();
+        if menu_open {
             self.update_touch(); // still runs while paused so the touch UI hides behind the menu
-            return;
         }
         match self.phase {
-            Phase::Offline => self.step_local(),
+            Phase::Offline => {
+                if !menu_open {
+                    self.step_local();
+                }
+            }
             // Keep rendering local play while the WebRTC handshake completes, then flip to rollback.
             Phase::Signaling => {
                 self.pump_signaling();
-                if self.phase != Phase::Running {
+                if self.phase != Phase::Running && !menu_open {
                     self.step_local();
                 }
             }
@@ -511,7 +517,7 @@ impl INode2D for KneeMan {
                     if expired {
                         godot_print!("netplay: reconnect window elapsed — turning off");
                         self.reset_offline();
-                    } else {
+                    } else if !menu_open {
                         self.step_local();
                     }
                 }
@@ -874,6 +880,36 @@ impl INode2D for KneeMan {
                 };
                 self.base_mut().draw_line_ex(a, b, col).width(width).done();
             }
+
+            // Countdown tag: a FINISHED drawn stroke (owner >= 0, not still being laid) shows how many
+            // seconds until it exits, as a small superscript box above its highest node. Baked stage
+            // strokes (owner < 0) are permanent and get no tag. Drawn in this ink pass = background z.
+            if !p.drawing && p.owner >= 0 {
+                let remaining = p.props.stroke_life - s.tick.saturating_sub(p.born[n - 1]) as i64;
+                if remaining > 0 {
+                    let top = (0..n)
+                        .map(|k| p.pts[k])
+                        .reduce(|a, b| if a.y <= b.y { a } else { b })
+                        .unwrap_or(p.pts[0]);
+                    let secs = remaining as f32 / 60.0;
+                    let text = format!("{secs:.1}s");
+                    let fs = 14;
+                    let pos = gv(top) - origin - Vector2::new((text.len() as f32) * fs as f32 * 0.3, 14.0);
+                    let box_w = text.len() as f32 * fs as f32 * 0.62 + 8.0;
+                    let box_tl = pos + Vector2::new(-4.0, -(fs as f32));
+                    self.base_mut().draw_rect(
+                        Rect2::new(box_tl, Vector2::new(box_w, fs as f32 + 5.0)),
+                        Color::from_rgba(0.05, 0.08, 0.12, 0.6),
+                    );
+                    if let Some(font) = ThemeDb::singleton().get_fallback_font() {
+                        self.base_mut()
+                            .draw_string_ex(&font, pos, &text)
+                            .font_size(fs)
+                            .modulate(Color::from_rgba(0.7, 0.9, 1.0, 0.85))
+                            .done();
+                    }
+                }
+            }
         }
 
         // Overhead gas meter: while a fighter holds an item, a tiny bar over the head shows its
@@ -1187,6 +1223,7 @@ impl KneeMan {
         self.room = Some(Room { code: key.to_string(), deadline_ms: None });
         self.resume_snapshot = None;
         self.got_resume = false;
+        self.got_tune = false;
         if !self.dial(Some(key)) {
             self.room = None;
             return;
@@ -1201,6 +1238,7 @@ impl KneeMan {
         self.room = None;
         self.resume_snapshot = None; // fresh match starts from spawn, not a stale snapshot
         self.got_resume = false;
+        self.got_tune = false;
         if !self.dial(None) {
             return;
         }
@@ -1272,11 +1310,15 @@ impl KneeMan {
             if ch.get_ready_state() == ChannelState::OPEN && self.net.is_none() {
                 // On reconnect the guest must hold until the host's resume snapshot lands, or the two
                 // rebuilt sessions would start from different states. First match (or host) has nothing
-                // to wait for.
+                // to wait for there.
                 let waiting_for_resume = self.phase == Phase::Reconnecting
                     && self.role == Some(Role::Guest)
                     && !self.got_resume;
-                if !waiting_for_resume {
+                // Every match: the guest also holds until the host's ruleset (Tune) lands, so both
+                // reducers build from identical physics. The host has nothing to wait for (it's the
+                // authority + sender).
+                let waiting_for_tune = self.role == Some(Role::Guest) && !self.got_tune;
+                if !waiting_for_resume && !waiting_for_tune {
                     self.begin_session();
                 }
             }
@@ -1340,6 +1382,16 @@ impl KneeMan {
                     self.got_resume = true;
                 }
             }
+            // Host's authoritative ruleset: adopt it for this match so both reducers run identical
+            // physics. Overwrites our local (possibly Feel-edited) Tune; `got_tune` releases the
+            // guest's begin_session gate.
+            "tune" => {
+                let b64 = rtc::dget_str(&d, "tune");
+                if let Some(t) = decode_tune(&b64) {
+                    self.tune.set(t);
+                    self.got_tune = true;
+                }
+            }
             "bye" => self.reset_offline(),
             _ => {}
         }
@@ -1395,6 +1447,17 @@ impl KneeMan {
                     ws.send_text(&rtc::to_json(&d));
                 }
             }
+            // Host is authoritative on the ruleset: ship our Tune so the guest's reducer runs identical
+            // physics. This is what makes custom rulesets survive netplay instead of each side silently
+            // using its own Feel-edited Tune (same inputs + different Tune = desync).
+            {
+                let mut d = VarDictionary::new();
+                d.set("kind", "tune");
+                d.set("tune", encode_tune(&self.tune.get()));
+                if let Some(mut ws) = self.ws.clone() {
+                    ws.send_text(&rtc::to_json(&d));
+                }
+            }
             if let Some(mut pc) = self.pc.clone() {
                 pc.create_offer();
             }
@@ -1402,8 +1465,9 @@ impl KneeMan {
         godot_print!("netplay: matched as {role:?}");
     }
 
-    /// Channel is open: hand it to a fresh ggrs session and flip to Running. Both peers MUST share
-    /// the same Tune (default here); editing it mid-match would desync.
+    /// Channel is open: hand it to a fresh ggrs session and flip to Running. Both peers build from the
+    /// SAME Tune — the host's, which the guest adopted over the "tune" handshake before this gate
+    /// opened — so the reducers run identical physics. Editing Tune mid-match would still desync.
     fn begin_session(&mut self) {
         let Some(role) = self.role else { return };
         let (local_handle, remote) = role.handles();
@@ -1444,6 +1508,7 @@ impl KneeMan {
         self.room = None;
         self.resume_snapshot = None;
         self.got_resume = false;
+        self.got_tune = false;
         self.phase = Phase::Offline;
         godot_print!("netplay: offline");
     }
@@ -1483,6 +1548,7 @@ impl KneeMan {
             .map(|n| *n.state())
             .or_else(|| Some(self.state.get()));
         self.got_resume = false;
+        self.got_tune = false;
         self.net = None;
         self.channel = None;
         self.pc = None;

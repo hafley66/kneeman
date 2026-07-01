@@ -17,6 +17,7 @@ pub use throw::*;
 
 use crate::{CharState, Fighter, Tune, Vector2, DUMMY_R, ECB_HALF_H};
 use self::special::special_slot;
+use serde::{Deserialize, Serialize};
 
 /// Hitboxes per move (Brawl-ish cap). Fixed so `AttackData` stays `Copy` + snapshot-cheap.
 pub const MAX_HB: usize = 4;
@@ -24,7 +25,7 @@ pub const MAX_HB: usize = 4;
 /// One hitbox: a circle offset from the fighter (x flipped by facing), live only on its own frame
 /// window `[start, start + len)`. A move is up to `MAX_HB` of these on the shared state clock, so
 /// sweetspot/sourspot, sex-kicks, and rapid multi-hit are all "more boxes", never new states.
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Hitbox {
     pub id: u8,             // priority; lowest LIVE overlapping id wins per victim (sweetspot first)
     pub start: i64,         // first active frame, relative to state start
@@ -56,7 +57,7 @@ impl Hitbox {
 /// One attack's frame data: a lead-in, up to `MAX_HB` windowed hitboxes (id-ordered), and endlag.
 /// The boxes drive both the hits and (via `f.frame`) the animation; `total()` sets the FSM state
 /// length so the timer and the hitboxes stay in lockstep.
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttackData {
     pub startup: i64,            // animation lead-in (no box before this); boxes key off the same f.frame
     pub recovery: i64,          // endlag after the last box closes

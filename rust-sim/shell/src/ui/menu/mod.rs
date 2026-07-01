@@ -28,12 +28,31 @@ pub fn menu<T: Theme>(
     router: &mut Router,
     cells: &MenuCells,
     lobbies: &[crate::net::LobbyRow],
+    push_status: &str,
     out: &mut Vec<Intent>,
 ) {
     let loc = router.location();
     if matches!(loc.base, Route::Closed) {
         return;
     }
+
+    // Escape closes/backs the menu. Consume it HERE (before any widget) so egui's built-in
+    // focus-release-on-Escape can't swallow it first now that a nav item is always focused. Routed as
+    // Intent::Esc: cancels a dialog, else backs out (Home -> Closed = resume).
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        out.push(Intent::Esc);
+    }
+
+    // Modal backdrop: a full-screen scrim UNDER the window (Order::Background < the window's Middle)
+    // so the paused game + HUD read as dimmed behind the menu.
+    egui::Area::new(egui::Id::new("xp_menu_scrim"))
+        .order(egui::Order::Background)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            ui.painter()
+                .rect_filled(ctx.content_rect(), 0.0, egui::Color32::from_black_alpha(150));
+        });
+
     let state = cells.state.get();
     let tune = cells.tune.get();
     let net = cells.net.get();
@@ -44,6 +63,7 @@ pub fn menu<T: Theme>(
         route: loc.base,
         net: &net,
         lobbies,
+        push_status,
     };
 
     theme.window(ctx, title_of(loc.base), |ui| {
@@ -81,9 +101,14 @@ fn rail<T: Theme>(ui: &mut egui::Ui, theme: &T, cx: &MenuCtx, out: &mut Vec<Inte
         (Route::Controls, "Controls"),
         (Route::Network, "Network"),
     ];
+    let mut first_resp: Option<egui::Response> = None;
     for &(r, label) in NAV {
         let sel = same_page(cx.route, r);
-        if theme.nav_item(ui, label, sel).clicked() && !sel {
+        let resp = theme.nav_item(ui, label, sel);
+        if first_resp.is_none() {
+            first_resp = Some(resp.clone());
+        }
+        if resp.clicked() && !sel {
             out.push(Intent::Nav(r));
         }
     }
@@ -95,6 +120,14 @@ fn rail<T: Theme>(ui: &mut egui::Ui, theme: &T, cx: &MenuCtx, out: &mut Vec<Inte
     ui.add_space(10.0);
     if theme.nav_item(ui, "▸ Resume game", false).clicked() {
         out.push(Intent::Nav(Route::Closed));
+    }
+    // Focus bootstrap: when nothing has focus (first open, or after body widgets disappeared on
+    // a route change) give it to the first rail entry. Arrow keys need an existing focused widget
+    // to move FROM; without this, directional nav is a no-op until something is manually focused.
+    if ui.ctx().memory(|m| m.focused()).is_none() {
+        if let Some(r) = first_resp {
+            r.request_focus();
+        }
     }
 }
 

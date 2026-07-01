@@ -8,7 +8,7 @@ use godot::classes::web_rtc_peer_connection::{ConnectionState, GatheringState, S
 use godot::classes::web_socket_peer::State as WsState;
 use godot::prelude::*;
 
-use crate::sim::SimState;
+use crate::sim::{SimState, Tune};
 
 /// Monotonic ms clock (Godot's, so it works the same on native + the emscripten web build).
 pub(crate) fn now_ms() -> u64 {
@@ -36,6 +36,66 @@ pub(crate) fn encode_state(s: &SimState) -> GString {
 pub(crate) fn decode_state(b64: &str) -> Option<SimState> {
     let raw = godot::classes::Marshalls::singleton().base64_to_raw(b64);
     bincode::deserialize::<SimState>(raw.as_slice()).ok()
+}
+
+/// Serialize the ruleset (`Tune`) for the signaling channel, same wire as the state snapshot. The
+/// host is authoritative: it ships this at match start so both peers' reducers run identical physics
+/// (custom rulesets in netplay), instead of each side silently using its own Feel-edited `Tune`.
+pub(crate) fn encode_tune(t: &Tune) -> GString {
+    let bytes = bincode::serialize(t).expect("serialize Tune");
+    godot::classes::Marshalls::singleton().raw_to_base64(&PackedByteArray::from(bytes.as_slice()))
+}
+
+/// Inverse of `encode_tune`. `None` on a malformed frame, so the guest keeps its own `Tune` and waits
+/// for a good one rather than adopting garbage physics.
+pub(crate) fn decode_tune(b64: &str) -> Option<Tune> {
+    let raw = godot::classes::Marshalls::singleton().base64_to_raw(b64);
+    bincode::deserialize::<Tune>(raw.as_slice()).ok()
+}
+
+// --- Web-push bridge --------------------------------------------------------------------------
+// The lobby push opt-in lives in JS (`deploy/web/push.js` exposes `window.smashPush`); the Network
+// page drives it through Godot's `JavaScriptBridge` singleton. gdext 0.4.5's codegen does NOT emit a
+// `JavaScriptBridge` class type (even on the emscripten target), so we can't name it -- instead fetch
+// the singleton dynamically by name and `call("eval", ...)` on the untyped Object. The singleton is
+// only registered on the web export, so `get_singleton` returns None on native -> both are no-ops.
+
+/// The `JavaScriptBridge` engine singleton, or None when not on the web export (native, or a headless
+/// run). Untyped because the class isn't in the gdext bindings; we reach `eval` by dynamic `call`.
+#[cfg(target_arch = "wasm32")]
+fn js_bridge() -> Option<Gd<Object>> {
+    godot::classes::Engine::singleton().get_singleton("JavaScriptBridge")
+}
+
+/// `JavaScriptBridge.eval(code, /*use_global_execution_context=*/true)` via dynamic dispatch, or Nil
+/// when the singleton is absent.
+#[cfg(target_arch = "wasm32")]
+fn js_eval(code: &str) -> Variant {
+    match js_bridge() {
+        Some(mut js) => js.call("eval", &[code.to_variant(), true.to_variant()]),
+        None => Variant::nil(),
+    }
+}
+
+/// Run the push subscribe flow (fires the browser permission prompt on first use).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn push_enable() {
+    js_eval("window.smashPush && window.smashPush.enable && window.smashPush.enable()");
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn push_enable() {}
+
+/// Current human push status (e.g. "pinging for 'default'"); empty when unset/unsupported/native.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn push_label() -> String {
+    js_eval("(window.smashPush && window.smashPush.label) || ''")
+        .try_to::<GString>()
+        .map(|g| g.to_string())
+        .unwrap_or_default()
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn push_label() -> String {
+    String::new()
 }
 
 /// An empty lobby is culled after this long with nobody in it. The remaining countdown ships in each

@@ -2,10 +2,11 @@
 //! and the throw release. Cross-fighter, so `resolve_grab` owns the held pair. Re-exported through `moves`.
 
 use crate::{hurtbox, sign, CharState, Fighter, InputFrame, Tune, Vector2, ECB_HALF_H, HITLAG_PER_DMG};
+use serde::{Deserialize, Serialize};
 
 /// A throw's launch: the grab's payoff. No frame windows (the throw fires the frame it's chosen);
 /// just damage + the knockback curve, indexed fwd/back/up/down in `Tune.throws`.
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThrowData {
     pub damage: f32,
     pub kb_base: f32,
