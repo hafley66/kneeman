@@ -15,10 +15,17 @@ impl Screen for Home {
             (Route::Rules, "Rules"),
             (Route::Background, "Background"),
             (Route::Feel, "Feel"),
+            (Route::Controls, "Controls"),
+            (Route::Network, "Network"),
         ] {
             if theme.button(ui, label).clicked() {
                 out.push(Intent::Nav(r));
             }
+        }
+        // Debug opens the egui panel and closes the menu so the panel is immediately visible.
+        if theme.button(ui, "Debug").clicked() {
+            out.push(Intent::OpenDebugPanel);
+            out.push(Intent::Nav(Route::Closed));
         }
         ui.add_space(10.0);
         if theme.button(ui, "Resume (Esc)").clicked() {

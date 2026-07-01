@@ -323,7 +323,13 @@ fn fighter_lands_and_stands_on_a_drawn_ink_floor() {
 fn holding_a_pen_and_attacking_lays_an_ink_path() {
     let (mut s, t) = settled();
     s.fighters[0].holding = 0;
-    s.items[0] = Item { kind: ItemKind::Pen, owner: 0, ..Item::EMPTY };
+    s.items[0] = Item {
+        kind: ItemKind::Pen,
+        owner: 0,
+        gas: t.ink_budget,
+        gas_max: t.ink_budget,
+        ..Item::EMPTY
+    };
     // hold attack + walk right; the trail pen lays nodes along the movement.
     for _ in 0..40 {
         let p0 = press(|i| {
@@ -345,7 +351,8 @@ fn attack_over_gun_picks_it_up() {
         pos: s.fighters[0].pos, // overlap the body
         vel: Vector2::ZERO,
         owner: -1,
-        ammo: 16,
+        gas: 16.0,
+        gas_max: 16.0,
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen,
@@ -363,7 +370,8 @@ fn grab_over_an_item_picks_it_up() {
         pos: s.fighters[0].pos, // standing over it
         vel: Vector2::ZERO,
         owner: -1,
-        ammo: 16,
+        gas: 16.0,
+        gas_max: 16.0,
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen,
@@ -383,7 +391,8 @@ fn firing_a_held_gun_spawns_a_bolt_and_spends_ammo() {
         pos: s.fighters[0].pos,
         vel: Vector2::ZERO,
         owner: 0,
-        ammo: 16,
+        gas: 16.0,
+        gas_max: 16.0,
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen,
@@ -391,7 +400,7 @@ fn firing_a_held_gun_spawns_a_bolt_and_spends_ammo() {
     let after = step(&s, &[&press(|i| i.attack = true), &idle()], &t);
     let bolts = after.items.iter().filter(|x| x.kind == ItemKind::LaserBolt).count();
     assert_eq!(bolts, 1, "one bolt should spawn");
-    assert_eq!(after.items[0].ammo, 15, "ammo should decrement by one");
+    assert_eq!(after.items[0].gas, 15.0, "gas should decrement by one shot");
 }
 
 #[test]
@@ -404,7 +413,8 @@ fn grab_drops_a_held_gun() {
         pos: s.fighters[0].pos,
         vel: Vector2::ZERO,
         owner: 0,
-        ammo: 16,
+        gas: 16.0,
+        gas_max: 16.0,
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen,

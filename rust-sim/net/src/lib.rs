@@ -216,7 +216,8 @@ pub fn checksum(s: &SimState) -> u128 {
         fold(it.vel.x.to_bits() as u64);
         fold(it.vel.y.to_bits() as u64);
         fold(it.owner as u64);
-        fold(it.ammo as u64);
+        fold(it.gas.to_bits() as u64);
+        fold(it.gas_max.to_bits() as u64);
         fold(it.timer as u64);
         fold(it.facing.to_bits() as u64);
     }

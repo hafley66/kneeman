@@ -102,14 +102,17 @@ impl ItemKind {
 
 /// One item OR projectile. Plain Copy data so it rolls back. `owner`: -1 = unowned ground item;
 /// else the fighter index that holds it (gun) or fired it (bolt). `timer`: gun = fire cooldown,
-/// bolt = remaining lifetime. `ammo`: gun shots left.
+/// `gas` is the item's first-dimension use measure (float, covers every kind): gun shots left, a
+/// pen's remaining ink length, a bolt's weak-flag. `gas_max` is the spawn value, so a HUD can show
+/// gas/gas_max as 0..1. `timer` is the projectile lifetime / gun cooldown.
 #[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub kind: ItemKind,
     pub pos: Vector2,
     pub vel: Vector2,
     pub owner: i8,
-    pub ammo: i64,
+    pub gas: f32,
+    pub gas_max: f32,
     pub timer: i64,
     pub facing: f32,
     pub tool: ToolKind, // which drawing tool, when `kind == Pen` (ignored otherwise)
@@ -121,7 +124,8 @@ impl Item {
         pos: Vector2::ZERO,
         vel: Vector2::ZERO,
         owner: -1,
-        ammo: 0,
+        gas: 0.0,
+        gas_max: 0.0,
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen,
@@ -204,11 +208,7 @@ pub(crate) fn maybe_spawn_item(n: &mut SimState, t: &Tune) {
             break;
         }
     }
-    let ammo = match kind {
-        ItemKind::BobGun => t.bomb.ammo,
-        ItemKind::Pen => 0, // a pen's budget lives on its InkPath at draw start, not in ammo
-        _ => t.laser.ammo,
-    };
+    let gas = fresh_gas(kind, t);
 
     let span = (FLOOR_RIGHT - FLOOR_LEFT - 120.0).max(0.0);
     let frac = (next_rng(&mut n.rng) % 1000) as f32 / 1000.0;
@@ -218,11 +218,22 @@ pub(crate) fn maybe_spawn_item(n: &mut SimState, t: &Tune) {
         pos: Vector2::new(x, GROUND_Y - 240.0), // drop in from above
         vel: Vector2::ZERO,
         owner: -1,
-        ammo,
+        gas,
+        gas_max: gas,
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen, // todo: roll a random tool when more than one pen ships
     };
+}
+
+/// A fresh item's starting `gas` -- the general first-dimension use measure: gun shots, or a pen's
+/// ink-length budget. Spawn sets both `gas` and `gas_max` to this so a HUD can normalize gas/gas_max.
+fn fresh_gas(kind: ItemKind, t: &Tune) -> f32 {
+    match kind {
+        ItemKind::BobGun => t.bomb.ammo as f32,
+        ItemKind::Pen => t.ink_budget,
+        _ => t.laser.ammo as f32,
+    }
 }
 
 /// Force-drop one item of a chosen kind into a free slot (the menu's debug spawn). Lands mid-stage,
@@ -231,18 +242,15 @@ pub fn spawn_kind(n: &mut SimState, kind: ItemKind, t: &Tune) {
     let Some(slot) = n.items.iter().position(|it| !it.active()) else {
         return;
     };
-    let ammo = match kind {
-        ItemKind::BobGun => t.bomb.ammo,
-        ItemKind::Pen => 0, // a pen's budget lives on its InkPath at draw start
-        _ => t.laser.ammo,
-    };
+    let gas = fresh_gas(kind, t);
     let x = (FLOOR_LEFT + FLOOR_RIGHT) * 0.5;
     n.items[slot] = Item {
         kind,
         pos: Vector2::new(x, GROUND_Y - 240.0),
         vel: Vector2::ZERO,
         owner: -1,
-        ammo,
+        gas,
+        gas_max: gas,
         timer: 0,
         facing: 1.0,
         tool: ToolKind::TrailPen,
@@ -291,7 +299,7 @@ pub(crate) fn fire_gun(n: &mut SimState, idx: usize, auto: bool, t: &Tune) {
     }
     let k = holding as usize;
     let gun = n.items[k].kind;
-    if !gun.is_gun() || n.items[k].timer > 0 || n.items[k].ammo <= 0 {
+    if !gun.is_gun() || n.items[k].timer > 0 || n.items[k].gas < 1.0 {
         return; // wrong item, on cooldown, or empty — the intent fired but nothing comes out
     }
     let cfg = if gun == ItemKind::BobGun { &t.bomb } else { &t.laser };
@@ -309,15 +317,16 @@ pub(crate) fn fire_gun(n: &mut SimState, idx: usize, auto: bool, t: &Tune) {
             pos: muzzle,
             vel,
             owner: idx as i8,
-            ammo: auto as i64, // laser: 1 = auto-fire (weak), 0 = full power; bomb ignores this
+            gas: auto as i64 as f32, // laser: 1 = auto-fire (weak), 0 = full power; bomb ignores this
+            gas_max: 1.0,
             timer: cfg.range,
             facing: f.facing,
             tool: ToolKind::TrailPen,
         };
     }
-    n.items[k].ammo -= 1;
+    n.items[k].gas -= 1.0;
     n.items[k].timer = if auto { cfg.autofire_cd } else { cfg.cooldown };
-    if n.items[k].ammo <= 0 {
+    if n.items[k].gas < 1.0 {
         n.items[k] = Item::EMPTY; // spent gun vanishes
         n.fighters[idx].holding = -1;
     }
@@ -469,7 +478,7 @@ fn apply_bolt_hit(b: &mut Fighter, bolt: &Item, t: &Tune) {
         return; // spawn i-frames / active dodge
     }
     let atk = t.laser.hit;
-    let scale = if bolt.ammo == 1 { t.laser.autofire_dmg } else { 1.0 }; // auto-fire bolts are weaker
+    let scale = if bolt.gas == 1.0 { t.laser.autofire_dmg } else { 1.0 }; // auto-fire bolts are weaker
     let dmg = atk.damage * scale;
     b.damage += dmg;
     let kb = knockback_units(b.damage, dmg, t.weight, &atk);

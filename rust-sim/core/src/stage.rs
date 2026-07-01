@@ -3,7 +3,7 @@
 //! polyline of segments — so stage geometry and ink share this module. Everything here is pure and
 //! `Copy`-friendly so it rides inside the rolled-back `SimState`. Re-exported at the crate root.
 
-use crate::{geo, Fighter, InputFrame, Tune, Vector2};
+use crate::{geo, Fighter, InputFrame, Item, SimState, Tune, Vector2};
 use serde::{Deserialize, Serialize};
 
 // Battlefield-style stage: one solid main platform (with grabbable ledges) + soft platforms
@@ -349,4 +349,91 @@ fn ang_diff(a: f32, b: f32) -> f32 {
         d = std::f32::consts::TAU - d;
     }
     d
+}
+
+/// Post-step ink: lay/extend each drawing fighter's path (tool-specific, budget-capped), finalize a
+/// path the moment its owner stops drawing or runs out of budget (running `classify` once to cache
+/// grabbability), then decay old nodes per-node and free spent slots. Baked stage strokes (owner < 0)
+/// never draw or decay. Pure; the only place ink paths mutate. Called last in `step`. See the
+/// `ink-paths` skill.
+pub(crate) fn update_paths(n: &mut SimState, inputs: &[&InputFrame], t: &Tune) {
+    let tick = n.tick;
+    let np = (n.active as usize).min(inputs.len());
+    for idx in 0..np {
+        let f = n.fighters[idx];
+        let holding = f.holding;
+        let pen = holding >= 0 && n.items[holding as usize].kind.is_pen();
+        let inp = inputs[idx];
+        let want = pen && (inp.attack || inp.attack_held);
+        let active_slot = n.paths.iter().position(|p| p.drawing && p.owner == idx as i8);
+        if want {
+            let tool = n.items[holding as usize].tool;
+            let slot = match active_slot {
+                Some(s) => s,
+                None => {
+                    let Some(s) = n.paths.iter().position(|p| !p.active() && !p.drawing) else {
+                        continue; // no free path slot — drop the stroke
+                    };
+                    let mut fresh = InkPath::EMPTY;
+                    fresh.kind = tool;
+                    fresh.props = tool_props(tool, t);
+                    fresh.owner = idx as i8;
+                    fresh.drawing = true;
+                    // Each stroke draws from the pen's remaining gas (its total ink), not a fresh
+                    // per-stroke budget, so gas depletes across strokes and the overhead bar means
+                    // "ink left". The pen is spent (vanishes) when gas hits zero, like a gun.
+                    fresh.budget = n.items[holding as usize].gas;
+                    n.paths[s] = fresh;
+                    s
+                }
+            };
+            let path = n.paths[slot];
+            if let Some(p) = tool_sample(tool, &f, inp, &path, t) {
+                let add = path.last().map_or(0.0, |prev| (p - prev).length());
+                if path.len == 0 || (add > 0.0 && path.budget - add >= 0.0) {
+                    n.paths[slot].push(p, tick);
+                    n.paths[slot].budget -= add;
+                    n.items[holding as usize].gas -= add; // deplete the pen's total gas (HUD bar)
+                }
+                if n.paths[slot].budget <= 0.0 {
+                    finalize_path(&mut n.paths[slot]); // stroke's gas spent: solidify
+                }
+                if n.items[holding as usize].gas <= 0.0 {
+                    n.items[holding as usize] = Item::EMPTY; // pen out of ink: vanishes
+                    n.fighters[idx].holding = -1;
+                }
+            }
+        } else if let Some(s) = active_slot {
+            finalize_path(&mut n.paths[s]); // released the button: solidify
+        }
+    }
+
+    // per-node decay: the oldest nodes fade first ("nodes go away after time N"); reclassify a
+    // finalized path whose geometry changed, and free a slot that emptied out.
+    for p in n.paths.iter_mut() {
+        if !p.active() || p.owner < 0 {
+            continue; // owner<0 = baked stage stroke: permanent, classified at load
+        }
+        let before = p.len;
+        let life = p.props.node_life as u64;
+        let mut dead = 0;
+        while (dead as usize) < p.len as usize && tick.saturating_sub(p.born[dead as usize]) > life {
+            dead += 1;
+        }
+        if dead > 0 {
+            p.trim_front(dead);
+        }
+        if p.len == 0 {
+            *p = InkPath::EMPTY;
+        } else if p.len != before && !p.drawing {
+            classify(p);
+        }
+    }
+}
+
+/// Stop drawing a path and cache its per-segment surface classes (the grabbability the collision read
+/// consumes). Called on button release or budget exhaustion.
+fn finalize_path(p: &mut InkPath) {
+    p.drawing = false;
+    classify(p);
 }

@@ -256,6 +256,10 @@ pub struct KneeMan {
     prev_pos: [sim::Vector2; sim::MAX_PLAYERS], // last frame's feet pos, for KO teleport detection (bangs)
     trails: [Vec<sim::Vector2>; sim::MAX_PLAYERS], // recent feet positions per fighter, for the fast-move smear
     bangs: Vec<(Vector2, f32)>,         // active blast flashes: world pos + age (0..1), drawn in draw()
+    puffs: Vec<(Vector2, f32)>,         // dirt cloud puffs: world pos + age (0..1); hard-brake / landing skid
+    flashes: Vec<(Vector2, f32)>,       // special-attack flashes: world pos + age (0..1); B-move startup
+    prev_state: [CharState; sim::MAX_PLAYERS], // prior-frame CharState, for transition edge detection
+    prev_vel: [sim::Vector2; sim::MAX_PLAYERS], // prior-frame velocity, for landing-skid speed check
     status: Option<Gd<Button>>,         // screen-space netplay status chip; tap it to find a match
     hud: [Option<Gd<Label>>; sim::MAX_PLAYERS], // bottom damage panel: each fighter's name + %
     cam: Option<Gd<Camera2D>>,          // sibling Camera2D, tracked to fit both fighters each frame
@@ -309,6 +313,10 @@ impl INode2D for KneeMan {
             prev_pos: [sim::Vector2::new(0.0, 0.0); sim::MAX_PLAYERS],
             trails: Default::default(),
             bangs: Vec::new(),
+            puffs: Vec::new(),
+            flashes: Vec::new(),
+            prev_state: [CharState::Stand; sim::MAX_PLAYERS],
+            prev_vel: [sim::Vector2::new(0.0, 0.0); sim::MAX_PLAYERS],
             status: None,
             hud: Default::default(),
             cam: None,
@@ -491,6 +499,7 @@ impl INode2D for KneeMan {
         let menu_open = self.debug_ui.as_ref().map(|d| d.bind().is_menu_open()).unwrap_or(false);
         if menu_open && self.phase != Phase::Running {
             self.update_status();
+            self.update_touch(); // still runs while paused so the touch UI hides behind the menu
             return;
         }
         match self.phase {
@@ -626,6 +635,48 @@ impl INode2D for KneeMan {
             }
             self.prev_pos[k] = p;
         }
+
+        // Dirt-cloud puffs (Task 3) and special-attack flashes (Task 4): detect state transitions.
+        // prev_state/prev_vel trail one draw() call behind (updated at the bottom of this loop).
+        for k in 0..active {
+            let f = &s.fighters[k];
+
+            // Braking puff: fast ground state (Dash/Run) collapses into a stop (Skid/Stand/Turn).
+            let was_fast_ground = matches!(self.prev_state[k], CharState::Dash | CharState::Run);
+            let just_braked = matches!(f.state, CharState::Skid | CharState::Stand | CharState::Turn)
+                && f.state != self.prev_state[k];
+            // Landing skid: airborne -> Landing with carry speed above threshold.
+            let was_air = matches!(
+                self.prev_state[k],
+                CharState::Air | CharState::Nair | CharState::Dair
+                    | CharState::AirDodge | CharState::Helpless
+            );
+            let landed_fast = f.state == CharState::Landing
+                && self.prev_state[k] != CharState::Landing
+                && self.prev_vel[k].x.abs() > 4.0;
+            if (was_fast_ground && just_braked) || (was_air && landed_fast) {
+                self.puffs.push((gv(f.pos), 0.0));
+            }
+
+            // Special flash: entering any B-move from a non-special state.
+            let now_special = matches!(
+                f.state,
+                CharState::SpecialN | CharState::SpecialS | CharState::SpecialU | CharState::SpecialD
+            );
+            let was_special = matches!(
+                self.prev_state[k],
+                CharState::SpecialN | CharState::SpecialS | CharState::SpecialU | CharState::SpecialD
+            );
+            if now_special && !was_special {
+                // Body center: feet pos lifted by the body half-height (46 px up = -y in Godot).
+                let body_center = gv(f.pos) - Vector2::new(0.0, 46.0);
+                self.flashes.push((body_center, 0.0));
+            }
+
+            self.prev_state[k] = f.state;
+            self.prev_vel[k] = f.vel;
+        }
+
         self.bangs.retain(|(_, age)| *age < 1.0);
         // draw + age each bang: an expanding ring plus radiating spokes, hot orange fading out.
         let bangs: Vec<(Vector2, f32)> = self.bangs.clone();
@@ -642,6 +693,39 @@ impl INode2D for KneeMan {
                 self.base_mut().draw_line_ex(c + dir * (r * 0.5), c + dir * (r + 40.0 * (1.0 - a)), col).width(5.0 * (1.0 - a) + 1.0).done();
             }
             self.bangs[i].1 = a + 0.045;
+        }
+
+        // Dirt-cloud puffs (Task 3): 3 expanding tan circles that drift upward, fade at the feet.
+        self.puffs.retain(|(_, age)| *age < 1.0);
+        let puffs: Vec<(Vector2, f32)> = self.puffs.clone();
+        for (i, (wp, age)) in puffs.iter().enumerate() {
+            let c = *wp - origin;
+            let a = *age;
+            let alpha = (1.0 - a).powf(1.8);
+            // Three circles with slight lateral offsets; all drift upward as age advances.
+            for (dx, scale) in [(-9.0_f32, 0.80_f32), (0.0, 1.0), (10.0, 0.72)] {
+                let r = (7.0 + a * 24.0) * scale;
+                let rise = a * 14.0; // puff drifts up over its lifetime
+                let col = Color::from_rgba(0.75, 0.63, 0.38, alpha * 0.62);
+                self.base_mut().draw_circle(c + Vector2::new(dx * (1.0 + a * 0.4), -rise), r, col);
+            }
+            self.puffs[i].1 = a + 0.07;
+        }
+
+        // Special-attack flashes (Task 4): bright expanding ring + inner glow at body center.
+        self.flashes.retain(|(_, age)| *age < 1.0);
+        let flashes: Vec<(Vector2, f32)> = self.flashes.clone();
+        for (i, (wp, age)) in flashes.iter().enumerate() {
+            let c = *wp - origin;
+            let a = *age;
+            let alpha = (1.0 - a).powf(1.2);
+            let r = 18.0 + a * 52.0;
+            let ring_col = Color::from_rgba(0.95, 0.88, 0.42, alpha * 0.82);
+            self.base_mut().draw_arc_ex(c, r, 0.0, std::f32::consts::TAU, 24, ring_col).width(5.0 * (1.0 - a) + 1.5).done();
+            // Inner glow disc fades faster than the ring.
+            let glow_col = Color::from_rgba(1.0, 0.95, 0.60, alpha * alpha * 0.45);
+            self.base_mut().draw_circle(c, r * 0.55, glow_col);
+            self.flashes[i].1 = a + 0.06;
         }
 
         // Motion smear: fast bursts (up-B / side-B / a hard launch) move a frozen single-frame
@@ -770,14 +854,51 @@ impl INode2D for KneeMan {
             for seg in 0..n.saturating_sub(1) {
                 let a = gv(p.pts[seg]) - origin;
                 let b = gv(p.pts[seg + 1]) - origin;
-                let col = match p.class[seg] {
-                    sim::SegClass::Ledge => Color::from_rgb(1.0, 0.85, 0.2), // grabbable lip
-                    sim::SegClass::Floor => Color::from_rgb(0.3, 0.7, 1.0),
-                    sim::SegClass::Wall => Color::from_rgb(0.6, 0.4, 1.0),
-                    sim::SegClass::None => Color::from_rgba(0.5, 0.8, 1.0, 0.5), // not yet a surface
+                // While the owner is still laying the stroke, every segment is class None (classify
+                // runs at finalize), so a live draw would read as a weak faded line. Paint it solid
+                // ink instead so the drawing shows up live under the pen, then it recolors to its
+                // Floor/Ledge/Wall class the moment the stroke is released.
+                // (col, width). `None` segments are laid ink that classified as no usable surface
+                // (too short, or a ramp too steep to stand / too shallow to be a wall). Draw them as
+                // a thin faint sketch so they read as "ineffective ink", not a broken platform.
+                let (col, width) = if p.drawing {
+                    (Color::from_rgb(0.3, 0.7, 1.0), 7.0) // live ink: confident, same hue as a Floor
+                } else {
+                    match p.class[seg] {
+                        sim::SegClass::Ledge => (Color::from_rgb(1.0, 0.85, 0.2), 7.0), // grabbable lip
+                        sim::SegClass::Floor => (Color::from_rgb(0.3, 0.7, 1.0), 7.0),
+                        sim::SegClass::Wall => (Color::from_rgb(0.6, 0.4, 1.0), 7.0),
+                        sim::SegClass::None => (Color::from_rgba(0.5, 0.8, 1.0, 0.22), 3.0),
+                    }
                 };
-                self.base_mut().draw_line_ex(a, b, col).width(7.0).done();
+                self.base_mut().draw_line_ex(a, b, col).width(width).done();
             }
+        }
+
+        // Overhead gas meter: while a fighter holds an item, a tiny bar over the head shows its
+        // remaining use (`gas / gas_max`) -- gun shots, or a pen's ink. Cosmetic read of the sim;
+        // `gas` is the item's general first-dimension use measure (see core `Item`).
+        for k in 0..active {
+            let f = s.fighters[k];
+            if f.holding < 0 {
+                continue;
+            }
+            let it = s.items[f.holding as usize];
+            if !it.active() || it.gas_max <= 0.0 {
+                continue;
+            }
+            let frac = (it.gas / it.gas_max).clamp(0.0, 1.0);
+            let w = 54.0_f32;
+            let h = 7.0_f32;
+            let head = gv(f.pos) - origin - Vector2::new(w * 0.5, 118.0);
+            self.base_mut().draw_rect(
+                Rect2::new(head - Vector2::new(1.0, 1.0), Vector2::new(w + 2.0, h + 2.0)),
+                Color::from_rgba(0.0, 0.0, 0.0, 0.55), // dark backing so it reads on any stage
+            );
+            // fill tints green (full) -> amber -> red (nearly spent) as it drains.
+            let fill = Color::from_rgb(1.0 - frac * 0.45, 0.35 + frac * 0.55, 0.22);
+            self.base_mut()
+                .draw_rect(Rect2::new(head, Vector2::new(w * frac, h)), fill);
         }
     }
 }
@@ -904,6 +1025,16 @@ impl KneeMan {
 
     pub fn net_cell(&self) -> Mutable<NetDebug> {
         self.netdbg.clone()
+    }
+
+    /// Network page (pause menu) actions, mirroring the on-screen status chip: start matchmaking
+    /// (no-op unless Offline, like the chip's tap) and drop back to local play from any net phase.
+    pub fn find_match(&mut self) {
+        self.on_connect();
+    }
+
+    pub fn leave_match(&mut self) {
+        self.reset_offline();
     }
 
     pub fn identity_cell(&self) -> Mutable<Identity> {
@@ -1360,11 +1491,18 @@ impl KneeMan {
         }
     }
 
-    /// Push the current phase into the on-screen label.
+    /// Push the current phase into the on-screen chip, and size/fade it for the context: the 20px
+    /// chip is a speck on a phone, so bump it on a touchscreen; during a live match fade it to 75%
+    /// so it doesn't fight the action.
     fn update_status(&mut self) {
         let txt = self.status_text();
+        let mobile = godot::classes::DisplayServer::singleton().is_touchscreen_available();
+        let in_match = self.phase == Phase::Running;
         if let Some(mut l) = self.status.clone() {
             l.set_text(&txt);
+            l.add_theme_font_size_override("font_size", if mobile { 34 } else { 20 });
+            let alpha = if in_match { 0.75 } else { 1.0 };
+            l.set_modulate(Color::from_rgba(1.0, 1.0, 1.0, alpha));
         }
     }
 
@@ -1489,10 +1627,17 @@ impl KneeMan {
 
         // Only show the on-screen gamepad when the device actually needs it: a touchscreen is present
         // AND no controller is paired. Desktop (no touchscreen) or "touchscreen + gamepad" hides it,
-        // so it never clutters a keyboard/pad session. Hidden -> no diamond published, so a stray
-        // touch can't fire a button either.
+        // so it never clutters a keyboard/pad session. Also hide it whenever the pause menu is open,
+        // so the stick/buttons don't sit on top of the menu. Hidden -> no diamond published, so a
+        // stray touch can't fire a button either.
+        let menu_open = self
+            .debug_ui
+            .as_ref()
+            .map(|d| d.bind().is_menu_open())
+            .unwrap_or(false);
         let show_touch = godot::classes::DisplayServer::singleton().is_touchscreen_available()
-            && Input::singleton().get_connected_joypads().is_empty();
+            && Input::singleton().get_connected_joypads().is_empty()
+            && !menu_open;
         for poly in self.quad_polys.iter_mut() {
             poly.set_visible(show_touch);
         }
@@ -1501,6 +1646,9 @@ impl KneeMan {
         }
         if let Some(p) = self.shorthop_panel.as_mut() {
             p.set_visible(show_touch);
+        }
+        if let Some(l) = self.shorthop_label.as_mut() {
+            l.set_visible(show_touch);
         }
         if let Some(b) = self.stick_base.as_mut() {
             b.set_visible(show_touch);

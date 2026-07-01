@@ -6,9 +6,11 @@ pub mod router;
 
 mod background;
 mod characters;
+mod controls;
 mod feel;
 mod home;
 mod items;
+mod network;
 mod rules;
 
 use crate::sim::{self, ItemKind};
@@ -34,12 +36,14 @@ pub fn menu<T: Theme>(
     }
     let state = cells.state.get();
     let tune = cells.tune.get();
+    let net = cells.net.get();
     let cx = MenuCtx {
         state: &state,
         tune: &tune,
         charsel: cells.charsel.get(),
         route: loc.base,
         require_both: router.require_both(),
+        net: &net,
     };
 
     theme.window(ctx, title_of(loc.base), |ui| {
@@ -70,12 +74,19 @@ fn rail<T: Theme>(ui: &mut egui::Ui, theme: &T, cx: &MenuCtx, out: &mut Vec<Inte
         (Route::Rules, "Rules"),
         (Route::Background, "Background"),
         (Route::Feel, "Feel"),
+        (Route::Controls, "Controls"),
+        (Route::Network, "Network"),
     ];
     for &(r, label) in NAV {
         let sel = same_page(cx.route, r);
         if theme.nav_item(ui, label, sel).clicked() && !sel {
             out.push(Intent::Nav(r));
         }
+    }
+    // Debug opens the egui panel (intercepted by the shell) and closes the menu so the panel shows.
+    if theme.nav_item(ui, "Debug", false).clicked() {
+        out.push(Intent::OpenDebugPanel);
+        out.push(Intent::Nav(Route::Closed));
     }
     ui.add_space(10.0);
     if theme.nav_item(ui, "▸ Resume game", false).clicked() {
@@ -103,6 +114,8 @@ fn render_base<T: Theme>(
         Route::Rules => rules::Rules.view(ui, theme, cx, out),
         Route::Background => background::Background.view(ui, theme, cx, out),
         Route::Feel => feel::Feel.view(ui, theme, cx, out),
+        Route::Controls => controls::Controls.view(ui, theme, cx, out),
+        Route::Network => network::Network.view(ui, theme, cx, out),
         Route::Closed => {}
     }
 }
@@ -116,6 +129,8 @@ fn title_of(route: Route) -> &'static str {
         Route::Rules => "Rules",
         Route::Background => "Background",
         Route::Feel => "Feel",
+        Route::Controls => "Controls",
+        Route::Network => "Network",
         Route::Closed => "",
     }
 }

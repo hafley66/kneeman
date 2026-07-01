@@ -43,6 +43,7 @@ impl super::Theme for Dark {
 
 /// The stylesheet. Apply once via EguiBridge::setup_context.
 pub fn apply(ctx: &egui::Context) {
+    install_fonts(ctx);
     let mut v = Visuals::dark();
     v.override_text_color = Some(TEXT);
     v.window_fill = PANEL;
@@ -84,6 +85,27 @@ pub fn apply(ctx: &egui::Context) {
     .into();
 
     ctx.set_style(style);
+}
+
+/// Register the bundled DejaVu Sans as the top Proportional face. DejaVu descends from Bitstream
+/// Vera (Verdana-metric humanist sans), so it reads like the XP "Tahoma" UI font and is freely
+/// redistributable -- so it ships in the wasm build, unlike a system font. Global to the egui
+/// context, so both the XP menu and this dark panel pick it up.
+fn install_fonts(ctx: &egui::Context) {
+    use std::sync::Arc;
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "xp_ui".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../../fonts/DejaVuSans.ttf"
+        ))),
+    );
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "xp_ui".to_owned());
+    ctx.set_fonts(fonts);
 }
 
 /// A styled container (a "div"). Base off the group frame, override via spreads-as-methods.

@@ -1,5 +1,7 @@
-use godot::classes::{Camera2D, HttpRequest, INode, InputEvent, InputEventKey, Node};
-use godot::global::Key;
+use godot::classes::{
+    Camera2D, HttpRequest, INode, Input, InputEvent, InputEventJoypadButton, InputEventKey, Node,
+};
+use godot::global::{JoyButton, Key};
 use godot::prelude::*;
 
 use futures_signals::signal::Mutable;
@@ -88,6 +90,19 @@ impl INode for DebugUi {
     }
 
     fn input(&mut self, event: Gd<InputEvent>) {
+        // Gamepad drives the pause menu. Start opens/backs it (like Esc); while it's open, dpad + A
+        // + B become synthetic key events (Tab focus-nav / Enter activate / Esc back) that egui and
+        // this handler already understand -- so no custom focus model and no bridge changes.
+        if let Ok(pad) = event.clone().try_cast::<InputEventJoypadButton>() {
+            if pad.is_pressed() && !pad.is_echo() && pad.get_button_index() == JoyButton::START {
+                self.open_pause_menu();
+                return;
+            }
+            if self.is_menu_open() {
+                self.gamepad_menu_nav(pad);
+            }
+            return;
+        }
         let Ok(key) = event.try_cast::<InputEventKey>() else {
             return;
         };
@@ -121,7 +136,7 @@ impl INode for DebugUi {
     }
 
     fn process(&mut self, _dt: f64) {
-        let (Some(bridge), Some(fighter)) = (self.egui.clone(), self.fighter.clone()) else {
+        let (Some(bridge), Some(mut fighter)) = (self.egui.clone(), self.fighter.clone()) else {
             return;
         };
         let ctx = bridge.bind().current_frame().clone();
@@ -133,13 +148,47 @@ impl INode for DebugUi {
 
         // --- XP menu: drawn every frame (independent of the debug panel toggle) ---
         {
-            let cells = MenuCells { state: &state_cell, tune: &tune_cell, charsel: &charsel_cell };
+            let cells = MenuCells {
+                state: &state_cell,
+                tune: &tune_cell,
+                charsel: &charsel_cell,
+                net: &net_cell,
+            };
             // resolve a pending Esc BEFORE drawing so the route change shows this frame
             if std::mem::take(&mut self.menu_esc) {
                 self.router.apply(vec![Intent::Esc], &cells);
             }
             let mut out: Vec<Intent> = Vec::new();
             crate::ui::menu::menu(&ctx, &Xp, &mut self.router, &cells, &mut out);
+            // Intercept the shell-driven intents before Router::apply so the pure router never sees
+            // them: OpenDebugPanel toggles this panel; Find/LeaveMatch drive KneeMan's netplay.
+            let mut open_panel = false;
+            let mut find_match = false;
+            let mut leave_match = false;
+            out.retain(|intent| match intent {
+                Intent::OpenDebugPanel => {
+                    open_panel = true;
+                    false
+                }
+                Intent::FindMatch => {
+                    find_match = true;
+                    false
+                }
+                Intent::LeaveMatch => {
+                    leave_match = true;
+                    false
+                }
+                _ => true,
+            });
+            if open_panel {
+                self.show = true;
+            }
+            if find_match {
+                fighter.bind_mut().find_match();
+            }
+            if leave_match {
+                fighter.bind_mut().leave_match();
+            }
             self.router.apply(out, &cells);
         }
 
@@ -191,6 +240,27 @@ impl DebugUi {
     /// menu_esc, so egui is not poked mid-input.
     pub fn open_pause_menu(&mut self) {
         self.menu_esc = true;
+    }
+
+    /// Map one gamepad button to a synthetic key event and re-inject it via Godot's input queue, so
+    /// egui's own focus navigation (and this handler's Esc) drive the pause menu: dpad down/up =
+    /// Tab / Shift+Tab (focus next/prev), A = Enter (activate), B = Esc (back one level).
+    fn gamepad_menu_nav(&mut self, pad: Gd<InputEventJoypadButton>) {
+        if !pad.is_pressed() || pad.is_echo() {
+            return;
+        }
+        let (keycode, shift) = match pad.get_button_index() {
+            JoyButton::DPAD_DOWN => (Key::TAB, false),
+            JoyButton::DPAD_UP => (Key::TAB, true),
+            JoyButton::A => (Key::ENTER, false),
+            JoyButton::B => (Key::ESCAPE, false),
+            _ => return,
+        };
+        let mut key = InputEventKey::new_gd();
+        key.set_keycode(keycode);
+        key.set_pressed(true);
+        key.set_shift_pressed(shift);
+        Input::singleton().parse_input_event(&key);
     }
 
     /// Kick off a GET of the relay's /status page (the server-status tab's refresh button).

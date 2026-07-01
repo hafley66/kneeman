@@ -69,6 +69,11 @@ fn frame_window(ctx: &egui::Context, title: &str, order: Order, add: impl FnOnce
                 })
                 .show(ui, |ui| {
                     ui.visuals_mut().override_text_color = Some(INK);
+                    // `.strong()` captions (e.g. the "Pause Menu" heading) resolve to
+                    // `widgets.active`/`noninteractive` text color, NOT override_text_color, so the
+                    // global dark Visuals paint them near-white on the beige face. Pin both dark.
+                    ui.visuals_mut().widgets.active.fg_stroke.color = INK;
+                    ui.visuals_mut().widgets.noninteractive.fg_stroke.color = INK;
                     ui.set_min_width(380.0);
                     title_bar(ui, title);
                     ui.add_space(8.0);

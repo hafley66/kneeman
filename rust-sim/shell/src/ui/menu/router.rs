@@ -11,6 +11,7 @@
 
 use futures_signals::signal::Mutable;
 
+use crate::net::NetDebug;
 use crate::sim::{self, ItemKind, SimState, Tune};
 
 // ============================ pure nav reducer (extractable crate) ============================
@@ -26,6 +27,8 @@ pub enum Route {
     Rules,
     Background,
     Feel,
+    Controls,
+    Network,
 }
 
 /// A modal laid over the base, query-param style (reachable from many bases). Two-player: it owns a
@@ -188,6 +191,7 @@ pub struct MenuCtx<'a> {
     pub charsel: [i64; 2],
     pub route: Route,
     pub require_both: bool,
+    pub net: &'a NetDebug, // transport snapshot for the Network page
 }
 
 /// The writable cells the effect layer drains into. Borrowed from KneeMan for the frame.
@@ -195,6 +199,7 @@ pub struct MenuCells<'a> {
     pub state: &'a Mutable<SimState>,
     pub tune: &'a Mutable<Tune>,
     pub charsel: &'a Mutable<[i64; 2]>,
+    pub net: &'a Mutable<NetDebug>,
 }
 
 /// What a screen asks for: nav edges (routed through the pure reducer) + app effects (run on cells).
@@ -209,6 +214,13 @@ pub enum Intent {
     ClearItems,
     SetChar { slot: usize, idx: i64 },
     SetRequireBoth(bool),
+    /// Signal to the shell (`DebugUi::process`) to open the egui debug panel. The pure Router
+    /// treats this as a no-op; the shell intercepts and drains it before calling `Router::apply`.
+    OpenDebugPanel,
+    /// Network page actions. Like `OpenDebugPanel`, the pure Router no-ops these; the shell
+    /// intercepts them before `Router::apply` and drives the KneeMan netplay methods.
+    FindMatch,
+    LeaveMatch,
 }
 
 /// Wraps the pure [`Nav`] and interprets [`Intent`]s: nav edges go through `Nav::reduce`, app edges
@@ -252,6 +264,8 @@ impl Router {
                     cells.charsel.set(c);
                 }
             }
+            // Intercepted by the shell before Router::apply is called; pure Router ignores them.
+            Intent::OpenDebugPanel | Intent::FindMatch | Intent::LeaveMatch => {}
         }
     }
 
