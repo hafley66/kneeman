@@ -1,0 +1,3 @@
+#!/bin/sh
+# sprefa dl rail: blocks a commit when a .dl/ diag rule trips.
+exec dl --check

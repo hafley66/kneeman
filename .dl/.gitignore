@@ -1,0 +1,4 @@
+cache.db*
+daemon.log
+daemon.pid
+daemon.sock

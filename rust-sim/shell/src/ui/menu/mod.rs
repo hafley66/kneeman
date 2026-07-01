@@ -36,12 +36,13 @@ pub fn menu<T: Theme>(
         return;
     }
 
-    // Escape closes/backs the menu. Consume it HERE (before any widget) so egui's built-in
-    // focus-release-on-Escape can't swallow it first now that a nav item is always focused. Routed as
-    // Intent::Esc: cancels a dialog, else backs out (Home -> Closed = resume).
-    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-        out.push(Intent::Esc);
-    }
+    // Swallow egui's Escape (before any widget) so its built-in focus-release-on-Escape can't fire
+    // while a nav item is focused. This is UI suppression ONLY -- the back/toggle INTENT comes from
+    // the shell's menu_esc (Intent::Esc), the same path the gamepad uses, so keyboard and controller
+    // share one semantic mapping. Emitting Intent::Esc here too would double-count a keyboard press.
+    ctx.input_mut(|i| {
+        i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+    });
 
     // Modal backdrop: a full-screen scrim UNDER the window (Order::Background < the window's Middle)
     // so the paused game + HUD read as dimmed behind the menu.
@@ -67,10 +68,16 @@ pub fn menu<T: Theme>(
     };
 
     theme.window(ctx, title_of(loc.base), |ui| {
-        // tiny build stamp, top-right — so you can see at a glance which wasm is actually live.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-            ui.label(egui::RichText::new(format!("build {}", env!("BUILD_HASH"))).small().weak());
+        // Top bar: condensed netplay status + a Find/Leave shortcut + a jump to the lobby page on the
+        // left; the tiny build stamp stays pinned right. Present on every page so match state and the
+        // quick-match button are one glance away without navigating to Network.
+        ui.horizontal(|ui| {
+            top_bar(ui, theme, &cx, out);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                ui.label(egui::RichText::new(format!("build {}", env!("BUILD_HASH"))).small().weak());
+            });
         });
+        ui.separator();
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(132.0);
@@ -87,6 +94,61 @@ pub fn menu<T: Theme>(
     if let Some(ds) = loc.dialog {
         dialog_layer(ctx, theme, ds, &cx, out);
     }
+}
+
+/// Condensed inline netplay status + shortcuts, shown on every page. A colored pill (fill = online/
+/// offline, leading dot = live channel health) reads the same data as the Network page's chip, then a
+/// Find/Leave quick-match button and a jump to the Network page for lobby selection. `out`-only, so it
+/// routes through the same shell interception as the Network screen's buttons.
+fn top_bar<T: Theme>(ui: &mut egui::Ui, theme: &T, cx: &MenuCtx, out: &mut Vec<Intent>) {
+    let net = cx.net;
+    let offline = net.phase == "offline";
+    // Dot = channel health at a glance: green once the data channel is live, amber while it negotiates.
+    let dot = if offline {
+        egui::Color32::from_rgb(120, 130, 145)
+    } else if matches!(net.channel, "open" | "connected") {
+        egui::Color32::from_rgb(90, 220, 130)
+    } else {
+        egui::Color32::from_rgb(235, 190, 70)
+    };
+    let fill = if offline {
+        egui::Color32::from_rgb(60, 65, 80)
+    } else {
+        egui::Color32::from_rgb(40, 140, 80)
+    };
+
+    ui.horizontal(|ui| {
+        egui::Frame::NONE
+            .fill(fill)
+            .corner_radius(egui::CornerRadius::same(6))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(70)))
+            .inner_margin(egui::Margin::symmetric(8, 3))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 4.5, dot);
+                // Text-only when offline (nothing to condense); online packs phase · channel · handle.
+                let text = if offline {
+                    "offline".to_string()
+                } else {
+                    format!("{}  ·  ch:{}  ·  h{}", net.phase, net.channel, net.handle)
+                };
+                ui.label(egui::RichText::new(text).small().strong().color(egui::Color32::WHITE));
+            });
+
+        // Quick-match shortcut: Find when offline, Leave once in a match.
+        if offline {
+            if theme.button(ui, "⚔ Find match").clicked() {
+                out.push(Intent::FindMatch);
+            }
+        } else if theme.button(ui, "Leave").clicked() {
+            out.push(Intent::LeaveMatch);
+        }
+        // Jump to the Network page for lobby selection (hidden when already there).
+        if !matches!(cx.route, Route::Network) && theme.button(ui, "🌐 Lobbies").clicked() {
+            out.push(Intent::Nav(Route::Network));
+        }
+    });
 }
 
 /// Left task-pane: one entry per page, the current one highlighted, plus a resume row.

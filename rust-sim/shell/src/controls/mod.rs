@@ -16,7 +16,7 @@ pub mod pad;
 
 use std::cell::Cell;
 
-use godot::classes::Input;
+use godot::classes::{Input, InputEvent, InputEventScreenDrag, InputEventScreenTouch};
 use godot::global::{JoyAxis, JoyButton, Key};
 use godot::prelude::*;
 
@@ -69,6 +69,75 @@ fn held(input: &mut Input, a: GameAction) -> bool {
 /// True if any alias of `a` had its rising edge this frame.
 fn pressed(input: &mut Input, a: GameAction) -> bool {
     a.names().iter().any(|n| input.is_action_just_pressed(*n))
+}
+
+// --- device seam for the touch UI (kneeman owns the layout; the raw device stays here) ---
+// These keep `Input`, `InputEventScreen*`, and `Key` out of kneeman.rs: the on-screen pad reads its
+// layout there but routes every raw-device call through this file, so the lockdown invariant holds
+// (enforced by .dl/lint-input-device.dl).
+
+/// A screen touch, classified out of the raw godot `InputEvent` so the caller names no device type.
+/// `pos` is screen-space; `finger` is the touch index.
+pub enum Touch {
+    Down { finger: i64, pos: Vector2 },
+    Up { finger: i64 },
+    Drag { finger: i64, pos: Vector2 },
+}
+
+/// Classify a raw input event as a screen touch, or `None` if it is something else.
+pub fn classify_touch(event: &Gd<InputEvent>) -> Option<Touch> {
+    if let Ok(t) = event.clone().try_cast::<InputEventScreenTouch>() {
+        let finger = t.get_index() as i64;
+        return Some(if t.is_pressed() {
+            Touch::Down { finger, pos: t.get_position() }
+        } else {
+            Touch::Up { finger }
+        });
+    }
+    if let Ok(d) = event.clone().try_cast::<InputEventScreenDrag>() {
+        return Some(Touch::Drag { finger: d.get_index() as i64, pos: d.get_position() });
+    }
+    None
+}
+
+/// Press every named action (the touch buttons synthesize the same actions the keyboard binds).
+pub fn press_actions(actions: &[&str]) {
+    let mut input = Input::singleton();
+    for a in actions {
+        input.action_press(*a);
+    }
+}
+
+/// Release every named action held by a lifted finger.
+pub fn release_actions(actions: &[&str]) {
+    let mut input = Input::singleton();
+    for a in actions {
+        input.action_release(*a);
+    }
+}
+
+/// True if at least one gamepad is connected (the touch pad hides itself when one is).
+pub fn gamepad_connected() -> bool {
+    !Input::singleton().get_connected_joypads().is_empty()
+}
+
+/// Debug test-spawn: the rising edges of number keys 1..=0 (ten slots) since `prev`. Returns the slot
+/// indices that went down THIS call and updates `prev`. Local-only; keeps `Key` out of the caller.
+pub fn number_key_edges(prev: &mut [bool; 10]) -> Vec<usize> {
+    const KEYS: [Key; 10] = [
+        Key::KEY_1, Key::KEY_2, Key::KEY_3, Key::KEY_4, Key::KEY_5,
+        Key::KEY_6, Key::KEY_7, Key::KEY_8, Key::KEY_9, Key::KEY_0,
+    ];
+    let input = Input::singleton();
+    let mut edges = Vec::new();
+    for (i, key) in KEYS.iter().enumerate() {
+        let down = input.is_key_pressed(*key);
+        if down && !prev[i] {
+            edges.push(i);
+        }
+        prev[i] = down;
+    }
+    edges
 }
 
 /// Read every game action for the local player into the sim's semantic [`InputFrame`]. `touch_stick`

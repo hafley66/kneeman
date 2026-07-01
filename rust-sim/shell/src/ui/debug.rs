@@ -146,18 +146,16 @@ impl INode for DebugUi {
             self.show = !self.show;
             return;
         }
-        // Esc drives the XP menu: opens the pause menu in game, else backs out / closes a dialog.
-        // Resolved in process() (egui can't be poked here), like the want_status deferral.
+        // Esc maps to the SAME semantic back/toggle intent as the gamepad (START/B): menu_esc ->
+        // Intent::Esc, resolved in process(). One path for keyboard + controller so they can't
+        // diverge. egui's consume_key in menu() only suppresses focus-release, it does not re-emit the
+        // intent (that double-counted a keyboard Esc: open then instantly back out). The lone
+        // keyboard-specific case is closing the debug panel when IT, not the menu, is the thing up.
         if key.get_keycode() == Key::ESCAPE {
-            // Menu open: the XP menu consumes Escape itself (in `menu()`), so egui's focus-release
-            // can't swallow it first — nothing to do here. Menu closed: close the debug panel if it's
-            // up, else open the pause menu.
-            if self.is_menu_open() {
-                // handled inside egui
-            } else if self.show {
+            if !self.is_menu_open() && self.show {
                 self.show = false;
             } else {
-                self.menu_esc = true; // nothing open -> open the pause menu
+                self.menu_esc = true;
             }
             return;
         }

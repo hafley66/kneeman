@@ -1,0 +1,29 @@
+# dl --hook condition: inject the "testing" skill when the agent reads OR edits a
+# test file this turn — only if it wasn't already loaded. The load-once guard is
+# the negated `!skill_loaded(_, _, "testing")` atom: skill_loaded is a built-in
+# derived from the transcript (explicit Skill calls + dl's own prior injections),
+# so the rule itself is idempotent. No state files.
+#
+# Install (turnkey): `dl setup --project .` writes this hook registration into
+# <repo>/.claude/settings.json for you. By hand it is:
+#
+#   { "hooks": { "PostToolUse": [ {
+#       "matcher": "Read|Edit|Write|MultiEdit",
+#       "hooks": [ { "type": "command", "command": "dl --hook" } ] } ] } }
+#
+# The condition is yours: `changed(p)` is the worktree change set (git status,
+# includes untracked — so a read-then-noop still surfaces if the file is dirty);
+# swap it for `agent_touch(_, s, p)` to key on the latest turn's EDITED files
+# only, or join `module_edge`, `type_edge`, whatever.
+
+rel inject_skill(name: text).
+
+inject_skill("testing") <-
+    changed(p),
+    p =~ /(_test\.|\.test\.|\.spec\.|test_|\/tests\/)/,
+    !skill_loaded(_, _, "testing").
+
+# A block example (uncomment to bounce a forbidden edit back at the agent):
+# rel block(reason: text).
+# block("do not edit generated files by hand") <-
+#     agent_touch(_, _, p), p =~ /\.gen\./.

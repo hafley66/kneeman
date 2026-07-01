@@ -1,0 +1,53 @@
+# lint-input-device.dl — raw input devices only in the intent registry.
+#
+# The gotcha this guards: an input-device read (keyboard / mouse / gamepad) leaking OUT of the one
+# place that maps devices to the game's semantic vocabulary. When it leaks, the keyboard and the
+# controller drift apart (the "Esc opens the menu but START doesn't" class of bug), because two files
+# now each decide what a press MEANS instead of one file mapping device -> intent and everyone
+# downstream reading only the intent.
+#
+# controls/mod.rs already states this invariant in prose ("the ONLY place ... that touches a raw
+# device ... nothing else may name Input, JoyButton, JoyAxis, or an action string"). This makes that
+# prose executable: a godot device symbol in any shell source OTHER than the allowlisted registry
+# files is an error row.
+#
+#   dl .dl/lint-input-device.dl --root . --check      # CI / pre-commit / Claude Code Stop hook (exit 2)
+#   dl .dl/lint-input-device.dl --root . --lsp         # live editor squiggle while writing
+#   dl --check --root .                                 # runs every .dl/*.dl in the repo
+
+# The registry: the two files permitted to name a raw device. controls/mod.rs is the gameplay input
+# seam (device -> InputFrame); ui/debug.rs is the menu/pad seam (device -> Intent). Everything else
+# must consume InputFrame / Intent, never a device symbol.
+rel allowed(path: file).
+allowed(p) <-
+  scan("WORK", "rust-sim/shell/src/**/*.rs", p, rev),
+  p =~ /shell\/src\/(controls\/mod|ui\/debug)\.rs$/.
+
+# Every godot device symbol in shell source, with the line it sits on. `match` is a lexical scan: it
+# flags ANY occurrence of the identifier, in any syntactic position (use-path, type arg, expr), which
+# a structural ast pattern would miss. Tokens chosen to be godot-specific so they don't collide with
+# unrelated names (InputFrame, an `input` local, egui::Key).
+rel device_ref(path: file, line: int, sym: text).
+device_ref(p, line, sym) <-
+  scan("WORK", "rust-sim/shell/src/**/*.rs", p, rev),
+  match(p, rev,
+        /\b(?<sym>JoyButton|JoyAxis|MouseButton|InputEventKey|InputEventJoypad\w*|InputEventMouse\w*|InputEventScreen\w*|Input::singleton|is_action_pressed|is_action_just_pressed|is_action_just_released|get_action_strength)\b/,
+        line).
+
+# Files the agent edited THIS turn (git-free, from the harness store). Join this into `diag` to scope
+# the rail like a save-hook -- nag about the device read you JUST wrote, not the whole repo's debt.
+rel agent_changed(path: file).
+agent_changed(p) <- agent_touch(_, _, p).
+
+# The rail: a device symbol outside the registry. `!allowed(p)` is the anti-join. Full-repo by default
+# (CI / pre-commit truth). For a live PostToolUse hook that only fires on the current turn's files, add
+# `, agent_changed(p)` to the body below.
+#
+# `diag` columns match the canonical 8-col schema (path,line,col,end_line,end_col,severity,code,msg)
+# so this rail MERGES with the others under `dl --check` discovery mode (a shared-namespace `diag`).
+# `match` gives line only, so col/end_line/end_col are 0/line/0.
+rel diag(path: file, line: int, col: int, end_line: int, end_col: int,
+         severity: text, code: text, msg: text).
+diag(p, line, 0, line, 0, "error", "input-outside-registry",
+     "raw input device `${sym}` outside the intent registry -- map it in controls/mod.rs or ui/debug.rs; downstream reads InputFrame/Intent only") <-
+  device_ref(p, line, sym), !allowed(p).

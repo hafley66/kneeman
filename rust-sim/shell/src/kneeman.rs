@@ -4,7 +4,7 @@ use godot::classes::web_rtc_peer_connection::ConnectionState;
 use godot::classes::web_socket_peer::State as WsState;
 use godot::classes::{
     AnimatedSprite2D, Button, Camera2D, CanvasLayer, ColorRect, Gradient, GradientTexture2D,
-    HttpRequest, INode2D, Input, InputEvent, InputEventScreenDrag, InputEventScreenTouch, Label,
+    HttpRequest, INode2D, InputEvent, Label,
     Node2D, Panel, Polygon2D, StyleBoxFlat, TextureRect, ThemeDb, WebRtcDataChannel,
     WebRtcPeerConnection, WebSocketPeer,
 };
@@ -307,7 +307,7 @@ impl INode2D for KneeMan {
             base,
             state: Mutable::new(SimState::spawn()),
             tune: Mutable::new(Tune::default()),
-            gizmos: Mutable::new(false),
+            gizmos: Mutable::new(true), // hitbox/hurtbox/ECB overlay ON by default
             sprites: Default::default(),
             dummy: None,
             tags: Default::default(),
@@ -545,11 +545,13 @@ impl INode2D for KneeMan {
     /// thread-local read by `sample_input`; the buttons press/release the same Input actions the
     /// keyboard binds. (Finding a match is the status chip's `on_connect`, not a key here.)
     fn input(&mut self, event: Gd<InputEvent>) {
-        // Finger down/up: claim a face button (right) or the floating stick (left).
-        if let Ok(touch) = event.clone().try_cast::<InputEventScreenTouch>() {
-            let pos = touch.get_position();
-            let finger = touch.get_index() as i64;
-            if touch.is_pressed() {
+        use crate::controls::Touch;
+        let Some(touch) = crate::controls::classify_touch(&event) else {
+            return;
+        };
+        match touch {
+            // Finger down: claim a face button (right) or the floating stick (left).
+            Touch::Down { finger, pos } => {
                 // hit-test the shorthop rect, then the diamond wedges, against this frame's layout
                 let hit = TOUCH_DIAMOND.get().and_then(|lay| {
                     if lay.shorthop.contains_point(pos) {
@@ -559,23 +561,20 @@ impl INode2D for KneeMan {
                     }
                 });
                 if let Some(actions) = hit {
-                    for a in actions {
-                        Input::singleton().action_press(*a);
-                    }
+                    crate::controls::press_actions(actions);
                     TOUCH_BTNS.with_borrow_mut(|v| v.push((finger, actions)));
                 } else if TOUCH_FINGER.get() < 0 && pos.x < TOUCH_STICK_ZONE_X.get() {
                     TOUCH_FINGER.set(finger);
                     TOUCH_ORIGIN.set((pos.x, pos.y));
                     TOUCH_STICK.set((0.0, 0.0));
                 }
-            } else {
-                // release: drop any wedge this finger held, and free the stick if it owned it.
+            }
+            // Finger up: drop any wedge this finger held, and free the stick if it owned it.
+            Touch::Up { finger } => {
                 TOUCH_BTNS.with_borrow_mut(|v| {
                     v.retain(|&(f, actions)| {
                         if f == finger {
-                            for a in actions {
-                                Input::singleton().action_release(*a);
-                            }
+                            crate::controls::release_actions(actions);
                             false
                         } else {
                             true
@@ -587,19 +586,16 @@ impl INode2D for KneeMan {
                     TOUCH_STICK.set((0.0, 0.0));
                 }
             }
-            return;
-        }
-        // Finger drag: if it owns the stick, update the tilt from its travel off the origin.
-        if let Ok(drag) = event.clone().try_cast::<InputEventScreenDrag>() {
-            if drag.get_index() as i64 == TOUCH_FINGER.get() {
-                let (ox, oy) = TOUCH_ORIGIN.get();
-                let p = drag.get_position();
-                let rad = TOUCH_STICK_RAD.get();
-                let sx = ((p.x - ox) / rad).clamp(-1.0, 1.0);
-                let sy = ((p.y - oy) / rad).clamp(-1.0, 1.0);
-                TOUCH_STICK.set((sx, sy));
+            // Finger drag: if it owns the stick, update the tilt from its travel off the origin.
+            Touch::Drag { finger, pos } => {
+                if finger == TOUCH_FINGER.get() {
+                    let (ox, oy) = TOUCH_ORIGIN.get();
+                    let rad = TOUCH_STICK_RAD.get();
+                    let sx = ((pos.x - ox) / rad).clamp(-1.0, 1.0);
+                    let sy = ((pos.y - oy) / rad).clamp(-1.0, 1.0);
+                    TOUCH_STICK.set((sx, sy));
+                }
             }
-            return;
         }
     }
 
@@ -787,17 +783,25 @@ impl INode2D for KneeMan {
         }
         } // end gizmos overlay
 
-        // DAIR telegraph: always draw the live hitboxes when a fighter is in Dair so the landing
-        // arc reads for opponents even with gizmos off. Skip when gizmos is on -- those boxes are
-        // already drawn above in the full overlay pass.
+        // DAIR + B-move telegraph: always draw the live hitboxes for Dair and the four specials
+        // (SpecialN/S/U/D) so those moves read even with gizmos off -- the specials have no bespoke
+        // anim frames, so the hitbox IS the read. Skip when gizmos is on: already drawn above.
         if !self.gizmos.get() {
-            let dair_col = Color::from_rgba(1.0, 0.45, 0.05, 0.55);
+            let tele_col = Color::from_rgba(1.0, 0.45, 0.05, 0.55);
             for f in &s.fighters[..active] {
-                if f.state == CharState::Dair {
+                let telegraphed = matches!(
+                    f.state,
+                    CharState::Dair
+                        | CharState::SpecialN
+                        | CharState::SpecialS
+                        | CharState::SpecialU
+                        | CharState::SpecialD
+                );
+                if telegraphed {
                     for hb in sim::live_hitboxes(f, &t).into_iter().flatten() {
                         let (hc, hr) = hb;
                         let c = gv(hc) - origin;
-                        self.base_mut().draw_circle(c, hr, dair_col);
+                        self.base_mut().draw_circle(c, hr, tele_col);
                     }
                 }
             }
@@ -1160,21 +1164,11 @@ impl KneeMan {
     /// stage (rising-edge, so one press = one spawn). Local play only — it mutates state outside the
     /// rollback loop, so it is deliberately not wired into the netplay path.
     fn poll_spawn_keys(&mut self, s: &mut SimState) {
-        use godot::global::Key;
-        const KEYS: [Key; 10] = [
-            Key::KEY_1, Key::KEY_2, Key::KEY_3, Key::KEY_4, Key::KEY_5,
-            Key::KEY_6, Key::KEY_7, Key::KEY_8, Key::KEY_9, Key::KEY_0,
-        ];
-        let input = Input::singleton();
         let tune = self.tune.get();
-        for (i, key) in KEYS.iter().enumerate() {
-            let down = input.is_key_pressed(*key);
-            if down && !self.spawn_prev[i] {
-                if let Some(card) = sim::MENU_ITEMS.get(i) {
-                    sim::spawn_kind(s, card.kind, &tune);
-                }
+        for i in crate::controls::number_key_edges(&mut self.spawn_prev) {
+            if let Some(card) = sim::MENU_ITEMS.get(i) {
+                sim::spawn_kind(s, card.kind, &tune);
             }
-            self.spawn_prev[i] = down;
         }
     }
 
@@ -1750,7 +1744,7 @@ impl KneeMan {
             .map(|d| d.bind().is_menu_open())
             .unwrap_or(false);
         let show_touch = godot::classes::DisplayServer::singleton().is_touchscreen_available()
-            && Input::singleton().get_connected_joypads().is_empty()
+            && !crate::controls::gamepad_connected()
             && !menu_open;
         for poly in self.quad_polys.iter_mut() {
             poly.set_visible(show_touch);
