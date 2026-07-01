@@ -38,6 +38,32 @@ pub(crate) fn decode_state(b64: &str) -> Option<SimState> {
     bincode::deserialize::<SimState>(raw.as_slice()).ok()
 }
 
+/// An empty lobby is culled after this long with nobody in it. The remaining countdown ships in each
+/// lobby-list row so the grid can show it tick down.
+pub const LOBBY_TTL_MS: u64 = 60_000;
+
+/// One row in the versioned lobby browser. Shell-only view state (never in `SimState`/checksum). Today
+/// `key` is the build version (lobbies are grouped/filtered by version — a "floating room by version");
+/// the eventual generic lifecycle identity is `(key, host, created, active)`.
+#[derive(Clone)]
+pub struct LobbyRow {
+    pub key: String,                 // version string today; any lifecycle key later
+    pub host: String,                // user / creator
+    pub active: u8,                  // players currently in
+    pub cap: u8,                     // capacity
+    pub empty_since_ms: Option<u64>, // Some once active == 0; drives the TTL countdown
+}
+
+impl LobbyRow {
+    /// Seconds left before the relay culls this empty lobby, or `None` while it still has players.
+    /// Saturates at 0 (a lobby past its TTL is on its way out this frame).
+    pub fn ttl_remaining_secs(&self, now_ms: u64) -> Option<u32> {
+        let since = self.empty_since_ms?;
+        let elapsed = now_ms.saturating_sub(since);
+        Some((LOBBY_TTL_MS.saturating_sub(elapsed) / 1000) as u32)
+    }
+}
+
 /// Read-only snapshot of the netplay transport machine for the debug panel. Every field is a
 /// `&'static str` (Copy) so it rides a `Mutable` cheaply; the human names are resolved in the shell
 /// (here) where the godot WebRTC enums are in scope. Counts are (sent, received) for each handshake

@@ -165,6 +165,8 @@ impl INode for DebugUi {
             let mut open_panel = false;
             let mut find_match = false;
             let mut leave_match = false;
+            let mut open_lobby = false;
+            let mut join_lobby: Option<String> = None;
             out.retain(|intent| match intent {
                 Intent::OpenDebugPanel => {
                     open_panel = true;
@@ -178,6 +180,14 @@ impl INode for DebugUi {
                     leave_match = true;
                     false
                 }
+                Intent::OpenLobby => {
+                    open_lobby = true;
+                    false
+                }
+                Intent::JoinLobby(key) => {
+                    join_lobby = Some(key.clone());
+                    false
+                }
                 _ => true,
             });
             if open_panel {
@@ -188,6 +198,12 @@ impl INode for DebugUi {
             }
             if leave_match {
                 fighter.bind_mut().leave_match();
+            }
+            if open_lobby {
+                fighter.bind_mut().open_lobby();
+            }
+            if let Some(key) = join_lobby {
+                fighter.bind_mut().join_lobby(key);
             }
             self.router.apply(out, &cells);
         }

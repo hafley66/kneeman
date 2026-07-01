@@ -221,6 +221,10 @@ pub enum Intent {
     /// intercepts them before `Router::apply` and drives the KneeMan netplay methods.
     FindMatch,
     LeaveMatch,
+    /// Versioned lobby browser (also shell-intercepted, Router no-ops). `OpenLobby` hosts a room for
+    /// the current version; `JoinLobby` dials an existing one by its key. Wired to the mesh in P2.
+    OpenLobby,
+    JoinLobby(String),
 }
 
 /// Wraps the pure [`Nav`] and interprets [`Intent`]s: nav edges go through `Nav::reduce`, app edges
@@ -265,7 +269,11 @@ impl Router {
                 }
             }
             // Intercepted by the shell before Router::apply is called; pure Router ignores them.
-            Intent::OpenDebugPanel | Intent::FindMatch | Intent::LeaveMatch => {}
+            Intent::OpenDebugPanel
+            | Intent::FindMatch
+            | Intent::LeaveMatch
+            | Intent::OpenLobby
+            | Intent::JoinLobby(_) => {}
         }
     }
 

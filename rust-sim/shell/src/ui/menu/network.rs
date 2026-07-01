@@ -1,35 +1,105 @@
 use super::router::{Intent, MenuCtx};
 use super::Screen;
+use crate::net::{now_ms, LobbyRow};
 use crate::ui::themes::Theme;
+use egui::{Color32, RichText};
 
-/// Netplay page: the matchmaking control moved off the play area into the menu. Shows the live
-/// transport snapshot ([`crate::net::NetDebug`]) and a Find/Leave button keyed off the phase. The
-/// on-screen chip stays as a passive indicator; joining/leaving happens here.
+/// Netplay page: 1v1 quick-match plus the versioned lobby browser. Lobbies are grouped by build
+/// version ("floating rooms by version"); an empty one is culled after a TTL, shown ticking down in
+/// the grid. Rows are a placeholder until the relay's `list` feed lands (see lobby-netplay-plan.md).
 pub struct Network;
+
+/// Placeholder lobby feed so the grid renders + the TTL visibly ticks. Swap for the relay `list`
+/// reply in P2. The empty row's `empty_since` loops each minute so the countdown animates. A lobby
+/// holds N players up to `MAX_PLAYERS` (4 today); cap is per-room, never a literal here.
+fn demo_lobbies(now: u64) -> Vec<LobbyRow> {
+    let ver = "v0.3";
+    let cap = crate::sim::MAX_PLAYERS as u8;
+    vec![
+        LobbyRow { key: ver.into(), host: "kneeman".into(), active: 3, cap, empty_since_ms: None },
+        LobbyRow { key: ver.into(), host: "hafley".into(), active: 1, cap, empty_since_ms: None },
+        LobbyRow {
+            key: ver.into(),
+            host: "ghosttown".into(),
+            active: 0,
+            cap,
+            empty_since_ms: Some(now.saturating_sub((now / 1000 % 60) * 1000)),
+        },
+    ]
+}
+
+/// Color the TTL countdown hot as it runs out.
+fn ttl_color(secs: u32) -> Color32 {
+    match secs {
+        0..=5 => Color32::from_rgb(230, 90, 80),
+        6..=20 => Color32::from_rgb(230, 180, 70),
+        _ => Color32::from_rgb(140, 150, 165),
+    }
+}
 
 impl Screen for Network {
     fn view<T: Theme>(&self, ui: &mut egui::Ui, theme: &T, cx: &MenuCtx, out: &mut Vec<Intent>) {
         let net = cx.net;
         let offline = net.phase == "offline";
 
-        ui.label(egui::RichText::new(format!("Status: {}", net.phase)).strong());
-        ui.add_space(6.0);
-
-        if offline {
-            ui.label("Not connected. Find a match to play someone online.");
-        } else {
+        ui.label(RichText::new(format!("Status: {}", net.phase)).strong());
+        if !offline {
             ui.label(format!("role: {}   ·   handle: {}", net.role, net.handle));
-            ui.label(format!("signaling: {}   ·   connection: {}", net.ws, net.conn));
-            ui.label(format!("ice: {}   ·   channel: {}", net.gather, net.channel));
+            ui.label(format!("signaling: {}   ·   channel: {}", net.ws, net.channel));
         }
 
-        ui.add_space(10.0);
-        if offline {
-            if theme.button(ui, "Find match").clicked() {
-                out.push(Intent::FindMatch);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if offline {
+                if theme.button(ui, "Find match").clicked() {
+                    out.push(Intent::FindMatch);
+                }
+                if theme.button(ui, "Open lobby").clicked() {
+                    out.push(Intent::OpenLobby);
+                }
+            } else if theme.button(ui, "Leave match").clicked() {
+                out.push(Intent::LeaveMatch);
             }
-        } else if theme.button(ui, "Leave match").clicked() {
-            out.push(Intent::LeaveMatch);
+        });
+
+        ui.add_space(12.0);
+        ui.label(RichText::new("Lobbies").strong());
+        ui.add_space(4.0);
+
+        let now = now_ms();
+        let lobbies = demo_lobbies(now);
+        egui::Grid::new("lobby_grid")
+            .striped(true)
+            .num_columns(5)
+            .spacing([14.0, 6.0])
+            .show(ui, |ui| {
+                for h in ["Version", "Host", "Players", "TTL", ""] {
+                    ui.label(RichText::new(h).strong().weak());
+                }
+                ui.end_row();
+
+                for row in &lobbies {
+                    ui.label(&row.key);
+                    ui.label(&row.host);
+                    let full = row.active >= row.cap;
+                    ui.label(
+                        RichText::new(format!("{}/{}", row.active, row.cap))
+                            .color(if full { Color32::from_rgb(230, 90, 80) } else { Color32::GRAY }),
+                    );
+                    match row.ttl_remaining_secs(now) {
+                        Some(s) => ui.label(RichText::new(format!("culls {s}s")).color(ttl_color(s))),
+                        None => ui.label(RichText::new("live").color(Color32::from_rgb(120, 200, 130))),
+                    };
+                    if ui.add_enabled(!full, egui::Button::new("Join").small()).clicked() {
+                        out.push(Intent::JoinLobby(row.key.clone()));
+                    }
+                    ui.end_row();
+                }
+            });
+
+        if lobbies.is_empty() {
+            ui.add_space(4.0);
+            ui.label(RichText::new("No lobbies for this version yet — open one.").weak());
         }
     }
 }
