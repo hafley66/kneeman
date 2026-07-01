@@ -1,31 +1,42 @@
-//! Minimal WebRTC signaling relay. Pairs WebSocket clients two at a time and forwards every text
-//! frame from one peer to the other, unread. The client (the gdext shell) speaks JSON:
+//! Single-process game server: a WebRTC signaling relay + web-push endpoints + the static host for
+//! the Godot web export. Built on axum so one binary replaces nginx + matchbox + the old hand-rolled
+//! HTTP loop (see plans/single-process-server.md).
 //!
-//!   server -> peer  : {"kind":"matched","role":"host"}   (first in a pair = host, second = guest)
-//!   peer   -> server: {"kind":"offer"|"answer"|"ice", ...}   (relayed verbatim to the partner)
-//!   server -> peer  : {"kind":"bye"}                     (partner left)
+//! Routes:
+//!   GET  /rtc        WebSocket relay. Pairs clients two at a time PER ROOM and forwards every text
+//!                    frame between the pair, unread. The client (gdext shell) speaks JSON:
+//!                      server -> peer : {"kind":"matched","role":"host"}   (first in a pair = host)
+//!                      peer   -> peer : {"kind":"offer"|"answer"|"ice",..} (relayed verbatim)
+//!                      server -> peer : {"kind":"bye"}                     (partner left)
+//!                    Deliberately dumb: it never parses the SDP/ICE; gameplay is direct P2P after.
+//!   GET  /status     JSON snapshot: build, uptime, waiting/pending counts, every connected client.
+//!   GET  /vapid      the browser's applicationServerKey (push), or null when push is off.
+//!   POST /subscribe  store a browser PushSubscription for a room.
+//!   /game/*          static Godot web export (ServeDir), with COOP/COEP + gzip + no-cache headers.
 //!
-//! The host creates the WebRTC offer; the guest answers. The relay is deliberately dumb: it does
-//! not parse offer/answer/ice payloads, only the pairing handshake is server-driven.
-//!
-//! Pairing is a single waiting slot (the matchbox `?next=2` behavior): the first connection waits,
-//! the second one snaps to it, both get a partner channel, the slot clears for the next two.
-//!
-//! Observability: a plain HTTP GET to the same route (no WebSocket upgrade) returns a JSON status
-//! snapshot — build hash + time, uptime, the pending/waiting count, and every connected client's
-//! name + color (sent as `?name=&color=` query params on the WS URL). Any browser can read it.
+//! Pairing is a single waiting slot per room (matchbox `?next=2` behavior): the first connection
+//! parks, the second snaps to it, both get the other's channel, the slot clears for the next two.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use futures_util::{SinkExt, StreamExt};
+use axum::body::Bytes;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, Query, State};
+use axum::http::{header, HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Router;
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio_tungstenite::tungstenite::Message;
+use tower::ServiceBuilder;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 use web_push::SubscriptionInfo;
 
 mod config;
@@ -50,12 +61,12 @@ struct Pending {
     give_guest: oneshot::Sender<mpsc::UnboundedSender<String>>,
 }
 
-type Lobby = Arc<Mutex<HashMap<String, Pending>>>;
+type Lobby = Mutex<HashMap<String, Pending>>;
 
 /// One connected client, as the status endpoint sees it. `role`/`matched` fill in once paired.
 #[derive(Clone)]
 struct ClientInfo {
-    who: String,    // peer socket address
+    who: String,    // peer socket address (loopback when behind a proxy)
     name: String,   // from ?name= (the player's localStorage name)
     color: String,  // from ?color= (their localStorage color, e.g. "#aabbcc")
     build: String,  // from ?hash= (their git build hash; compare to build_hash to spot mismatches)
@@ -74,6 +85,21 @@ struct Server {
     push: PushState,
 }
 
+type Shared = Arc<Server>;
+
+/// Query params on the `/rtc` WebSocket URL (percent-decoded by serde_urlencoded). All optional.
+#[derive(Deserialize, Default)]
+struct Join {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    color: String,
+    #[serde(default)]
+    room: String,
+    #[serde(default)]
+    hash: String,
+}
+
 /// POST /subscribe body: a browser PushSubscription plus the room it wants pings for.
 #[derive(Deserialize)]
 struct SubscribeReq {
@@ -85,124 +111,166 @@ struct SubscribeReq {
 #[tokio::main]
 async fn main() {
     let cfg = Config::from_env();
-    let listener = TcpListener::bind(&cfg.bind_addr).await.expect("bind signaling port");
-    println!(
-        "smash-signaling listening on ws://{} (proxy wss://host/rtc) — build {BUILD_HASH}",
-        cfg.bind_addr
-    );
-    let server = Arc::new(Server {
+    let bind = cfg.bind_addr.clone();
+    let game_dir = cfg.game_dir.clone();
+    let server: Shared = Arc::new(Server {
         started: Instant::now(),
         started_unix: now_unix(),
         next_id: AtomicU64::new(1),
         clients: Mutex::new(BTreeMap::new()),
-        lobby: Arc::new(Mutex::new(HashMap::new())),
+        lobby: Mutex::new(HashMap::new()),
         push: PushState::new(cfg),
     });
 
-    loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
-        let server = server.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle(stream, server).await {
-                eprintln!("peer ended: {e}");
-            }
-        });
-    }
+    // Static host for the Godot export: serve precompressed `.gz` when present (the 40MB engine wasm
+    // is gzipped at export time), and stamp the cross-origin-isolation + revalidation headers that the
+    // threaded wasm build needs. This is the nginx `godot.conf` block, in-process.
+    let coop = HeaderName::from_static("cross-origin-opener-policy");
+    let coep = HeaderName::from_static("cross-origin-embedder-policy");
+    let game = ServiceBuilder::new()
+        .layer(SetResponseHeaderLayer::overriding(coop, HeaderValue::from_static("same-origin")))
+        .layer(SetResponseHeaderLayer::overriding(coep, HeaderValue::from_static("require-corp")))
+        .layer(SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static("no-cache")))
+        .service(
+            ServeDir::new(&game_dir)
+                .precompressed_gzip()
+                .append_index_html_on_directories(true),
+        );
+
+    let app = Router::new()
+        .route("/rtc", get(ws_upgrade))
+        .route("/status", get(status))
+        .route("/", get(status))
+        .route("/vapid", get(vapid))
+        .route("/subscribe", post(subscribe))
+        .nest_service("/game", game)
+        // Browser reads /status etc. cross-origin; keep the old permissive CORS. Also answers the
+        // OPTIONS preflight the hand-rolled server used to special-case.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
+        .with_state(server);
+
+    let listener = TcpListener::bind(&bind).await.expect("bind server port");
+    println!("smash server listening on http://{bind}  (game_dir={game_dir}) — build {BUILD_HASH}");
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .expect("serve");
 }
 
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Peek the request head and route. A WebSocket upgrade (carries `Sec-WebSocket-Key`) is the relay;
-/// everything else is plain HTTP routed by method + path. Peeking (not reading) leaves the bytes for
-/// `accept_async` on the WS path; the HTTP handlers own the stream and read it themselves.
-async fn handle(stream: tokio::net::TcpStream, server: Arc<Server>) -> Result<(), String> {
-    let mut buf = [0u8; 2048];
-    let n = stream.peek(&mut buf).await.map_err(|e| e.to_string())?;
-    let head = String::from_utf8_lossy(&buf[..n]);
-    let lower = head.to_ascii_lowercase();
+// --- WebSocket relay -----------------------------------------------------------------------------
 
-    if lower.contains("sec-websocket-key") {
-        let (name, color, room, build) = parse_query(&head);
-        return relay(stream, server, name, color, room, build).await;
-    }
-
-    let (method, path) = request_line(&head);
-    match (method.as_str(), path.as_str()) {
-        ("OPTIONS", _) => write_http(stream, "204 No Content", "text/plain", "").await,
-        ("GET", "/vapid") => serve_vapid(stream, &server).await,
-        ("POST", "/subscribe") => handle_subscribe(stream, &server).await,
-        ("GET", "/status") | ("GET", "/") => serve_status(stream, &server).await,
-        _ => write_http(stream, "404 Not Found", "text/plain", "not found").await,
-    }
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(server): State<Shared>,
+    ConnectInfo(who): ConnectInfo<SocketAddr>,
+    Query(j): Query<Join>,
+) -> Response {
+    ws.on_upgrade(move |sock| relay(sock, server, who.to_string(), j))
 }
 
-/// (METHOD, PATH-without-query) from the request line, e.g. "POST /subscribe?x HTTP/1.1" -> ("POST","/subscribe").
-fn request_line(head: &str) -> (String, String) {
-    let mut parts = head.lines().next().unwrap_or("").split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let target = parts.next().unwrap_or("/");
-    let path = target.split('?').next().unwrap_or("/").to_string();
-    (method, path)
+/// Register the client, run the pair-and-forward loop, then always deregister.
+async fn relay(mut sock: WebSocket, server: Shared, who: String, j: Join) {
+    let room = norm_room(&j.room);
+    println!("connect {who} ({}) room '{room}' build '{}'", j.name, j.hash);
+    let id = server.next_id.fetch_add(1, Ordering::Relaxed);
+    server.clients.lock().await.insert(
+        id,
+        ClientInfo {
+            who,
+            name: j.name.clone(),
+            color: j.color,
+            build: j.hash,
+            role: String::new(),
+            matched: false,
+            since_unix: now_unix(),
+        },
+    );
+    relay_inner(&mut sock, &server, id, &j.name, &room).await;
+    server.clients.lock().await.remove(&id);
 }
 
-/// Extract `name`/`color`/`room`/`hash` from the request line's query string (URL-decoded, lightly).
-/// `hash` is the client's git build hash, surfaced in /status so mismatched clients are visible.
-fn parse_query(head: &str) -> (String, String, String, String) {
-    let query = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1)) // "GET /rtc?name=..&color=..&room=..&hash=.. HTTP/1.1"
-        .and_then(|path| path.split_once('?').map(|(_, q)| q.to_string()))
-        .unwrap_or_default();
-    let (mut name, mut color, mut room, mut build) =
-        (String::new(), String::new(), String::new(), String::new());
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            match k {
-                "name" => name = url_decode(v),
-                "color" => color = url_decode(v),
-                "room" => room = url_decode(v),
-                "hash" => build = url_decode(v),
-                _ => {}
+async fn relay_inner(sock: &mut WebSocket, server: &Shared, id: u64, name: &str, room: &str) {
+    // Messages destined FOR this peer (written by the partner's relay task) arrive on this channel.
+    let (to_me, mut from_partner) = mpsc::unbounded_channel::<String>();
+
+    // Claim a partner within this ROOM: snap to a waiting host (we become guest), else park as host
+    // and ping anyone subscribed to the room that a match is now waiting.
+    let (role, to_partner): (&str, mpsc::UnboundedSender<String>) = {
+        let mut slot = server.lobby.lock().await;
+        match slot.remove(room) {
+            Some(p) => {
+                let _ = p.give_guest.send(to_me.clone());
+                ("guest", p.to_host)
             }
-        }
-    }
-    (name, color, room, build)
-}
-
-/// Just enough percent-decoding for `%23` (#) and `+` spaces; identity strings are short + tame.
-fn url_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    out.push(b as char);
-                    i += 3;
-                    continue;
+            None => {
+                let (give, got) = oneshot::channel();
+                slot.insert(room.to_string(), Pending { to_host: to_me.clone(), give_guest: give });
+                drop(slot);
+                let who_label = if name.is_empty() { "someone".to_string() } else { name.to_string() };
+                server.push.notify(
+                    room.to_string(),
+                    "🥊 lobby waiting".to_string(),
+                    format!("{who_label} is waiting in '{room}' — tap to fight"),
+                );
+                match got.await {
+                    Ok(guest_tx) => ("host", guest_tx),
+                    Err(_) => {
+                        // We left before a guest arrived: clear our own parked slot if it's still ours.
+                        let mut s = server.lobby.lock().await;
+                        if s.get(room).map(|p| p.to_host.same_channel(&to_me)).unwrap_or(false) {
+                            s.remove(room);
+                        }
+                        return;
+                    }
                 }
-                out.push('%');
-                i += 1;
-            }
-            b'+' => {
-                out.push(' ');
-                i += 1;
-            }
-            c => {
-                out.push(c as char);
-                i += 1;
             }
         }
+    };
+
+    // Mark this client matched in the registry now that it has a partner + role.
+    if let Some(c) = server.clients.lock().await.get_mut(&id) {
+        c.role = role.to_string();
+        c.matched = true;
     }
-    out
+
+    println!("matched {id} as {role}");
+    if sock.send(Message::Text(format!(r#"{{"kind":"matched","role":"{role}"}}"#))).await.is_err() {
+        let _ = to_partner.send(r#"{"kind":"bye"}"#.to_string());
+        return;
+    }
+
+    // rxjs: merge( ws$.subscribe(partner), partner$.subscribe(ws) ) until either side completes.
+    loop {
+        tokio::select! {
+            msg = sock.recv() => match msg {
+                Some(Ok(Message::Text(t))) => { let _ = to_partner.send(t); }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {}          // ignore binary/ping/pong
+                Some(Err(_)) => break,
+            },
+            out = from_partner.recv() => match out {
+                Some(t) => { if sock.send(Message::Text(t)).await.is_err() { break; } }
+                None => break,
+            },
+        }
+    }
+
+    let _ = to_partner.send(r#"{"kind":"bye"}"#.to_string());
+    println!("disconnect {id} ({role})");
 }
 
-/// Write the JSON status snapshot as a tiny HTTP/1.1 response, then close.
-async fn serve_status(mut stream: tokio::net::TcpStream, server: &Arc<Server>) -> Result<(), String> {
+// --- HTTP handlers -------------------------------------------------------------------------------
+
+/// JSON status snapshot for the observability page.
+async fn status(State(server): State<Shared>) -> Response {
     let clients = server.clients.lock().await;
     let pending = !server.lobby.lock().await.is_empty();
     let waiting = clients.values().filter(|c| !c.matched).count();
@@ -235,14 +303,29 @@ async fn serve_status(mut stream: tokio::net::TcpStream, server: &Arc<Server>) -
         rows,
     );
     drop(clients);
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream.write_all(resp.as_bytes()).await.map_err(|e| e.to_string())?;
-    stream.shutdown().await.ok();
-    Ok(())
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// GET /vapid -> the client's applicationServerKey (base64url), or null when push is off.
+async fn vapid(State(server): State<Shared>) -> Response {
+    let body = match server.push.public_key() {
+        Some(key) => format!(r#"{{"publicKey":"{key}"}}"#),
+        None => r#"{"publicKey":null}"#.to_string(),
+    };
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// POST /subscribe -> store a browser PushSubscription for a room. Body: {room, subscription}.
+async fn subscribe(State(server): State<Shared>, body: Bytes) -> Response {
+    match serde_json::from_slice::<SubscribeReq>(&body) {
+        Ok(req) => {
+            let room = norm_room(&req.room);
+            server.push.subscribe(room.clone(), req.subscription).await;
+            println!("[push] subscribed a device to room '{room}'");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("bad json: {e}")).into_response(),
+    }
 }
 
 /// Minimal JSON string escaping for the few fields we echo (name/color/addr).
@@ -260,199 +343,4 @@ fn json_str(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-/// Generic tiny HTTP response (always CORS-open, always Connection: close). `status` is the full
-/// status line text, e.g. "200 OK" / "204 No Content" / "404 Not Found".
-async fn write_http(
-    mut stream: tokio::net::TcpStream,
-    status: &str,
-    content_type: &str,
-    body: &str,
-) -> Result<(), String> {
-    let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: content-type\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(resp.as_bytes()).await.map_err(|e| e.to_string())?;
-    stream.shutdown().await.ok();
-    Ok(())
-}
-
-/// GET /vapid -> the client's applicationServerKey (base64url), or null when push is off. The client
-/// fetches this instead of hard-coding a key, so nothing is pinned to a host or baked at build time.
-async fn serve_vapid(stream: tokio::net::TcpStream, server: &Arc<Server>) -> Result<(), String> {
-    let body = match server.push.public_key() {
-        Some(key) => format!(r#"{{"publicKey":"{key}"}}"#),
-        None => r#"{"publicKey":null}"#.to_string(),
-    };
-    write_http(stream, "200 OK", "application/json", &body).await
-}
-
-/// POST /subscribe -> store a browser PushSubscription for a room. Body: {room, subscription}.
-async fn handle_subscribe(stream: tokio::net::TcpStream, server: &Arc<Server>) -> Result<(), String> {
-    let (stream, raw) = read_http_body(stream).await?;
-    match serde_json::from_slice::<SubscribeReq>(&raw) {
-        Ok(req) => {
-            let room = norm_room(&req.room);
-            server.push.subscribe(room.clone(), req.subscription).await;
-            println!("[push] subscribed a device to room '{room}'");
-            write_http(stream, "204 No Content", "text/plain", "").await
-        }
-        Err(e) => write_http(stream, "400 Bad Request", "text/plain", &format!("bad json: {e}")).await,
-    }
-}
-
-/// Read an HTTP request fully off the stream and return (stream, body-bytes). Reads headers to find
-/// Content-Length, then the body. The stream is returned so the caller can still write the response.
-async fn read_http_body(
-    mut stream: tokio::net::TcpStream,
-) -> Result<(tokio::net::TcpStream, Vec<u8>), String> {
-    let mut buf = Vec::with_capacity(2048);
-    let mut tmp = [0u8; 2048];
-    // read until headers complete
-    let headers_end = loop {
-        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-            break pos + 4;
-        }
-        let n = stream.read(&mut tmp).await.map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err("connection closed before headers".into());
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    };
-    let head = String::from_utf8_lossy(&buf[..headers_end]).to_ascii_lowercase();
-    let want = head
-        .lines()
-        .find_map(|l| l.strip_prefix("content-length:"))
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    while buf.len() - headers_end < want {
-        let n = stream.read(&mut tmp).await.map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    }
-    let body = buf[headers_end..(headers_end + want).min(buf.len())].to_vec();
-    Ok((stream, body))
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// The original relay: pair two peers and forward text between them. Now also registers the client
-/// in the shared map (for `/status`) and tears the entry down on disconnect.
-async fn relay(
-    stream: tokio::net::TcpStream,
-    server: Arc<Server>,
-    name: String,
-    color: String,
-    room: String,
-    build: String,
-) -> Result<(), String> {
-    let who = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
-    let room = norm_room(&room);
-    println!("connect {who} ({name}) room '{room}' build '{build}'");
-    let id = server.next_id.fetch_add(1, Ordering::Relaxed);
-    server.clients.lock().await.insert(
-        id,
-        ClientInfo {
-            who: who.clone(),
-            name: name.clone(),
-            color,
-            build,
-            role: String::new(),
-            matched: false,
-            since_unix: now_unix(),
-        },
-    );
-    // Always drop the registry entry, however this task exits.
-    let result = relay_inner(stream, &server, id, &who, &name, &room).await;
-    server.clients.lock().await.remove(&id);
-    result
-}
-
-async fn relay_inner(
-    stream: tokio::net::TcpStream,
-    server: &Arc<Server>,
-    id: u64,
-    who: &str,
-    name: &str,
-    room: &str,
-) -> Result<(), String> {
-    let lobby = server.lobby.clone();
-    let ws = tokio_tungstenite::accept_async(stream).await.map_err(|e| e.to_string())?;
-    let (mut tx_ws, mut rx_ws) = ws.split();
-
-    // Messages destined FOR this peer (written by the partner's relay task) arrive on this channel.
-    let (to_me, mut from_partner) = mpsc::unbounded_channel::<String>();
-
-    // Claim a partner within this ROOM: snap to a waiting host (we become guest), else park as host
-    // and ping anyone subscribed to the room that a match is now waiting.
-    let (role, to_partner): (&str, mpsc::UnboundedSender<String>) = {
-        let mut slot = lobby.lock().await;
-        match slot.remove(room) {
-            Some(p) => {
-                let _ = p.give_guest.send(to_me.clone());
-                ("guest", p.to_host)
-            }
-            None => {
-                let (give, got) = oneshot::channel();
-                slot.insert(room.to_string(), Pending { to_host: to_me.clone(), give_guest: give });
-                drop(slot);
-                let who_label = if name.is_empty() { "someone".to_string() } else { name.to_string() };
-                server.push.notify(
-                    room.to_string(),
-                    "🥊 lobby waiting".to_string(),
-                    format!("{who_label} is waiting in '{room}' — tap to fight"),
-                );
-                match got.await {
-                    Ok(guest_tx) => ("host", guest_tx),
-                    Err(_) => {
-                        let mut s = lobby.lock().await;
-                        if s.get(room).map(|p| p.to_host.same_channel(&to_me)).unwrap_or(false) {
-                            s.remove(room);
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    };
-
-    // Mark this client matched in the registry now that it has a partner + role.
-    if let Some(c) = server.clients.lock().await.get_mut(&id) {
-        c.role = role.to_string();
-        c.matched = true;
-    }
-
-    println!("matched {who} as {role}");
-    tx_ws
-        .send(Message::Text(format!(r#"{{"kind":"matched","role":"{role}"}}"#).into()))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Relay loop: forward our inbound WS text to the partner; write partner text out to our WS.
-    loop {
-        tokio::select! {
-            msg = rx_ws.next() => match msg {
-                Some(Ok(Message::Text(t))) => { let _ = to_partner.send(t.to_string()); }
-                Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(_)) => {}
-                Some(Err(_)) => break,
-            },
-            out = from_partner.recv() => match out {
-                Some(t) => tx_ws.send(Message::Text(t.into())).await.map_err(|e| e.to_string())?,
-                None => break,
-            },
-        }
-    }
-
-    println!("disconnect {who} ({role})");
-    let _ = to_partner.send(r#"{"kind":"bye"}"#.to_string());
-    Ok(())
 }

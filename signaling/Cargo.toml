@@ -14,8 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
-tokio-tungstenite = "0.24"
-futures-util = "0.3"
+# axum owns the HTTP surface now: ws relay + JSON handlers + a tower-http ServeDir for the Godot
+# web export (the /game/ static host that nginx used to serve). One process, one framework.
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "set-header", "cors"] }
 web-push = { version = "0.11.0", default-features = false, features = ["hyper-client"] }
 # web-push's hyper-client uses hyper-tls -> openssl-sys. Vendor openssl so the binary builds on any
 # box without libssl-dev installed (build-time needs only a C compiler + perl, which the rust

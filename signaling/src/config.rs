@@ -7,6 +7,7 @@
 //!   VAPID_SUBJECT      contact put in the VAPID JWT     (default mailto:admin@localhost)
 //!   SUBS_PATH          file the push subscriptions live in (default ./subscriptions.json)
 //!   PUSH_TTL_SECS      how long a push may queue at the push service (default 600)
+//!   GAME_DIR           static root for the Godot web export at /game/ (default /var/www/smash-godot)
 
 use std::env;
 
@@ -17,6 +18,7 @@ pub struct Config {
     pub vapid_subject: String,
     pub subs_path: String,
     pub push_ttl_secs: u32,
+    pub game_dir: String, // static root for the Godot web export served at /game/
 }
 
 impl Config {
@@ -37,6 +39,7 @@ impl Config {
             vapid_subject: env::var("VAPID_SUBJECT").unwrap_or_else(|_| "mailto:admin@localhost".into()),
             subs_path: env::var("SUBS_PATH").unwrap_or_else(|_| "./subscriptions.json".into()),
             push_ttl_secs: env::var("PUSH_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(600),
+            game_dir: env::var("GAME_DIR").unwrap_or_else(|_| "/var/www/smash-godot".into()),
         }
     }
 }
