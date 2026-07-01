@@ -497,3 +497,73 @@ fn falling_past_the_blast_zone_respawns() {
     assert!(after.fighters[0].pos.y <= spawn_y + 1.0, "should respawn back at the top");
     assert_eq!(after.fighters[0].damage, 0.0, "respawn resets damage");
 }
+
+#[test]
+fn an_unowned_gun_off_stage_keeps_falling_and_despawns_at_the_blast_zone() {
+    // FLOOR_RIGHT = 1050, GROUND_Y = 760, BLAST_Y = 1600 (all pixel space). Place a gun well past
+    // the right ledge, above the pit, at rest.
+    let (mut s, t) = settled();
+    s.items[0] = Item {
+        kind: ItemKind::LaserGun,
+        pos: Vector2::new(1400.0, 700.0), // off the span (x > FLOOR_RIGHT), above the floor y
+        gas: 16.0,
+        gas_max: 16.0,
+        ..Item::EMPTY
+    };
+    // one step must NOT snap it to the invisible floor at GROUND_Y (760) — off the span it accrues
+    // downward velocity instead of dead-stopping.
+    s = step(&s, &[&idle(), &idle()], &t);
+    assert!(s.items[0].active(), "still in flight after one step");
+    assert!(s.items[0].vel.y > 0.0, "gravity pulls it down instead of resting on an invisible floor");
+    let mut fell_past_floor = false;
+    let mut gone = false;
+    for _ in 0..600 {
+        s = step(&s, &[&idle(), &idle()], &t);
+        if s.items[0].active() && s.items[0].pos.y > 760.0 + 1.0 {
+            fell_past_floor = true; // dropped below the old invisible floor rather than settling on it
+        }
+        if !s.items[0].active() {
+            gone = true;
+            break;
+        }
+    }
+    assert!(fell_past_floor, "the gun should fall past GROUND_Y (no invisible floor off the span)");
+    assert!(gone, "the gun should despawn after crossing the blast zone");
+    assert!(!s.items[0].active(), "despawn = empty slot, quietly");
+}
+
+#[test]
+fn a_bomb_off_stage_despawns_quietly_without_exploding() {
+    // A live bomb lobbed over the pit (x well past FLOOR_RIGHT = 1050) must fall past GROUND_Y and
+    // cross BLAST_Y (1600) BEFORE its fuse (t.bomb.range) ends, then vanish with NO explosion.
+    let (mut s, t) = settled();
+    s.items[0] = Item {
+        kind: ItemKind::Bomb,
+        pos: Vector2::new(1400.0, 700.0),
+        vel: Vector2::ZERO,
+        owner: -1,
+        timer: t.bomb.range, // full fuse; it should die by falling, not by fusing out
+        gas: 0.0,
+        gas_max: 1.0,
+        ..Item::EMPTY
+    };
+    let dmg0 = [s.fighters[0].damage, s.fighters[1].damage];
+    // first step: it arcs down, it does not detonate on the invisible floor off the span.
+    s = step(&s, &[&idle(), &idle()], &t);
+    assert!(s.items[0].active(), "bomb still falling after one step (no invisible-floor detonation)");
+    assert!(s.items[0].pos.y > 700.0, "bomb falls off the span instead of resting/detonating");
+    let mut gone = false;
+    for _ in 0..600 {
+        s = step(&s, &[&idle(), &idle()], &t);
+        if !s.items[0].active() {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "the bomb should despawn after crossing the blast zone");
+    assert!(!s.items[0].active(), "quiet despawn = empty slot");
+    assert_eq!(
+        [s.fighters[0].damage, s.fighters[1].damage], dmg0,
+        "a bomb that fell out of bounds must not explode or damage anyone"
+    );
+}

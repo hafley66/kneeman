@@ -28,6 +28,7 @@ pub fn menu<T: Theme>(
     theme: &T,
     router: &mut Router,
     cells: &MenuCells,
+    lobbies: &[crate::net::LobbyRow],
     out: &mut Vec<Intent>,
 ) {
     let loc = router.location();
@@ -44,9 +45,14 @@ pub fn menu<T: Theme>(
         route: loc.base,
         require_both: router.require_both(),
         net: &net,
+        lobbies,
     };
 
     theme.window(ctx, title_of(loc.base), |ui| {
+        // tiny build stamp, top-right — so you can see at a glance which wasm is actually live.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            ui.label(egui::RichText::new(format!("build {}", env!("BUILD_HASH"))).small().weak());
+        });
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(132.0);

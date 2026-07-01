@@ -43,6 +43,7 @@ pub struct DebugUi {
     server_status: Mutable<String>,   // latest status body (or a fetching/error message)
     router: Router,                   // XP menu nav state (memory-router); independent of the panel
     menu_esc: bool,                   // an Esc was pressed; the next process() resolves it (deferred)
+    lobbies: Vec<crate::net::LobbyRow>, // shell-held lobby list the Network grid renders (P2: relay feed)
 }
 
 #[godot_api]
@@ -60,6 +61,7 @@ impl INode for DebugUi {
             server_status: Mutable::new(String::from("(not fetched)")),
             router: Router::default(),
             menu_esc: false,
+            lobbies: Vec::new(),
         }
     }
 
@@ -159,14 +161,13 @@ impl INode for DebugUi {
                 self.router.apply(vec![Intent::Esc], &cells);
             }
             let mut out: Vec<Intent> = Vec::new();
-            crate::ui::menu::menu(&ctx, &Xp, &mut self.router, &cells, &mut out);
+            crate::ui::menu::menu(&ctx, &Xp, &mut self.router, &cells, &self.lobbies, &mut out);
             // Intercept the shell-driven intents before Router::apply so the pure router never sees
-            // them: OpenDebugPanel toggles this panel; Find/LeaveMatch drive KneeMan's netplay.
+            // them: OpenDebugPanel toggles this panel; Find/LeaveMatch drive KneeMan's netplay; the
+            // lobby intents mutate the shell-held `self.lobbies` (local UI state, not the transport).
             let mut open_panel = false;
             let mut find_match = false;
             let mut leave_match = false;
-            let mut open_lobby = false;
-            let mut join_lobby: Option<String> = None;
             out.retain(|intent| match intent {
                 Intent::OpenDebugPanel => {
                     open_panel = true;
@@ -181,11 +182,11 @@ impl INode for DebugUi {
                     false
                 }
                 Intent::OpenLobby => {
-                    open_lobby = true;
+                    self.open_lobby();
                     false
                 }
                 Intent::JoinLobby(key) => {
-                    join_lobby = Some(key.clone());
+                    self.join_lobby(key);
                     false
                 }
                 _ => true,
@@ -198,12 +199,6 @@ impl INode for DebugUi {
             }
             if leave_match {
                 fighter.bind_mut().leave_match();
-            }
-            if open_lobby {
-                fighter.bind_mut().open_lobby();
-            }
-            if let Some(key) = join_lobby {
-                fighter.bind_mut().join_lobby(key);
             }
             self.router.apply(out, &cells);
         }
@@ -296,6 +291,34 @@ impl DebugUi {
             return;
         }
         self.server_status.set(body.get_string_from_utf8().to_string());
+    }
+}
+
+// Shell-held lobby list mutations, driven by the Network page's OpenLobby/JoinLobby intents. This is
+// LOCAL UI state (never the KneeMan transport / SimState / checksum); the relay `list` feed replaces
+// it in P2 (see lobby-netplay-plan.md §7).
+impl DebugUi {
+    /// Host a lobby for the current build version. Idempotent: only one self-hosted row ("you").
+    fn open_lobby(&mut self) {
+        if self.lobbies.iter().any(|l| l.host == "you") {
+            return;
+        }
+        self.lobbies.push(crate::net::LobbyRow {
+            key: "v0.3".into(),
+            host: "you".into(),
+            active: 1,
+            cap: crate::sim::MAX_PLAYERS as u8,
+            empty_since_ms: None,
+        });
+    }
+
+    /// Join a lobby by key: bump its player count, clamped to capacity (no-op if already full).
+    fn join_lobby(&mut self, key: &str) {
+        if let Some(row) = self.lobbies.iter_mut().find(|l| l.key == key) {
+            if row.active < row.cap {
+                row.active += 1;
+            }
+        }
     }
 }
 

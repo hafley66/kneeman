@@ -1,32 +1,13 @@
 use super::router::{Intent, MenuCtx};
 use super::Screen;
-use crate::net::{now_ms, LobbyRow};
+use crate::net::now_ms;
 use crate::ui::themes::Theme;
 use egui::{Color32, RichText};
 
 /// Netplay page: 1v1 quick-match plus the versioned lobby browser. Lobbies are grouped by build
 /// version ("floating rooms by version"); an empty one is culled after a TTL, shown ticking down in
-/// the grid. Rows are a placeholder until the relay's `list` feed lands (see lobby-netplay-plan.md).
+/// the grid. Rows come from shell-held state (`cx.lobbies`), fed by the relay's `list` in P2.
 pub struct Network;
-
-/// Placeholder lobby feed so the grid renders + the TTL visibly ticks. Swap for the relay `list`
-/// reply in P2. The empty row's `empty_since` loops each minute so the countdown animates. A lobby
-/// holds N players up to `MAX_PLAYERS` (4 today); cap is per-room, never a literal here.
-fn demo_lobbies(now: u64) -> Vec<LobbyRow> {
-    let ver = "v0.3";
-    let cap = crate::sim::MAX_PLAYERS as u8;
-    vec![
-        LobbyRow { key: ver.into(), host: "kneeman".into(), active: 3, cap, empty_since_ms: None },
-        LobbyRow { key: ver.into(), host: "hafley".into(), active: 1, cap, empty_since_ms: None },
-        LobbyRow {
-            key: ver.into(),
-            host: "ghosttown".into(),
-            active: 0,
-            cap,
-            empty_since_ms: Some(now.saturating_sub((now / 1000 % 60) * 1000)),
-        },
-    ]
-}
 
 /// Color the TTL countdown hot as it runs out.
 fn ttl_color(secs: u32) -> Color32 {
@@ -67,7 +48,7 @@ impl Screen for Network {
         ui.add_space(4.0);
 
         let now = now_ms();
-        let lobbies = demo_lobbies(now);
+        let lobbies = cx.lobbies;
         egui::Grid::new("lobby_grid")
             .striped(true)
             .num_columns(5)
@@ -78,7 +59,7 @@ impl Screen for Network {
                 }
                 ui.end_row();
 
-                for row in &lobbies {
+                for row in lobbies {
                     ui.label(&row.key);
                     ui.label(&row.host);
                     let full = row.active >= row.cap;

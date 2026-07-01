@@ -63,8 +63,11 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
         n.pos += n.vel * DT;
         n.vel.x = move_toward(n.vel.x, 0.0, DUMMY_FRICTION * DT);
         let mut landed = false;
-        if n.pos.y < GROUND_Y {
-            n.vel.y += t.gravity * DT; // arc back down
+        let over_stage = n.pos.x >= FLOOR_LEFT && n.pos.x <= FLOOR_RIGHT;
+        if n.pos.y < GROUND_Y || !over_stage {
+            // arc back down; keep falling past the edge when off the stage (no invisible floor —
+            // a launched body knocked off the side drops into the blast zone like everything else).
+            n.vel.y += t.gravity * DT;
         } else {
             if was_air {
                 landed = true; // crossed into the floor this frame

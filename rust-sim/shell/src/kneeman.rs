@@ -1037,16 +1037,6 @@ impl KneeMan {
         self.reset_offline();
     }
 
-    /// Versioned lobby actions (browser buttons). Stubs until the mesh/relay lobby mode lands (P2 in
-    /// lobby-netplay-plan.md); for now they just record intent so the plumbing is exercised end to end.
-    pub fn open_lobby(&mut self) {
-        godot_print!("[net] open lobby (host) — not yet wired; see lobby-netplay-plan.md P2");
-    }
-
-    pub fn join_lobby(&mut self, key: String) {
-        godot_print!("[net] join lobby '{key}' — not yet wired; see lobby-netplay-plan.md P2");
-    }
-
     pub fn identity_cell(&self) -> Mutable<Identity> {
         self.identity.clone()
     }

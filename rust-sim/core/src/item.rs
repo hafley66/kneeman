@@ -3,8 +3,8 @@
 //! for the slot type carried in `SimState.items`. Pure; re-exported at the crate root.
 
 use crate::{
-    airborne, hurtbox, knockback_units, Fighter, Hitbox, SimState, StrokeId, ToolKind, Tune, Vector2, DT,
-    FLOOR_LEFT, FLOOR_RIGHT, GROUND_Y, HITLAG_PER_DMG, MAX_ITEMS,
+    airborne, hurtbox, knockback_units, out_of_bounds, Fighter, Hitbox, SimState, StrokeId, ToolKind,
+    Tune, Vector2, DT, FLOOR_LEFT, FLOOR_RIGHT, GROUND_Y, HITLAG_PER_DMG, MAX_ITEMS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -382,18 +382,23 @@ pub(crate) fn update_items(n: &mut SimState, t: &Tune) {
                 }
             }
             ItemKind::LaserGun | ItemKind::BobGun | ItemKind::Pen => {
-                // unowned: gravity, settle on the floor
+                // unowned: gravity, settle on the floor — but ONLY over the stage span. Off the edge
+                // (past a wall) there is no floor, so it keeps falling and despawns at the blast zone.
                 let mut p = it.pos;
                 let mut v = it.vel;
                 p += v * DT;
-                if p.y < GROUND_Y {
-                    v.y += t.gravity * DT;
-                } else {
+                let over_stage = p.x >= FLOOR_LEFT && p.x <= FLOOR_RIGHT;
+                if over_stage && p.y >= GROUND_Y {
                     p.y = GROUND_Y;
                     v = Vector2::ZERO;
+                } else {
+                    v.y += t.gravity * DT; // off the span (or above the floor): keep falling
                 }
                 n.items[k].pos = p;
                 n.items[k].vel = v;
+                if out_of_bounds(p) {
+                    n.items[k] = Item::EMPTY; // crossed a blast zone: quiet despawn
+                }
             }
             ItemKind::LaserBolt => {
                 let p = it.pos + it.vel * DT;
@@ -401,7 +406,8 @@ pub(crate) fn update_items(n: &mut SimState, t: &Tune) {
                 n.items[k].timer -= 1;
                 let mut spent = n.items[k].timer <= 0
                     || p.x < FLOOR_LEFT - 400.0
-                    || p.x > FLOOR_RIGHT + 400.0;
+                    || p.x > FLOOR_RIGHT + 400.0
+                    || out_of_bounds(p);
                 for fi in 0..2 {
                     if fi as i8 == it.owner {
                         continue; // your own bolts pass through you
@@ -425,7 +431,10 @@ pub(crate) fn update_items(n: &mut SimState, t: &Tune) {
                 n.items[k].pos = p;
                 n.items[k].vel = v;
                 n.items[k].timer -= 1;
-                let mut boom = n.items[k].timer <= 0 || p.y >= GROUND_Y;
+                // Off the stage span there is no floor to touch, so ground-contact only detonates
+                // when the bomb is actually over the platform.
+                let over_stage = p.x >= FLOOR_LEFT && p.x <= FLOOR_RIGHT;
+                let mut boom = n.items[k].timer <= 0 || (over_stage && p.y >= GROUND_Y);
                 for fi in 0..2 {
                     if fi as i8 == it.owner {
                         continue; // doesn't detonate on its own thrower's body in flight
@@ -435,7 +444,9 @@ pub(crate) fn update_items(n: &mut SimState, t: &Tune) {
                         boom = true;
                     }
                 }
-                if boom {
+                if out_of_bounds(p) {
+                    n.items[k] = Item::EMPTY; // fell past a blast zone: quiet despawn, NO explosion
+                } else if boom {
                     explode(n, p, t);
                     n.items[k] = Item::EMPTY;
                 }

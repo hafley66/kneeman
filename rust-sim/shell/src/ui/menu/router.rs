@@ -192,6 +192,7 @@ pub struct MenuCtx<'a> {
     pub route: Route,
     pub require_both: bool,
     pub net: &'a NetDebug, // transport snapshot for the Network page
+    pub lobbies: &'a [crate::net::LobbyRow], // shell-held lobby list for the Network page's grid
 }
 
 /// The writable cells the effect layer drains into. Borrowed from KneeMan for the frame.
