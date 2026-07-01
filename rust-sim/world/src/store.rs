@@ -16,6 +16,15 @@ pub trait WorldStore {
     fn head(&self, id: WorldId) -> Option<EventId>;
     fn since(&self, id: WorldId, from: Option<EventId>) -> Vec<Node>;
     fn has(&self, id: WorldId, ev: EventId) -> bool;
+
+    // --- compaction (§4.5): a snapshot is a deletable cache; compact moves the replay floor ---
+    /// Cache the folded state through `upto` (blob = `canon(&World)`). Non-destructive.
+    fn put_snapshot(&mut self, id: WorldId, upto: EventId, blob: &[u8]);
+    /// Latest snapshot: `(upto, blob)`.
+    fn get_snapshot(&self, id: WorldId) -> Option<(EventId, Vec<u8>)>;
+    /// Drop every event at or before `upto` (the low-water mark). Caller guarantees a snapshot through
+    /// `upto` exists and that `upto <= min(live participants' head)`. `since(None)` then returns the tail.
+    fn compact(&mut self, id: WorldId, upto: EventId);
 }
 
 /// Compute the id an append onto `parent` would get. Shared by both impls so their ids match.
@@ -31,6 +40,7 @@ fn next_id(parent: Option<EventId>, payload: &[u8]) -> EventId {
 pub struct MemStore {
     seeds: std::collections::HashMap<WorldId, Seed>,
     logs: std::collections::HashMap<WorldId, Vec<Node>>,
+    snaps: std::collections::HashMap<WorldId, (EventId, Vec<u8>)>,
 }
 
 impl MemStore {
@@ -77,6 +87,19 @@ impl WorldStore for MemStore {
     fn has(&self, id: WorldId, ev: EventId) -> bool {
         self.logs.get(&id).is_some_and(|l| l.iter().any(|n| n.id == ev))
     }
+    fn put_snapshot(&mut self, id: WorldId, upto: EventId, blob: &[u8]) {
+        self.snaps.insert(id, (upto, blob.to_vec()));
+    }
+    fn get_snapshot(&self, id: WorldId) -> Option<(EventId, Vec<u8>)> {
+        self.snaps.get(&id).cloned()
+    }
+    fn compact(&mut self, id: WorldId, upto: EventId) {
+        if let Some(log) = self.logs.get_mut(&id) {
+            if let Some(cut) = log.iter().position(|n| n.id == upto) {
+                log.drain(..=cut); // keep events strictly after the low-water mark
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -113,7 +136,9 @@ impl SqliteStore {
                  id BLOB PRIMARY KEY, world_id BLOB NOT NULL, parent BLOB,
                  seq INTEGER NOT NULL, schema INTEGER NOT NULL, payload BLOB NOT NULL);
              CREATE INDEX IF NOT EXISTS world_event_by_world ON world_event(world_id, seq);
-             CREATE TABLE IF NOT EXISTS world_head(world_id BLOB PRIMARY KEY, head BLOB NOT NULL);",
+             CREATE TABLE IF NOT EXISTS world_head(world_id BLOB PRIMARY KEY, head BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS world_snapshot(
+                 world_id BLOB PRIMARY KEY, upto BLOB NOT NULL, blob BLOB NOT NULL);",
         )
     }
 }
@@ -204,6 +229,41 @@ impl WorldStore for SqliteStore {
             )
             .is_ok()
     }
+    fn put_snapshot(&mut self, id: WorldId, upto: EventId, blob: &[u8]) {
+        self.conn
+            .execute(
+                "INSERT INTO world_snapshot(world_id, upto, blob) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(world_id) DO UPDATE SET upto=?2, blob=?3",
+                rusqlite::params![&id.0[..], &upto.0[..], blob],
+            )
+            .expect("put_snapshot");
+    }
+    fn get_snapshot(&self, id: WorldId) -> Option<(EventId, Vec<u8>)> {
+        self.conn
+            .query_row("SELECT upto, blob FROM world_snapshot WHERE world_id=?1", [&id.0[..]], |r| {
+                Ok((EventId(to32(r.get::<_, Vec<u8>>(0)?)), r.get::<_, Vec<u8>>(1)?))
+            })
+            .ok()
+    }
+    fn compact(&mut self, id: WorldId, upto: EventId) {
+        // resolve the low-water mark's seq, then delete everything at or below it.
+        let seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT seq FROM world_event WHERE world_id=?1 AND id=?2",
+                rusqlite::params![&id.0[..], &upto.0[..]],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(seq) = seq {
+            self.conn
+                .execute(
+                    "DELETE FROM world_event WHERE world_id=?1 AND seq<=?2",
+                    rusqlite::params![&id.0[..], seq],
+                )
+                .expect("compact");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +315,35 @@ mod tests {
         }
         let (lm, ls) = (mem.since(a, None), sql.since(b, None));
         assert_eq!(fold(BuildVersion(1), &lm), fold(BuildVersion(1), &ls));
+    }
+
+    // Compaction is lossless: snapshot@k + the surviving tail folds to the same world as the full log.
+    #[test]
+    fn compaction_preserves_state_through_the_store() {
+        use crate::WorldEvent;
+        let mut s = SqliteStore::in_memory().unwrap();
+        let id = s.publish(&seed());
+        let evs: Vec<WorldEvent> = (0..5).map(|k| WorldEvent::SetRule { key: RuleKey(k), val: RuleVal(k as f32) }).collect();
+        for ev in &evs {
+            s.append(id, ev);
+        }
+        let full = fold(BuildVersion(1), &s.since(id, None)); // truth before compaction
+        let log = s.since(id, None);
+        let cut = log[2].id; // low-water mark = 3rd event
+        let snap_state = fold(BuildVersion(1), &log[..3]); // state through the cut
+        s.put_snapshot(id, cut, &smash_world_canon(&snap_state));
+        s.compact(id, cut); // drop events 0..=2
+
+        assert_eq!(s.since(id, None).len(), 2); // only the tail survives on disk
+        let (upto, blob) = s.get_snapshot(id).unwrap();
+        assert_eq!(upto, cut);
+        let base: crate::fold::World = bincode::deserialize(&blob).unwrap();
+        let rebuilt = crate::fold::fold_from(&base, &s.since(id, None)); // snapshot + tail
+        assert_eq!(rebuilt, full); // identical to the pre-compaction world
+    }
+
+    fn smash_world_canon<T: serde::Serialize>(v: &T) -> Vec<u8> {
+        bincode::serialize(v).unwrap()
     }
 
     // `since(head)` returns nothing (a caught-up peer pulls no diff); `since(None)` returns all.

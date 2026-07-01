@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 use smash_core::{SegClass, StrokeId, Tune, Vector2};
 
 pub mod bridge; // ggrs -> durable gate (§D.5): confirmed-frame diff, pure
-pub mod fold; // the World scan: apply/fold/fold_from/chain/ingest, pure
-pub mod store; // side effects: WorldStore save/load (MemStore + SqliteStore)
+pub mod fold; // the World scan: apply/fold/fold_from/chain/ingest + relation/ingest_topo, pure
+pub mod migrate; // schema decode + upcast (Envelope -> WorldEvent), pure
+pub mod store; // side effects: WorldStore save/load + snapshot/compact (MemStore + SqliteStore)
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // Identities — fixed-size, self-verifying. A hash IS the name; equality is byte equality.
@@ -120,6 +121,9 @@ pub enum WorldEvent {
     /// A migration IS an event: its apply-arm transforms state schema v -> v+1, and it moves the
     /// world's version (fold HEAD). Forces a snapshot right after (plans/world-protocol.md §4.5).
     Upgrade { to: BuildVersion, mig: MigrationId },
+    /// Jump effective state back to the fold-through-`to` (git reset, recorded FORWARD — history kept).
+    /// Handled in `fold` (it re-folds the prefix); `apply` treats it as a no-op (one node has no prefix).
+    Reset { to: EventId },
     // APPEND NEW VARIANTS HERE, at the end. Never reorder, never remove.
 }
 
@@ -236,5 +240,63 @@ mod tests {
         assert_eq!(a, a2); // identical append -> identical id (dedupe)
         let child = event_id(Some(a), Schema(1), &payload);
         assert_ne!(a, child); // same payload, different parent -> different id (chain)
+    }
+}
+
+/// Byte-freeze: the exact on-wire encoding of every `WorldEvent` variant and the `event_id` chain over
+/// them. Tune-independent (no `Seed`). If a variant is reordered or a field moved/removed/retyped,
+/// these digests change and CI fails — the mechanical enforcement of the §2 append-only rule. To add a
+/// variant at the END: keep all lines below, append the new variant + its two golden lines.
+#[cfg(test)]
+mod golden {
+    use super::*;
+    use smash_core::{SegClass, Vector2};
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{:02x}", x)).collect()
+    }
+
+    fn frozen_events() -> Vec<WorldEvent> {
+        vec![
+            WorldEvent::PlacePlatform { at: Vector2::new(1.0, 2.0), len: 32.0, class: SegClass::Floor, stroke: 0, owner: Owner::PERMANENT },
+            WorldEvent::ErasePlatform { placed: EventId([1u8; 32]) },
+            WorldEvent::Revert { target: EventId([2u8; 32]) },
+            WorldEvent::SetRule { key: RuleKey(3), val: RuleVal(1.5) },
+            WorldEvent::Upgrade { to: BuildVersion(2), mig: MigrationId(1) },
+            WorldEvent::Reset { to: EventId([3u8; 32]) },
+        ]
+    }
+
+    #[test]
+    fn worldevent_bytes_are_frozen() {
+        let expect = [
+            "000000000000803f00000040000000420100000000ff",
+            "010000000101010101010101010101010101010101010101010101010101010101010101",
+            "020000000202020202020202020202020202020202020202020202020202020202020202",
+            "0300000003000000c03f",
+            "040000000200000001000000",
+            "050000000303030303030303030303030303030303030303030303030303030303030303",
+        ];
+        for (e, want) in frozen_events().iter().zip(expect) {
+            assert_eq!(hex(&canon(e)), want); // reordering/moving a field breaks this exact byte string
+        }
+    }
+
+    #[test]
+    fn event_id_chain_is_frozen() {
+        let expect = [
+            "550d7465b6231e5c87b4b73318c957b75ac37062e0657ea36a4b54d7fc03455f",
+            "af54ca55a43ec10024f8355f782c508f990e43610567c91407e79cae78326fbe",
+            "97f20ef78e43d7822420281f8bfdc9ceba741c5710beb0488baa37f969956e78",
+            "e67f2165e37b35889ab9b2bc2fea1d501e0a90feafd510eb90aa325b265d0d43",
+            "90461034290d2ed543e5d7e7287f41cb6de7371a6c859808701650d8aada3b05",
+            "9aef63177322c7026e444d66562c28d468e2ea684c28a96a7c89f26d7eaddea4",
+        ];
+        let mut parent = None;
+        for (e, want) in frozen_events().iter().zip(expect) {
+            let id = event_id(parent, Schema(1), &canon(e));
+            assert_eq!(hex(&id.0), want); // the whole hash chain is pinned end to end
+            parent = Some(id);
+        }
     }
 }

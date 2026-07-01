@@ -5,11 +5,12 @@
 //! deterministic iteration (BTreeMap). The rxjs analogue is `events$.pipe(scan(apply, genesis))`.
 
 use crate::{canon, event_id, BuildVersion, EventId, Node, Owner, Schema, Seq, WorldEvent};
+use serde::{Deserialize, Serialize};
 use smash_core::{SegClass, Vector2};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// MVP built segment (subset of a real forge stroke): enough to prove place/erase/revert fold.
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Plat {
     pub at: Vector2,
     pub len: f32,
@@ -18,7 +19,8 @@ pub struct Plat {
 }
 
 /// The folded world state. Keyed by the placing event's id so erase/revert are O(1) and deterministic.
-#[derive(Clone, PartialEq, Debug)]
+/// `Serialize` so a snapshot blob (lock 6 / §4.5) is just `canon(&World)`.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct World {
     pub version: BuildVersion,          // moves on `Upgrade` — fold HEAD == the world's version
     pub platforms: BTreeMap<EventId, Plat>,
@@ -50,14 +52,21 @@ pub fn apply(w: &mut World, n: &Node) {
         WorldEvent::Upgrade { to, .. } => {
             w.version = *to;
         }
+        WorldEvent::Reset { .. } => {} // no-op here; `fold` re-folds the prefix (needs the whole log)
     }
 }
 
-/// Full fold from genesis.
+/// Full fold from genesis. `Reset{to}` re-folds the prefix through `to` (git reset, forward-recorded).
 pub fn fold(build: BuildVersion, nodes: &[Node]) -> World {
     let mut w = World::genesis(build);
-    for n in nodes {
-        apply(&mut w, n);
+    for (i, n) in nodes.iter().enumerate() {
+        if let WorldEvent::Reset { to } = &n.ev {
+            // cut = index just past `to` in the already-seen prefix; unknown target -> back to genesis.
+            let cut = nodes[..i].iter().position(|m| m.id == *to).map_or(0, |p| p + 1);
+            w = fold(build, &nodes[..cut]);
+        } else {
+            apply(&mut w, n);
+        }
     }
     w
 }
@@ -85,12 +94,76 @@ pub fn chain(events: &[WorldEvent]) -> Vec<Node> {
 }
 
 /// P2P ingest = git have/want reduce: append only nodes we lack (dedupe by content id). Idempotent.
+/// Assumes in-order delivery; use `ingest_topo` when packets can arrive out of order.
 pub fn ingest(local: &mut Vec<Node>, incoming: &[Node]) {
     let have: HashSet<EventId> = local.iter().map(|n| n.id).collect();
     for n in incoming {
         if !have.contains(&n.id) {
             local.push(n.clone());
         }
+    }
+}
+
+/// Accepts possibly-out-of-order P2P delivery. `chain` is the ordered reachable prefix; `orphans` holds
+/// nodes whose parent hasn't landed yet. A child that arrives early is BUFFERED (retained, not dropped)
+/// and flushed onto the chain the moment its parent appears. This, not `ingest`, is what a live peer
+/// runs (real delivery is unordered).
+#[derive(Default)]
+pub struct Ingestor {
+    pub chain: Vec<Node>,
+    orphans: Vec<Node>,
+}
+
+impl Ingestor {
+    pub fn ingest(&mut self, incoming: &[Node]) {
+        let known: HashSet<EventId> =
+            self.chain.iter().chain(self.orphans.iter()).map(|n| n.id).collect();
+        for n in incoming {
+            if !known.contains(&n.id) {
+                self.orphans.push(n.clone());
+            }
+        }
+        // pull any orphan whose parent is now the chain tip (parent None when the chain is empty).
+        loop {
+            let tip = self.chain.last().map(|n| n.id);
+            match self.orphans.iter().position(|n| n.parent == tip) {
+                Some(pos) => self.chain.push(self.orphans.remove(pos)),
+                None => break,
+            }
+        }
+    }
+}
+
+/// How two chain tips relate, by walking `parent` links in a node pool. Drives handshake head-reconcile:
+/// `Ancestor` -> the other fast-forwards; `Fork` -> `Refuse::Forked` (v1 forbids concurrent hosts).
+#[derive(PartialEq, Eq, Debug)]
+pub enum Relation {
+    Same,
+    Ancestor,   // a is an ancestor of b (b can fast-forward past a)
+    Descendant, // b is an ancestor of a
+    Fork,       // neither is an ancestor of the other — divergent history
+}
+
+pub fn relation(pool: &[Node], a: EventId, b: EventId) -> Relation {
+    if a == b {
+        return Relation::Same;
+    }
+    let parent: HashMap<EventId, Option<EventId>> = pool.iter().map(|n| (n.id, n.parent)).collect();
+    let ancestry = |tip: EventId| -> HashSet<EventId> {
+        let mut cur = Some(tip);
+        let mut seen = HashSet::new();
+        while let Some(id) = cur {
+            seen.insert(id);
+            cur = parent.get(&id).copied().flatten();
+        }
+        seen
+    };
+    if ancestry(b).contains(&a) {
+        Relation::Ancestor
+    } else if ancestry(a).contains(&b) {
+        Relation::Descendant
+    } else {
+        Relation::Fork
     }
 }
 
@@ -146,6 +219,17 @@ mod tests {
     }
 
     #[test]
+    fn reset_jumps_state_back_but_is_recorded_forward() {
+        let a = place(1.0);
+        let aid = chain(&[a.clone()])[0].id;
+        // place A, place B, then Reset back to A -> state has only A, yet the log still holds 3 events.
+        let nodes = chain(&[a, place(2.0), WorldEvent::Reset { to: aid }]);
+        let w = fold(B, &nodes);
+        assert_eq!(w.platforms.len(), 1); // rolled back to just-A
+        assert_eq!(nodes.len(), 3); // history is kept (forward-recorded reset)
+    }
+
+    #[test]
     fn upgrade_moves_the_version() {
         let nodes = chain(&[WorldEvent::Upgrade { to: BuildVersion(7), mig: crate::MigrationId(1) }]);
         assert_eq!(fold(B, &nodes).version, BuildVersion(7)); // fold HEAD == world version
@@ -158,6 +242,43 @@ mod tests {
             WorldEvent::SetRule { key: RuleKey(3), val: RuleVal(2.0) }, // last write wins
         ]);
         assert_eq!(fold(B, &nodes).rules.get(&3), Some(&2.0));
+    }
+
+    #[test]
+    fn ingestor_reorders_shuffled_delivery() {
+        let nodes = chain(&[place(1.0), place(2.0), place(3.0)]);
+        let mut ing = Ingestor::default();
+        ing.ingest(&[nodes[2].clone(), nodes[0].clone(), nodes[1].clone()]); // out of order
+        assert_eq!(ing.chain, nodes); // rebuilt in chain order
+        assert_eq!(fold(B, &ing.chain), fold(B, &nodes));
+    }
+
+    #[test]
+    fn ingestor_buffers_an_orphan_until_its_parent_lands() {
+        let nodes = chain(&[place(1.0), place(2.0), place(3.0)]);
+        let mut ing = Ingestor::default();
+        ing.ingest(&[nodes[0].clone(), nodes[2].clone()]); // n1 missing -> n2 buffered
+        assert_eq!(ing.chain, vec![nodes[0].clone()]); // only the reachable prefix is applied
+        ing.ingest(&[nodes[1].clone()]); // parent arrives -> orphan flushes onto the chain
+        assert_eq!(ing.chain, nodes);
+    }
+
+    #[test]
+    fn relation_classifies_ancestor_and_fork() {
+        use crate::{event_id, Schema};
+        let base = chain(&[place(1.0), place(2.0)]); // n0 <- n1
+        assert_eq!(relation(&base, base[0].id, base[1].id), Relation::Ancestor);
+        // two divergent children of n1 = a fork.
+        let mk = |x: f32| {
+            let ev = place(x);
+            let id = event_id(Some(base[1].id), Schema(1), &crate::canon(&ev));
+            Node { id, parent: Some(base[1].id), seq: crate::Seq(2), ev }
+        };
+        let (a, b) = (mk(3.0), mk(4.0));
+        let mut pool = base.clone();
+        pool.push(a.clone());
+        pool.push(b.clone());
+        assert_eq!(relation(&pool, a.id, b.id), Relation::Fork);
     }
 
     #[test]
