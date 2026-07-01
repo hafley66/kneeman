@@ -33,3 +33,6 @@ tools/.venv/
 tools/.cache/
 **/.venv/
 __pycache__/
+
+# pulled pose captures (tools/pose-capture -> just poses-pull)
+captures/

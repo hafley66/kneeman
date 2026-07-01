@@ -65,6 +65,14 @@ net-test:
 
 vps := "root@hafley.codes"
 
+# --- pose capture (film a friend into a fighter) ---
+# ship the capture app + nginx snippet; serves https://hafley.codes/game/poses/ (env-overridable)
+poses-deploy:
+    VPS={{vps}} PROJ={{proj}} deploy/scripts/poses.sh
+# pull captured zips from the box -> ./captures and unzip (env: POSES_LOCAL, POSES_UNZIP)
+poses-pull:
+    VPS={{vps}} PROJ={{proj}} deploy/scripts/poses-pull.sh
+
 # upload the nginx snippets + systemd unit, then (idempotently) install/start matchbox + nginx
 vps-deploy:
     ssh {{vps}} 'mkdir -p /etc/nginx/snippets'
