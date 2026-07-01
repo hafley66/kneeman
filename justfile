@@ -160,9 +160,11 @@ godot-deploy: godot-export
     ssh {{vps}} 'nginx -t && systemctl reload nginx'
     @echo "live at https://hafley.codes/game/"
 
-# ship the game: gate on the rollback determinism test, then compile + export + deploy.
+# ship EVERYTHING: rollback-determinism gate, then push the nginx snippets (cache/COOP headers,
+# relay routes) AND compile + export + deploy the game. `vps-deploy` is idempotent, so folding it in
+# means one command never leaves the server config drifting behind the build.
 # Use this (not raw godot-deploy) for any change that touches the sim or netplay path.
-ship: net-test godot-deploy
+ship: net-test vps-deploy godot-deploy
 
 # --- submodules / assets ---
 
