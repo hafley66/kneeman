@@ -8,7 +8,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-smash_core = { path = "../core" }
+smash_core = { path = "../core", features = ["storage"] } # storage = the sqlite WorldStore (durable worlds)
 smash_net = { path = "../net" } # ggrs core + start_p2p; matchbox feature left OFF (detached)
 futures-signals = "0.3"
 ggrs = "0.13"     # for the NonBlockingSocket trait the Godot WebRTC transport implements

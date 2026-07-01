@@ -2,7 +2,7 @@
 //! pure; save/load lives here. Two impls: `MemStore` (tests / the RAM cache) and `SqliteStore` (real,
 //! rusqlite bundled — the min-db, per-peer, SQLite-everywhere decision).
 
-use crate::world::{canon, event_id, world_id, EventId, Node, Schema, Seed, Seq, WorldEvent, WorldId};
+use crate::world::{canon, event_id, world_id, AssetId, EventId, Node, Schema, Seed, Seq, WorldEvent, WorldId};
 
 /// Current write schema. Read dispatches on the stored per-event schema (upcast); writes stamp this.
 pub const SCHEMA: Schema = Schema(1);
@@ -138,8 +138,25 @@ impl SqliteStore {
              CREATE INDEX IF NOT EXISTS world_event_by_world ON world_event(world_id, seq);
              CREATE TABLE IF NOT EXISTS world_head(world_id BLOB PRIMARY KEY, head BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS world_snapshot(
-                 world_id BLOB PRIMARY KEY, upto BLOB NOT NULL, blob BLOB NOT NULL);",
+                 world_id BLOB PRIMARY KEY, upto BLOB NOT NULL, blob BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS asset(id BLOB PRIMARY KEY, bytes BLOB NOT NULL);",
         )
+    }
+
+    /// Content-addressed asset blob store (gif backgrounds, authored stage blobs). The id IS the
+    /// blake3 of `bytes`, so a put is idempotent and a get is self-verifying. `SetBackground` stores
+    /// the `AssetId`; the pixels live here, out of the event log.
+    pub fn put_asset(&mut self, bytes: &[u8]) -> AssetId {
+        let id = AssetId(*blake3::hash(bytes).as_bytes());
+        self.conn
+            .execute("INSERT OR IGNORE INTO asset(id, bytes) VALUES(?1, ?2)", rusqlite::params![&id.0[..], bytes])
+            .expect("put_asset");
+        id
+    }
+    pub fn get_asset(&self, id: AssetId) -> Option<Vec<u8>> {
+        self.conn
+            .query_row("SELECT bytes FROM asset WHERE id=?1", [&id.0[..]], |r| r.get::<_, Vec<u8>>(0))
+            .ok()
     }
 }
 
@@ -287,6 +304,17 @@ mod tests {
             WorldEvent::SetRule { key: RuleKey(1), val: RuleVal(0.5) },
             WorldEvent::SetRule { key: RuleKey(2), val: RuleVal(9.0) },
         ]
+    }
+
+    // Gif background bytes round-trip through the content-addressed asset store, keyed by their hash.
+    #[test]
+    fn asset_blob_roundtrips_by_content_hash() {
+        let mut s = SqliteStore::in_memory().unwrap();
+        let gif = b"GIF89a...fake pixels...";
+        let id = s.put_asset(gif);
+        assert_eq!(s.put_asset(gif), id); // same bytes -> same id (idempotent put)
+        assert_eq!(s.get_asset(id).as_deref(), Some(&gif[..]));
+        assert_eq!(s.get_asset(crate::world::AssetId([0u8; 32])), None); // unknown id -> miss
     }
 
     // Save then load, on the real sqlite backend, reconstructs the same folded world.
