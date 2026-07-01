@@ -791,12 +791,8 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
         // from under us (no spanning segment), fall.
         let p = paths[n.ground_ink as usize];
         n.pos.x += n.vel.x * DT;
-        // deliberate "down, down" drop: require a fresh Down press while ALREADY crouching
-        // (prev==Crouch). The entry tap that caused Stand->Crouch has prev=Stand, so it never
-        // drops. JumpSquat/Dtilt are implicitly excluded because n.state must be Crouch.
-        let drop = !p.props.solid && i.down_pressed
-            && n.state == CharState::Crouch && prev == CharState::Crouch;
-        match (drop, ink_floor_y_at(&p, n.pos.x)) {
+        // soft ink drops through via the same tilt-window buffer as a soft platform.
+        match (drop_through(&mut n, i, t, !p.props.solid), ink_floor_y_at(&p, n.pos.x)) {
             (false, Some(y)) => {
                 n.pos.y = y;
                 n.vel.y = 0.0;
@@ -811,10 +807,7 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
         // grounded: pinned to its platform, no vertical motion
         let p = PLATFORMS[n.ground_plat.clamp(0, PLATFORMS.len() as i32 - 1) as usize];
         n.pos.x += n.vel.x * DT;
-        if !p.solid && i.down_pressed && n.state == CharState::Crouch && prev == CharState::Crouch {
-            // deliberate "down, down" drop: a fresh Down press while ALREADY crouching (prev==Crouch).
-            // The entry tap that caused Stand->Crouch has prev=Stand so it never drops.
-            // JumpSquat/Dtilt are implicitly excluded because n.state must be Crouch.
+        if drop_through(&mut n, i, t, !p.solid) {
             n.state = CharState::Air;
             n.ground_plat = -1;
             n.coyote = t.coyote_frames as u8;
@@ -927,6 +920,34 @@ fn try_ground_action(n: &mut Fighter, i: &InputFrame, atk: bool, grab: bool, t: 
     } else {
         false
     }
+}
+
+/// Soft-platform / soft-ink drop-through with a tilt-window buffer (Melee/PM feel). A fresh Down tap
+/// on a soft surface arms `drop_buf = plat_drop_window` instead of dropping instantly; the same tap
+/// also entered Crouch via the state machine (which ran first). While the buffer counts down the
+/// fighter stays crouched, so a Down+Attack in the window converts to a Dtilt — that leaves Crouch
+/// and cancels the pending drop. Returns true on the frame the window expires still crouched: that's
+/// when the drop actually happens. `soft` is false for the solid main stage / solid ink (never drops).
+///
+/// Tune `plat_drop_window`: 1 = drop on the entry frame (frame-perfect tilt, Melee-ish); larger =
+/// longer grace to convert into a tilt (PM-ish), at the cost of that many frames of drop latency.
+fn drop_through(n: &mut Fighter, i: &InputFrame, t: &Tune, soft: bool) -> bool {
+    // any non-crouch action (a Dtilt from Down+Attack, a jump out of crouch, release to Stand)
+    // cancels a pending drop. Solid surfaces never drop.
+    if !soft || n.state != CharState::Crouch {
+        n.drop_buf = 0;
+        return false;
+    }
+    if i.down_pressed {
+        n.drop_buf = t.plat_drop_window.max(1); // arm on the fresh Down tap
+    }
+    if n.drop_buf > 0 {
+        n.drop_buf -= 1;
+        if n.drop_buf == 0 {
+            return true; // window elapsed with no attack to convert it -> drop through
+        }
+    }
+    false
 }
 
 /// Consume a buffered jump/shorthop if one is live in the movement lane. Returns Some(full_hop).

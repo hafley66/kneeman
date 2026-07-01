@@ -205,6 +205,7 @@ pub fn checksum(s: &SimState) -> u128 {
         fold(f.grab_timer as u64);
         fold(f.tech_buf as u64);
         fold(f.tumble as u64);
+        fold(f.drop_buf as u64);
     }
     fold(s.tick);
     fold(s.rng);

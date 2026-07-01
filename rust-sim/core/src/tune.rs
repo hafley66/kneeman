@@ -141,6 +141,9 @@ pub struct Tune {
     pub autohop_dmg: f32, // damage multiplier for auto-short-hop aerials (jump+attack macro)
     pub di_max_angle: f32, // max degrees the victim's stick can rotate a launch trajectory (survival DI)
     pub coyote_frames: i64, // grace window after walking off an edge to still get a full grounded jump
+    pub plat_drop_window: i64, // soft-platform drop tilt-window: frames a Down tap waits before
+                            // dropping, so a Down+Attack inside it reads as a Dtilt. 1 = instant
+                            // drop / frame-perfect tilt (Melee); larger = more lenient tilt (PM).
     pub specials: [SpecialMove; 4], // B-move loadout, indexed by special_slot (N/Side/Up/Down)
     // items (match settings, not character-derived)
     pub items_on: bool,           // master switch for item spawns
@@ -233,6 +236,7 @@ impl Tune {
             autohop_dmg: 0.85, // Ultimate-ish 15% cut on the easy jump+attack aerial
             di_max_angle: 18.0, // ~18 deg of trajectory DI, the survival-DI ceiling
             coyote_frames: 9, // walk off the lip and you keep your real jump for ~9f (forgiving edge grace)
+            plat_drop_window: 3, // PM-ish: 3f to convert a platform Down tap into a Dtilt before it drops
             specials: [SpecialMove::PUNCH, SpecialMove::LUNGE, SpecialMove::RISE, SpecialMove::DROP],
             items_on: true,
             item_spawn_interval: 1200, // ~20s between spawns (one item at a time, so keep it rare)

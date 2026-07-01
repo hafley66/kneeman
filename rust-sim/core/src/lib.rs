@@ -224,6 +224,8 @@ pub struct Fighter {
     pub tech_buf: u8,      // tech window: a shield press during hitstun arms a tech for N frames
     pub tumble: bool,      // this launch is hard enough to knock down (or be teched) on landing
     pub wall_hit: i64,     // frames left in the wall-bounce tilt window (cosmetic: shell tilts + swaps clip)
+    pub drop_buf: i64,     // soft-platform drop tilt-window: a Down tap arms it; an attack in-window
+                           // converts to Dtilt + cancels; expires -> drop through. 0 = no pending drop.
 }
 
 /// Max simultaneous items+projectiles on screen (fixed so SimState stays Copy + checksums cheaply).
@@ -278,6 +280,7 @@ impl Fighter {
             tech_buf: 0,
             tumble: false,
             wall_hit: 0,
+            drop_buf: 0,
         }
     }
 

@@ -215,6 +215,54 @@ fn down_plus_attack_enters_dtilt() {
     );
 }
 
+/// Land P1 straight down onto the left SOFT platform (index 1) and settle to Stand there, so the
+/// soft-platform drop-buffer tests start from a known "crouch-able on a soft platform" pose.
+fn on_soft_platform() -> (SimState, Tune) {
+    let t = Tune::default();
+    let mut s = SimState::spawn();
+    s.fighters[0].pos.x = 410.0; // center of PLATFORMS[1] (left soft, x 280..540, y 575)
+    s.fighters[0].pos.y = 480.0; // above the platform top, below the top-center platform's x-range
+    s.fighters[0].vel.x = 0.0;
+    s.fighters[0].vel.y = 0.0;
+    s.fighters[0].state = CharState::Air;
+    for _ in 0..60 {
+        s = step(&s, &[&idle(), &idle()], &t);
+    }
+    assert_eq!(s.fighters[0].state, CharState::Stand, "should land + settle on the soft platform");
+    assert_eq!(s.fighters[0].ground_plat, 1, "should be standing on the left soft platform");
+    (s, t)
+}
+
+#[test]
+fn down_tap_drops_through_a_soft_platform() {
+    let (mut s, t) = on_soft_platform();
+    // A single Down TAP (down_pressed on the first frame only) crouches + arms the drop buffer,
+    // then drops through within plat_drop_window frames — no re-tap required (Melee/PM feel).
+    let mut dropped = false;
+    for f in 0..(t.plat_drop_window as usize + 4) {
+        let tap = f == 0; // rising edge only on the first frame
+        s = step(&s, &[&press(|i| { i.down = true; i.down_pressed = tap; }), &idle()], &t);
+        if s.fighters[0].state == CharState::Air && s.fighters[0].ground_plat < 0 {
+            dropped = true;
+            break;
+        }
+    }
+    assert!(dropped, "a Down tap on a soft platform should drop through within the tilt-window");
+}
+
+#[test]
+fn down_attack_in_the_window_dtilts_instead_of_dropping() {
+    let (mut s, t) = on_soft_platform();
+    // Frame 0: the Down tap crouches and arms the buffer — it must NOT drop yet.
+    s = step(&s, &[&press(|i| { i.down = true; i.down_pressed = true; }), &idle()], &t);
+    assert_eq!(s.fighters[0].state, CharState::Crouch, "the Down tap crouches first, no instant drop");
+    assert_eq!(s.fighters[0].ground_plat, 1, "still on the platform after the entry tap");
+    // Frame 1 (inside plat_drop_window): Down + Attack converts to a Dtilt and cancels the drop.
+    s = step(&s, &[&press(|i| { i.down = true; i.attack = true; }), &idle()], &t);
+    assert_eq!(s.fighters[0].state, CharState::Dtilt, "Down+Attack in the window should dtilt");
+    assert_eq!(s.fighters[0].ground_plat, 1, "the dtilt must NOT drop through the platform");
+}
+
 #[test]
 fn classify_caches_floor_wall_and_grabbable_lip() {
     // a flat shelf (0,0)->(100,0) then a sharp drop (100,0)->(120,200).
