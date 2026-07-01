@@ -1,0 +1,15 @@
+[package]
+name = "smash_world"
+version = "0.1.0"
+edition = "2021"
+
+# The durable-world foundation: strong sized, serializable, content-addressed types + the two hash
+# functions that give a world its identity (world_id) and each event its identity (event_id).
+# Pure compute (blake3 + bincode over serde), no engine, no IO — builds native + wasm like smash_core.
+# The WorldStore trait + sqlite impl land here later; this file is the byte-frozen bedrock first.
+[dependencies]
+smash_core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"   # canonical (deterministic, positional) encoder — used for BOTH hashing and storage
+blake3 = "1"      # 32-byte content hashes: WorldId, AssetId, EventId
+rusqlite = { version = "0.32", features = ["bundled"] } # SqliteStore: bundled C sqlite (emscripten-linkable path)
