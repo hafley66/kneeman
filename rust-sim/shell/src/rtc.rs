@@ -126,13 +126,70 @@ pub fn data_channel_options() -> Dictionary {
     d
 }
 
-/// ICE config dict for `WebRtcPeerConnection::initialize`. One public STUN server — enough for most
-/// home NATs. Symmetric NATs would need TURN (not provisioned).
+/// TURN credential endpoint (GET). The relay mints a short-lived HMAC credential for the coturn relay
+/// (see signaling/src/turn.rs); prefetched at boot into `TURN_CREDS`. Absent host/secret => 404 => we
+/// stay STUN-only.
+pub fn turn_url() -> String {
+    format!("{}/turn", relay_base())
+}
+
+/// Ephemeral coturn REST credential, as returned by `/turn`. Cached process-wide after the boot fetch;
+/// `ice_config` folds it into the ICE server list so ICE can relay when a direct path fails.
+#[derive(Clone, Default)]
+pub struct TurnCreds {
+    pub urls: Vec<String>,   // e.g. ["turn:hafley.codes:3478?transport=udp", "...tcp"]
+    pub username: String,    // unix-expiry string
+    pub credential: String,  // base64(HMAC-SHA1(secret, username))
+}
+
+thread_local! {
+    static TURN_CREDS: std::cell::RefCell<Option<TurnCreds>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Parse a `/turn` JSON response and cache it. No-op on malformed/empty bodies (stays STUN-only).
+pub fn store_turn_creds(text: &GString) {
+    let d = parse_json(text);
+    let username = dget_str(&d, "username");
+    let credential = dget_str(&d, "credential");
+    let urls: Vec<String> = d
+        .get("urls")
+        .and_then(|v| v.try_to::<VariantArray>().ok())
+        .map(|a| a.iter_shared().filter_map(|v| v.try_to::<GString>().ok()).map(|g| g.to_string()).collect())
+        .unwrap_or_default();
+    if username.is_empty() || credential.is_empty() || urls.is_empty() {
+        return;
+    }
+    TURN_CREDS.with(|c| *c.borrow_mut() = Some(TurnCreds { urls, username, credential }));
+}
+
+/// Count of cached TURN urls (0 = STUN-only). For the firehose `turn` event.
+pub fn turn_url_count() -> usize {
+    TURN_CREDS.with(|c| c.borrow().as_ref().map(|t| t.urls.len()).unwrap_or(0))
+}
+
+/// ICE config dict for `WebRtcPeerConnection::initialize`. Always offers a public STUN server (enough
+/// for most home NATs); when a TURN credential has been fetched (`store_turn_creds`), it is appended
+/// as a relay fallback for symmetric-NAT / VPN peer pairs. ICE prefers direct and only relays on need.
 pub fn ice_config() -> Dictionary {
-    let mut server = Dictionary::new();
-    server.set("urls", "stun:stun.l.google.com:19302");
+    let mut stun = Dictionary::new();
+    stun.set("urls", "stun:stun.l.google.com:19302");
+    let mut servers = varray![stun];
+    // One server entry per url STRING (not an array): Godot's web WebRTC only honors a string `urls`,
+    // matching the working STUN entry above. An array-valued `urls` is silently dropped by the browser
+    // bridge, so the relay candidate never gathers.
+    TURN_CREDS.with(|c| {
+        if let Some(t) = c.borrow().as_ref() {
+            for u in &t.urls {
+                let mut turn = Dictionary::new();
+                turn.set("urls", u.as_str());
+                turn.set("username", t.username.as_str());
+                turn.set("credential", t.credential.as_str());
+                servers.push(&turn.to_variant());
+            }
+        }
+    });
     let mut cfg = Dictionary::new();
-    cfg.set("iceServers", varray![server]);
+    cfg.set("iceServers", servers);
     cfg
 }
 
@@ -165,4 +222,10 @@ pub fn dget_str(d: &Dictionary, key: &str) -> String {
 /// Read an int field (ICE candidate index), defaulting to 0.
 pub fn dget_int(d: &Dictionary, key: &str) -> i64 {
     d.get(key).and_then(|v| v.try_to::<i64>().ok()).unwrap_or(0)
+}
+
+/// Read an int field with a caller-chosen default for absent/mistyped keys (e.g. -1 to mark "a peer
+/// on an older build didn't send this field").
+pub fn dget_int_or(d: &Dictionary, key: &str, default: i64) -> i64 {
+    d.get(key).and_then(|v| v.try_to::<i64>().ok()).unwrap_or(default)
 }

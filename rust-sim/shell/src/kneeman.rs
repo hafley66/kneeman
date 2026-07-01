@@ -298,12 +298,17 @@ pub struct KneeMan {
     peer_build: Option<String>,                // opponent's build hash from the SDP handshake (None until traded)
     stale_build: bool,                         // our wasm is older than the live server build -> reload
     peer_identity: Option<Identity>,           // remote player's chosen name+color from the SDP handshake
+    peer_char: Option<usize>,                  // remote player's roster pick from the handshake (display-only, per-peer)
 
     // --- netcode event firehose (see `analytics`); its own HttpRequest so it never collides with the
     // /status fetch above. `last_net` edge-detects transport changes so we log deltas, not every frame.
     analytics_http: Option<Gd<HttpRequest>>,
     ev_tick: u32,                              // frame counter: flush the buffer + heartbeat on a cadence
     last_net: NetDebug,                        // previous transport snapshot, for change detection
+
+    // --- TURN: prefetch coturn REST creds at boot so ice_config() can add a relay fallback (rtc.rs) ---
+    turn_http: Option<Gd<HttpRequest>>,        // GET /turn once at boot; result cached via rtc::store_turn_creds
+    ice_typ_seen: u8,                          // bitmask of ICE candidate types logged this session (host/srflx/relay/prflx)
 }
 
 #[godot_api]
@@ -341,6 +346,8 @@ impl INode2D for KneeMan {
             analytics_http: None,
             ev_tick: 0,
             last_net: NetDebug::default(),
+            turn_http: None,
+            ice_typ_seen: 0,
             sig: SigCounts::default(),
             identity: Mutable::new(Identity::default()),
             saved_identity: Identity::default(),
@@ -362,6 +369,7 @@ impl INode2D for KneeMan {
             peer_build: None,
             stale_build: false,
             peer_identity: None,
+            peer_char: None,
         }
     }
 
@@ -456,6 +464,17 @@ impl INode2D for KneeMan {
         ev_http.set_name("AnalyticsHttp");
         self.analytics_http = Some(ev_http);
         crate::analytics::log("boot", &format!(r#","build":"{}""#, rtc::BUILD_HASH));
+
+        // TURN prefetch: GET /turn once so ice_config() can add a relay fallback for symmetric-NAT /
+        // VPN peer pairs. Its own node + completion callback (unlike the fire-and-forget analytics one)
+        // because we need the response body. 404 (TURN unconfigured) leaves us STUN-only, no harm.
+        let mut turn_http = HttpRequest::new_alloc();
+        let tcb = self.to_gd();
+        turn_http.connect("request_completed", &Callable::from_object_method(&tcb, "on_turn_fetched"));
+        self.base_mut().add_child(&turn_http);
+        turn_http.set_name("TurnHttp");
+        let _ = turn_http.request(&GString::from(rtc::turn_url().as_str()));
+        self.turn_http = Some(turn_http);
 
         // Skybox: a screen-pinned vertical gradient behind the world (deep space-blue -> horizon
         // glow). CanvasLayer at a negative layer keeps it under the stage + fighters, and a
@@ -983,6 +1002,7 @@ impl KneeMan {
         let id = self.identity.get_cloned();
         d.set("pname", GString::from(&id.name));
         d.set("pcolor", id.color.to_html()); // "#rrggbbaa" hex; parsed in note_peer_identity
+        d.set("pchar", self.charsel.get_cloned()[0]); // local player's roster pick -> shown on our remote slot
         if let Some(mut ws) = self.ws.clone() {
             ws.send_text(&rtc::to_json(&d));
         }
@@ -1009,6 +1029,15 @@ impl KneeMan {
     #[func]
     fn on_ice_created(&mut self, media: GString, index: i32, name: GString) {
         self.sig.ice_out += 1;
+        // Firehose the candidate TYPE (host/srflx/relay/prflx) once each, so the tail shows whether the
+        // browser actually gathered a *relay* candidate -- i.e. whether the TURN server is being used.
+        let cand = name.to_string();
+        let typ = cand.split(" typ ").nth(1).and_then(|s| s.split(' ').next()).unwrap_or("?");
+        let bit = match typ { "host" => 1u8, "srflx" => 2, "relay" => 4, "prflx" => 8, _ => 0 };
+        if bit != 0 && self.ice_typ_seen & bit == 0 {
+            self.ice_typ_seen |= bit;
+            crate::analytics::log("cand", &format!(r#","typ":"{typ}","h":{}"#, self.local_handle));
+        }
         let mut d = VarDictionary::new();
         d.set("kind", "ice");
         d.set("media", media);
@@ -1040,6 +1069,27 @@ impl KneeMan {
             && rtc::BUILD_HASH != "unknown"
             && server != rtc::BUILD_HASH;
     }
+
+    /// `/turn` fetched at boot: cache the coturn REST credential so `ice_config()` adds a relay
+    /// fallback. 404 = TURN unconfigured on the relay -> stay STUN-only. Logged to the firehose so the
+    /// tail confirms whether each device armed TURN before a match.
+    #[func]
+    fn on_turn_fetched(
+        &mut self,
+        _result: i64,
+        code: i64,
+        _headers: PackedStringArray,
+        body: PackedByteArray,
+    ) {
+        if code != 200 {
+            crate::analytics::log("turn", &format!(r#","ok":false,"code":{code}"#));
+            return;
+        }
+        let text = body.get_string_from_utf8();
+        rtc::store_turn_creds(&text);
+        let n = rtc::turn_url_count();
+        crate::analytics::log("turn", &format!(r#","ok":true,"urls":{n}"#));
+    }
 }
 
 impl KneeMan {
@@ -1059,9 +1109,13 @@ impl KneeMan {
         }
     }
 
-    /// Record the opponent's chosen name+color from the SDP handshake dict ("pname"/"pcolor").
-    /// Cosmetic only — never touches SimState or NetInput; cannot affect the checksum.
-    fn note_peer_identity(&mut self, name: String, color_html: String) {
+    /// Record the opponent's chosen name+color+char from the SDP handshake dict ("pname"/"pcolor"/
+    /// "pchar"). Cosmetic only — never touches SimState or NetInput; cannot affect the checksum. `pchar`
+    /// is the peer's roster pick; `sync_charsel` paints it on the remote slot. -1 = old client (ignored).
+    fn note_peer_identity(&mut self, name: String, color_html: String, pchar: i64) {
+        if pchar >= 0 {
+            self.peer_char = Some(pchar as usize);
+        }
         if name.is_empty() {
             return; // old client didn't send identity; leave peer_identity None
         }
@@ -1420,7 +1474,7 @@ impl KneeMan {
             "offer" => {
                 self.sig.offer_in += 1;
                 self.note_peer_build(rtc::dget_str(&d, "hash"));
-                self.note_peer_identity(rtc::dget_str(&d, "pname"), rtc::dget_str(&d, "pcolor"));
+                self.note_peer_identity(rtc::dget_str(&d, "pname"), rtc::dget_str(&d, "pcolor"), rtc::dget_int_or(&d, "pchar", -1));
                 let sdp = rtc::dget_str(&d, "sdp");
                 if let Some(mut pc) = self.pc.clone() {
                     pc.set_remote_description("offer", &sdp);
@@ -1430,7 +1484,7 @@ impl KneeMan {
             "answer" => {
                 self.sig.answer_in += 1;
                 self.note_peer_build(rtc::dget_str(&d, "hash"));
-                self.note_peer_identity(rtc::dget_str(&d, "pname"), rtc::dget_str(&d, "pcolor"));
+                self.note_peer_identity(rtc::dget_str(&d, "pname"), rtc::dget_str(&d, "pcolor"), rtc::dget_int_or(&d, "pchar", -1));
                 let sdp = rtc::dget_str(&d, "sdp");
                 if let Some(mut pc) = self.pc.clone() {
                     pc.set_remote_description("answer", &sdp);
@@ -1483,9 +1537,17 @@ impl KneeMan {
     fn setup_peer(&mut self, role: Role) {
         self.role = Some(role);
         self.local_handle = role.handles().0;
+        self.ice_typ_seen = 0;
+        // Log whether TURN is armed for THIS peer session (creds fetched by now?) so the tail correlates
+        // a relay fallback with a successful connect. 0 => STUN-only (boot fetch missed / TURN disabled).
+        crate::analytics::log("peer_setup", &format!(r#","role":"{role:?}","turn":{}"#, rtc::turn_url_count()));
 
+        let cfg = rtc::ice_config();
+        // DEBUG: log the exact JSON Godot will hand to `new RTCPeerConnection(JSON.parse(...))`, so the
+        // tail shows whether the TURN entries (with creds) actually reach the browser or get dropped.
+        crate::analytics::log("ice_cfg", &format!(r#","json":{}"#, crate::analytics::jstr(&rtc::to_json(&cfg).to_string())));
         let mut pc = WebRtcPeerConnection::new_gd();
-        pc.initialize_ex().configuration(&rtc::ice_config()).done();
+        pc.initialize_ex().configuration(&cfg).done();
 
         let gd = self.to_gd();
         pc.connect(
@@ -2037,19 +2099,35 @@ impl KneeMan {
         self.saved_identity = id;
     }
 
-    /// Apply a menu character pick to the live sprite. Cosmetic: roster index isn't networked, so
-    /// each peer shows whatever skin it picked; swapping mid-match can't desync (art never folds
-    /// into the checksum). Clamps to the roster and rebuilds frames/scale/offset on the right sprite.
+    /// Apply the character picks to the live sprites. Cosmetic: roster index rides the SDP handshake
+    /// (display-only, never folds into the checksum), so swapping can't desync. In a net match the
+    /// local pick (charsel[0]) paints THIS peer's slot (`local_handle`) and the peer's pick (`peer_char`
+    /// from the handshake) paints the remote slot; in local hotseat each charsel entry paints its slot.
+    /// Clamps to the roster and rebuilds frames/scale/offset only on slots that actually changed.
     fn sync_charsel(&mut self) {
-        let want = self.charsel.get_cloned();
         let roster = roster();
-        for slot in 0..want.len() {
-            let idx = (want[slot].max(0) as usize).min(roster.len() - 1);
-            if idx == self.characters[slot] {
+        let clamp = |v: i64| (v.max(0) as usize).min(roster.len() - 1);
+        let want = self.charsel.get_cloned();
+
+        let mut desired = self.characters;
+        if self.net.is_some() {
+            let local = self.local_handle.min(1);
+            desired[local] = clamp(want[0]);
+            if let Some(pc) = self.peer_char {
+                desired[1 - local] = pc.min(roster.len() - 1);
+            }
+        } else {
+            for slot in 0..want.len().min(desired.len()) {
+                desired[slot] = clamp(want[slot]);
+            }
+        }
+
+        for slot in 0..desired.len() {
+            if desired[slot] == self.characters[slot] {
                 continue;
             }
-            self.characters[slot] = idx;
-            let c = &roster[idx];
+            self.characters[slot] = desired[slot];
+            let c = &roster[desired[slot]];
             if let Some(mut a) = self.sprites[slot].clone() {
                 apply_character(&mut a, c);
                 self.base_scale[slot] = c.scale;

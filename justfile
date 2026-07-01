@@ -98,15 +98,32 @@ signaling-bin:
     cd {{proj}}/signaling && cargo zigbuild --release --target x86_64-unknown-linux-musl
 
 # deploy the relay by shipping the PREBUILT static binary — the 1-core/1GB box never compiles rust.
-# Also refreshes the nginx push routes + systemd unit so /vapid + /subscribe + the EnvironmentFile land.
+# Ships the binary + nginx snippets (rtc/ev/turn) + systemd unit and idempotently wires the includes.
+# The recipe body is deploy/scripts/signaling.sh (VPS/PROJ/BIN overridable via env).
 signaling-deploy: signaling-bin
-    scp {{proj}}/signaling/target/x86_64-unknown-linux-musl/release/smash-signaling {{vps}}:/root/.cargo/bin/smash-signaling.new
-    scp deploy/nginx/rtc.conf {{vps}}:/etc/nginx/snippets/rtc.conf
-    scp deploy/nginx/ev.conf {{vps}}:/etc/nginx/snippets/ev.conf
-    scp deploy/systemd/smash-signaling.service {{vps}}:/etc/systemd/system/smash-signaling.service
-    # idempotently `include` the /ev snippet in the 443 server block (right after the rtc.conf include)
-    ssh {{vps}} 'grep -q "snippets/ev.conf" /etc/nginx/sites-enabled/default || sed -i "/include snippets\/rtc.conf;/a\\    include snippets/ev.conf;" /etc/nginx/sites-enabled/default'
-    ssh {{vps}} 'mv /root/.cargo/bin/smash-signaling.new /root/.cargo/bin/smash-signaling && systemctl daemon-reload && nginx -t && systemctl reload nginx && systemctl restart smash-signaling && systemctl --no-pager status smash-signaling | head -4'
+    VPS={{vps}} PROJ={{proj}} deploy/scripts/signaling.sh
+
+# --- TURN relay (coturn on the box; ICE fallback for symmetric-NAT / VPN peer pairs) ---
+
+# One-time: generate a random shared secret + point the relay at the TURN host, appended to the relay's
+# EnvironmentFile (never committed). Body: deploy/scripts/turn-secret.sh. Re-run to rotate.
+turn-secret:
+    VPS={{vps}} PROJ={{proj}} deploy/scripts/turn-secret.sh
+
+# Install/refresh coturn (reads the secret from the env file) + verify /turn mints. Re-runnable.
+# NOTE: also open 3478/udp+tcp and 49160-49200/udp on the Vultr CLOUD firewall. Body: deploy/scripts/turn.sh.
+turn-deploy:
+    VPS={{vps}} PROJ={{proj}} deploy/scripts/turn.sh
+
+# Full TURN bring-up in one shot: relay (with /turn) + coturn + verify. Body: deploy/scripts/turn-up.sh.
+# Prereq: run `just turn-secret` once first.
+turn-up: signaling-bin
+    VPS={{vps}} PROJ={{proj}} deploy/scripts/turn-up.sh
+
+# Post-deploy TURN validation (mint + external STUN reachability + turnutils relay test). Run it from
+# your laptop/CI (`brew install coturn` for turnutils) to prove the media range is externally reachable.
+turn-check:
+    VPS={{vps}} PROJ={{proj}} deploy/scripts/turn-check.sh
 
 # tail the live netcode event firehose (client-stamped sid/cs + server-stamped t/cip/sip). Pretty via
 # jq if present. This is the "stop guessing" view: watch phase/net/session_begin/hb lines in realtime.
@@ -161,7 +178,7 @@ godot-wasm:
 godot-export: godot-wasm
     cd {{proj}} && mkdir -p build/web && source ~/emsdk/emsdk_env.sh && \
       "{{godot45}}" --headless --path . --export-release "Web" build/web/index.html
-    cp {{proj}}/deploy/web/sw.js {{proj}}/deploy/web/push.js {{proj}}/build/web/
+    cp {{proj}}/deploy/web/sw.js {{proj}}/deploy/web/push.js {{proj}}/deploy/web/turn-probe.js {{proj}}/build/web/
     # Precompress the big assets so the in-process server's ServeDir(.precompressed_gzip()) serves the
     # .gz directly (no per-request CPU). -k keeps the originals for clients that don't send gzip.
     cd {{proj}}/build/web && gzip -kf index.side.wasm smash_sim.wasm index.js index.wasm index.pck 2>/dev/null || true
