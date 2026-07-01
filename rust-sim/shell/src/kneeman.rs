@@ -277,6 +277,7 @@ pub struct KneeMan {
     identity: Mutable<Identity>,        // local player name+color, edited by the panel, persisted
     saved_identity: Identity,           // last value written to localStorage (change detection)
     charsel: Mutable<[i64; 2]>,         // P1/P2 roster pick, written by the menu, applied live
+    toasts: crate::toast::Toasts,       // global snackbar queue, emitted on phase changes, drawn by DebugUi
     characters: [usize; sim::MAX_PLAYERS], // per-fighter index into ROSTER; charsel drives slots 0..2
     base_scale: [f32; sim::MAX_PLAYERS],   // each sprite's resting scale (impact-pop multiplies it)
 
@@ -352,6 +353,7 @@ impl INode2D for KneeMan {
             identity: Mutable::new(Identity::default()),
             saved_identity: Identity::default(),
             charsel: Mutable::new([0, 1]),
+            toasts: Mutable::new(Vec::new()),
             characters: [0, 1, 0, 1], // default: frog/zombie alternating; charsel overrides slots 0..2
             base_scale: [1.0; sim::MAX_PLAYERS],
             phase: Phase::Offline,
@@ -1159,6 +1161,10 @@ impl KneeMan {
         self.charsel.clone()
     }
 
+    pub fn toasts_cell(&self) -> crate::toast::Toasts {
+        self.toasts.clone()
+    }
+
     /// Once per frame: heartbeat the live phase/channel while connected (so a stall shows as repeated
     /// lines with unchanging state), and flush the buffered events to the relay on a cadence. ~60Hz
     /// physics tick: heartbeat every 60 frames (~1s), flush every 30 (~0.5s).
@@ -1211,8 +1217,25 @@ impl KneeMan {
                     self.local_handle,
                 ),
             );
+            self.toast_phase(self.phase, p);
         }
         self.phase = p;
+    }
+
+    /// Surface a phase transition to the player as a snackbar. Same (from,to) chokepoint the firehose
+    /// logs, so the connect/drop/reconnect story is told once and both consumers stay in lockstep.
+    /// Only real lifecycle edges toast; an intentional Leave (Signaling/Offline -> Offline) stays quiet.
+    fn toast_phase(&self, from: Phase, to: Phase) {
+        use crate::toast::{push, ToastKind};
+        let (kind, text) = match (from, to) {
+            (Phase::Signaling, Phase::Running) => (ToastKind::Success, "Connected to your opponent"),
+            (Phase::Reconnecting, Phase::Running) => (ToastKind::Success, "Reconnected"),
+            (Phase::Running, Phase::Reconnecting) => (ToastKind::Warn, "Connection lost, reconnecting…"),
+            (Phase::Reconnecting, Phase::Offline) => (ToastKind::Error, "Reconnect timed out. You are offline."),
+            (Phase::Running, Phase::Offline) => (ToastKind::Error, "Disconnected"),
+            _ => return,
+        };
+        push(&self.toasts, kind, text);
     }
 
     /// Read the live transport states off the ws/pc/channel handles and publish them for the panel.

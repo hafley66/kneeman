@@ -178,9 +178,9 @@ impl INode for DebugUi {
         };
         let ctx = bridge.bind().current_frame().clone();
         // grab the shared BehaviorSubjects (cheap clones of the same cells)
-        let (state_cell, tune_cell, gizmos_cell, net_cell, identity_cell, charsel_cell) = {
+        let (state_cell, tune_cell, gizmos_cell, net_cell, identity_cell, charsel_cell, toasts_cell) = {
             let f = fighter.bind();
-            (f.state_cell(), f.tune_cell(), f.gizmos_cell(), f.net_cell(), f.identity_cell(), f.charsel_cell())
+            (f.state_cell(), f.tune_cell(), f.gizmos_cell(), f.net_cell(), f.identity_cell(), f.charsel_cell(), f.toasts_cell())
         };
 
         // --- XP menu: drawn every frame (independent of the debug panel toggle) ---
@@ -262,6 +262,7 @@ impl INode for DebugUi {
             }
             if find_match {
                 fighter.bind_mut().find_match();
+                crate::toast::push(&toasts_cell, crate::toast::ToastKind::Info, "Searching for a match…");
             }
             if leave_match {
                 fighter.bind_mut().leave_match();
@@ -280,6 +281,10 @@ impl INode for DebugUi {
             }
             self.router.apply(out, &cells);
         }
+
+        // Snackbar: drawn every frame OVER game + menu (foreground), so a disconnect/reconnect line
+        // shows during play, not only in the pause menu. Ages itself off `dt`, above the `self.show` gate.
+        crate::toast::render(&ctx, dt as f32, &toasts_cell);
 
         if !self.show {
             return;
