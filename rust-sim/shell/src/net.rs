@@ -81,6 +81,10 @@ pub struct NetDebug {
     pub offer: (u32, u32),
     pub answer: (u32, u32),
     pub ice: (u32, u32),
+    // version/relay ping info for the Network page.
+    pub build_hash: &'static str, // our own build hash (env!("BUILD_HASH"))
+    pub stale_build: bool,        // relay reported a newer build -> reload warning
+    pub peer_build_mismatch: bool, // peer SDP hash was received AND differs from ours
 }
 
 impl Default for NetDebug {
@@ -97,6 +101,9 @@ impl Default for NetDebug {
             offer: (0, 0),
             answer: (0, 0),
             ice: (0, 0),
+            build_hash: crate::rtc::BUILD_HASH,
+            stale_build: false,
+            peer_build_mismatch: false,
         }
     }
 }

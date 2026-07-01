@@ -31,19 +31,17 @@ pub enum Route {
     Network,
 }
 
-/// A modal laid over the base, query-param style (reachable from many bases). Two-player: it owns a
-/// confirm per player and only fires once the gate (`require_both`) passes.
+/// A modal laid over the base (reachable from many bases). Single confirm: one button fires it, one
+/// cancels. No per-player gate — a dialog either fires or it doesn't.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Dialog {
     ConfirmReset,
-    SpawnConfirm(ItemKind),
     GifImport,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct DialogState {
     pub kind: Dialog,
-    pub confirms: [bool; 2],
 }
 
 /// Where the menu is: a base page plus an optional dialog on top. Copy + small, so it is cheap to
@@ -61,9 +59,8 @@ pub enum NavCmd {
     Push(Route),
     Back,
     OpenDialog(Dialog),
-    Confirm(usize), // a player pressed confirm (0 or 1)
+    Confirm, // fire the open dialog
     CancelDialog,
-    SetRequireBoth(bool),
 }
 
 /// What the reducer hands back: nothing, or "this dialog passed its gate -- caller, run its effect".
@@ -80,7 +77,6 @@ pub enum NavOut {
 pub struct Nav {
     loc: Location,
     history: Vec<Route>,
-    require_both: bool, // dialogs need both players; off = either one closes it ("bc its funny")
 }
 
 impl Default for Nav {
@@ -91,7 +87,6 @@ impl Default for Nav {
                 dialog: None,
             },
             history: Vec::new(),
-            require_both: true,
         }
     }
 }
@@ -99,10 +94,6 @@ impl Default for Nav {
 impl Nav {
     pub fn location(&self) -> Location {
         self.loc
-    }
-
-    pub fn require_both(&self) -> bool {
-        self.require_both
     }
 
     /// Apply one nav command. Pure: mutates only `self`, returns any dialog that passed its gate.
@@ -127,21 +118,14 @@ impl Nav {
                 NavOut::None
             }
             NavCmd::OpenDialog(d) => {
-                self.loc.dialog = Some(DialogState {
-                    kind: d,
-                    confirms: [false; 2],
-                });
+                self.loc.dialog = Some(DialogState { kind: d });
                 NavOut::None
             }
             NavCmd::CancelDialog => {
                 self.loc.dialog = None;
                 NavOut::None
             }
-            NavCmd::SetRequireBoth(b) => {
-                self.require_both = b;
-                NavOut::None
-            }
-            NavCmd::Confirm(p) => self.confirm(p),
+            NavCmd::Confirm => self.confirm(),
         }
     }
 
@@ -158,39 +142,26 @@ impl Nav {
         self.loc = Location { base, dialog: None };
     }
 
-    /// Mark a player's confirm; when the gate passes, clear the dialog and report it for firing.
-    fn confirm(&mut self, player: usize) -> NavOut {
-        let Some(ds) = self.loc.dialog.as_mut() else {
+    /// Confirm the open dialog: clear it and report it for firing.
+    fn confirm(&mut self) -> NavOut {
+        let Some(ds) = self.loc.dialog.as_ref() else {
             return NavOut::None;
         };
-        if player < 2 {
-            ds.confirms[player] = true;
-        }
-        let pass = if self.require_both {
-            ds.confirms[0] && ds.confirms[1]
-        } else {
-            ds.confirms[0] || ds.confirms[1]
-        };
-        if pass {
-            let kind = ds.kind;
-            self.loc.dialog = None;
-            NavOut::Fire(kind)
-        } else {
-            NavOut::None
-        }
+        let kind = ds.kind;
+        self.loc.dialog = None;
+        NavOut::Fire(kind)
     }
 }
 
 // ================================ impure effect layer (shell) =================================
 
 /// A read-only snapshot the screens see: the game cells sampled once this frame, plus the current
-/// route (for nav highlighting) and the require-both setting.
+/// route (for nav highlighting).
 pub struct MenuCtx<'a> {
     pub state: &'a SimState,
     pub tune: &'a Tune,
     pub charsel: [i64; 2],
     pub route: Route,
-    pub require_both: bool,
     pub net: &'a NetDebug, // transport snapshot for the Network page
     pub lobbies: &'a [crate::net::LobbyRow], // shell-held lobby list for the Network page's grid
 }
@@ -209,12 +180,11 @@ pub enum Intent {
     Nav(Route),
     Back,
     OpenDialog(Dialog),
-    DialogConfirm(usize),
+    DialogConfirm,
     DialogCancel,
     SpawnItem(ItemKind),
     ClearItems,
     SetChar { slot: usize, idx: i64 },
-    SetRequireBoth(bool),
     /// Signal to the shell (`DebugUi::process`) to open the egui debug panel. The pure Router
     /// treats this as a no-op; the shell intercepts and drains it before calling `Router::apply`.
     OpenDebugPanel,
@@ -240,10 +210,6 @@ impl Router {
         self.nav.location()
     }
 
-    pub fn require_both(&self) -> bool {
-        self.nav.require_both()
-    }
-
     /// Drain a frame's intents, after the egui pass.
     pub fn apply(&mut self, intents: Vec<Intent>, cells: &MenuCells) {
         for it in intents {
@@ -258,8 +224,7 @@ impl Router {
             Intent::Back => self.dispatch(NavCmd::Back, cells),
             Intent::OpenDialog(d) => self.dispatch(NavCmd::OpenDialog(d), cells),
             Intent::DialogCancel => self.dispatch(NavCmd::CancelDialog, cells),
-            Intent::DialogConfirm(p) => self.dispatch(NavCmd::Confirm(p), cells),
-            Intent::SetRequireBoth(b) => self.dispatch(NavCmd::SetRequireBoth(b), cells),
+            Intent::DialogConfirm => self.dispatch(NavCmd::Confirm, cells),
             Intent::SpawnItem(k) => spawn_item(cells, k),
             Intent::ClearItems => clear_items(cells),
             Intent::SetChar { slot, idx } => {
@@ -288,7 +253,6 @@ impl Router {
     fn fire_dialog(&mut self, kind: Dialog, cells: &MenuCells) {
         match kind {
             Dialog::ConfirmReset => cells.tune.set(Tune::default()),
-            Dialog::SpawnConfirm(k) => spawn_item(cells, k),
             Dialog::GifImport => { /* wired with the gif-background feature */ }
         }
     }

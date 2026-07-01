@@ -13,7 +13,6 @@ mod items;
 mod network;
 mod rules;
 
-use crate::sim::{self, ItemKind};
 use crate::ui::themes::Theme;
 use router::{Dialog, DialogState, Intent, MenuCells, MenuCtx, Route, Router};
 
@@ -43,7 +42,6 @@ pub fn menu<T: Theme>(
         tune: &tune,
         charsel: cells.charsel.get(),
         route: loc.base,
-        require_both: router.require_both(),
         net: &net,
         lobbies,
     };
@@ -141,37 +139,24 @@ fn title_of(route: Route) -> &'static str {
     }
 }
 
-/// The two-player modal: scrim + framed body with a confirm button per player and a cancel.
+/// A single-confirm modal: scrim + framed body with one Confirm and one Cancel.
 fn dialog_layer<T: Theme>(
     ctx: &egui::Context,
     theme: &T,
     ds: DialogState,
-    cx: &MenuCtx,
+    _cx: &MenuCtx,
     out: &mut Vec<Intent>,
 ) {
     theme.dialog(ctx, dialog_title(ds.kind), |ui| {
         ui.label(dialog_body(ds.kind));
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            for p in 0..2usize {
-                let label = if ds.confirms[p] {
-                    format!("P{} ✓", p + 1)
-                } else {
-                    format!("P{} OK", p + 1)
-                };
-                if theme.button(ui, &label).clicked() {
-                    out.push(Intent::DialogConfirm(p));
-                }
+            if theme.button(ui, "Confirm").clicked() {
+                out.push(Intent::DialogConfirm);
             }
             if theme.button(ui, "Cancel").clicked() {
                 out.push(Intent::DialogCancel);
             }
-        });
-        ui.add_space(4.0);
-        ui.small(if cx.require_both {
-            "both players must confirm"
-        } else {
-            "either player confirms"
         });
     });
 }
@@ -179,7 +164,6 @@ fn dialog_layer<T: Theme>(
 fn dialog_title(d: Dialog) -> &'static str {
     match d {
         Dialog::ConfirmReset => "Reset feel?",
-        Dialog::SpawnConfirm(_) => "Spawn item?",
         Dialog::GifImport => "Import GIF",
     }
 }
@@ -187,15 +171,6 @@ fn dialog_title(d: Dialog) -> &'static str {
 fn dialog_body(d: Dialog) -> String {
     match d {
         Dialog::ConfirmReset => "Restore all physics tuning to defaults.".to_string(),
-        Dialog::SpawnConfirm(k) => format!("Drop a {} onto the stage.", item_name(k)),
         Dialog::GifImport => "Pick a GIF for the stage background.".to_string(),
     }
-}
-
-fn item_name(k: ItemKind) -> &'static str {
-    sim::MENU_ITEMS
-        .iter()
-        .find(|c| c.kind == k)
-        .map(|c| c.name)
-        .unwrap_or("item")
 }

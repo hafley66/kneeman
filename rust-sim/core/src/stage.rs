@@ -3,7 +3,7 @@
 //! polyline of segments — so stage geometry and ink share this module. Everything here is pure and
 //! `Copy`-friendly so it rides inside the rolled-back `SimState`. Re-exported at the crate root.
 
-use crate::{geo, Fighter, InputFrame, Item, SimState, Tune, Vector2};
+use crate::{geo, Fighter, InputFrame, SimState, Tune, Vector2};
 use serde::{Deserialize, Serialize};
 
 // Battlefield-style stage: one solid main platform (with grabbable ledges) + soft platforms
@@ -461,7 +461,10 @@ pub(crate) fn update_paths(n: &mut SimState, inputs: &[&InputFrame], t: &Tune) {
                     finalize_path(&mut n.paths[slot]); // stroke's gas spent: solidify
                 }
                 if n.items[holding as usize].gas <= 0.0 {
-                    n.items[holding as usize] = Item::EMPTY; // pen out of ink: vanishes
+                    // pen out of ink: don't pop instantly like a spent gun — detach it to the ground
+                    // (still briefly pickup-able). `update_items` despawns it once it settles idle on
+                    // the floor with no ink left (its "unload").
+                    n.items[holding as usize].owner = -1;
                     n.fighters[idx].holding = -1;
                 }
             }

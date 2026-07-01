@@ -5,7 +5,7 @@
 
 use crate::geo;
 use crate::{
-    Act, Action, CharState, Fighter, InkPath, InputFrame, Item, Lane, Tune, Vector2,
+    Act, Action, CharState, Fighter, InkPath, InputFrame, Item, Lane, ThrowDir, Tune, Vector2,
     DASH_THRESH, DT, DUMMY_FRICTION, ECB_HALF_H, ECB_HALF_W, FLOOR_LEFT, FLOOR_RIGHT, GROUND_Y,
     KNOCKDOWN_LOCK, LEDGE_FALL_EPS, LEDGE_REACH_X, MAX_DRAWN, MAX_ITEMS, PLATFORMS, STAGE_BOTTOM,
     STOP_EPS, WALK_THRESH, WALL_TILT_FRAMES,
@@ -212,7 +212,12 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
     let held_pen = holding && items[n.holding as usize].kind.is_pen();
     if holding {
         if grab {
-            act = Act::Drop;
+            // grab while holding: a directional stick THROWS the item as a live projectile; a
+            // neutral grab is the old gentle toss (Drop).
+            act = match item_throw_dir(i, n.facing) {
+                Some(dir) => Act::Throw { dir },
+                None => Act::Drop,
+            };
         } else if held_pen && (i.attack || i.attack_held) {
             act = Act::Draw; // a pen draws instead of firing
         } else if !held_pen && (i.attack || i.attack_held) {
@@ -224,7 +229,7 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
         act = Act::Pickup;
     }
     let fire = matches!(act, Act::Fire { .. });
-    let grabbing = matches!(act, Act::Pickup | Act::Drop);
+    let grabbing = matches!(act, Act::Pickup | Act::Drop | Act::Throw { .. });
     let drawing_act = matches!(act, Act::Draw);
     let atk = i.attack && !fire && !grabbing && !drawing_act; // effective attack for jab/aerial
     // grab button with empty hands + no item interaction = a fighter-grab attempt (grounded only).
@@ -699,6 +704,13 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
                 // (wavedash), where the down is the dodge aim, not a drop command.
                 let land = p.solid || !i.down || n.state == CharState::AirDodge;
                 if in_x && crossed && land {
+                    // a fast tumbling (spiked) body bounces off the floor instead of landing: invert
+                    // vel.y scaled by floor_bounce and STAY airborne + tumbling (the dair funny bounce).
+                    if n.tumble && n.vel.y > t.tumble_speed {
+                        n.pos.y = p.y;
+                        n.vel.y = -n.vel.y * t.floor_bounce;
+                        break;
+                    }
                     n.pos.y = p.y;
                     n.vel.y = 0.0;
                     n.fast_falling = false;
@@ -722,6 +734,12 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
                 let crossed = prev_y <= surf + 1.0 && n.pos.y >= surf;
                 let land = p.props.solid || !i.down || n.state == CharState::AirDodge;
                 if crossed && land {
+                    // same funny floor bounce off a drawn ink surface: fast tumbling body rebounds.
+                    if n.tumble && n.vel.y > t.tumble_speed {
+                        n.pos.y = surf;
+                        n.vel.y = -n.vel.y * t.floor_bounce;
+                        break;
+                    }
                     n.pos.y = surf;
                     n.vel.y = 0.0;
                     n.fast_falling = false;
@@ -898,6 +916,24 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
 
 fn is_ledge(st: CharState) -> bool {
     matches!(st, CharState::LedgeHold | CharState::LedgeClimb)
+}
+
+/// Throw direction from the stick at the grab press: up / down / forward / back. `None` = a neutral
+/// grab, which stays the soft toss (Act::Drop). aim_y is +down (matches the throw/DI convention).
+fn item_throw_dir(i: &InputFrame, facing: f32) -> Option<ThrowDir> {
+    if i.aim_y <= -0.4 {
+        Some(ThrowDir::Up)
+    } else if i.aim_y >= 0.4 {
+        Some(ThrowDir::Down)
+    } else if i.dir.abs() >= 0.4 {
+        if sign(i.dir) == facing {
+            Some(ThrowDir::Forward)
+        } else {
+            Some(ThrowDir::Back)
+        }
+    } else {
+        None // neutral: gentle toss
+    }
 }
 
 /// Jump / shield are available from every actionable ground state; factor them out.

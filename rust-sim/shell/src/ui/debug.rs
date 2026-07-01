@@ -96,9 +96,16 @@ impl INode for DebugUi {
         // + B become synthetic key events (Tab focus-nav / Enter activate / Esc back) that egui and
         // this handler already understand -- so no custom focus model and no bridge changes.
         if let Ok(pad) = event.clone().try_cast::<InputEventJoypadButton>() {
-            if pad.is_pressed() && !pad.is_echo() && pad.get_button_index() == JoyButton::START {
-                self.open_pause_menu();
-                return;
+            if pad.is_pressed() && !pad.is_echo() {
+                if pad.get_button_index() == JoyButton::START {
+                    self.open_pause_menu();
+                    return;
+                }
+                // ○/B closes the debug panel when it's the thing on screen (menu not open).
+                if pad.get_button_index() == JoyButton::B && !self.is_menu_open() && self.show {
+                    self.show = false;
+                    return;
+                }
             }
             if self.is_menu_open() {
                 self.gamepad_menu_nav(pad);
@@ -121,7 +128,14 @@ impl INode for DebugUi {
         // Esc drives the XP menu: opens the pause menu in game, else backs out / closes a dialog.
         // Resolved in process() (egui can't be poked here), like the want_status deferral.
         if key.get_keycode() == Key::ESCAPE {
-            self.menu_esc = true;
+            // menu open -> back out of it; else if the debug panel is up, Esc closes that.
+            if self.is_menu_open() {
+                self.menu_esc = true;
+            } else if self.show {
+                self.show = false;
+            } else {
+                self.menu_esc = true; // nothing open -> open the pause menu
+            }
             return;
         }
         if key.is_meta_pressed() && key.is_shift_pressed() {
@@ -168,6 +182,8 @@ impl INode for DebugUi {
             let mut open_panel = false;
             let mut find_match = false;
             let mut leave_match = false;
+            let mut open_lobby_key: Option<String> = None;
+            let mut join_key: Option<String> = None;
             out.retain(|intent| match intent {
                 Intent::OpenDebugPanel => {
                     open_panel = true;
@@ -182,11 +198,11 @@ impl INode for DebugUi {
                     false
                 }
                 Intent::OpenLobby => {
-                    self.open_lobby();
+                    open_lobby_key = Some(Self::lobby_key());
                     false
                 }
                 Intent::JoinLobby(key) => {
-                    self.join_lobby(key);
+                    join_key = Some(key.clone());
                     false
                 }
                 _ => true,
@@ -199,6 +215,16 @@ impl INode for DebugUi {
             }
             if leave_match {
                 fighter.bind_mut().leave_match();
+            }
+            // Lobby = a named relay room. Opening hosts the versioned room AND shows a local grid row;
+            // both actions just dial `matchmake_room`, so two clients on the same key pair over the
+            // existing 1v1 transport. The mock `active` count bump is gone (no more self-join inflation).
+            if let Some(key) = open_lobby_key {
+                self.open_lobby(&key);
+                fighter.bind_mut().matchmake_room(&key);
+            }
+            if let Some(key) = join_key {
+                fighter.bind_mut().matchmake_room(&key);
             }
             self.router.apply(out, &cells);
         }
@@ -261,8 +287,8 @@ impl DebugUi {
             return;
         }
         let (keycode, shift) = match pad.get_button_index() {
-            JoyButton::DPAD_DOWN => (Key::TAB, false),
-            JoyButton::DPAD_UP => (Key::TAB, true),
+            JoyButton::DPAD_DOWN | JoyButton::DPAD_RIGHT => (Key::TAB, false),
+            JoyButton::DPAD_UP | JoyButton::DPAD_LEFT => (Key::TAB, true),
             JoyButton::A => (Key::ENTER, false),
             JoyButton::B => (Key::ESCAPE, false),
             _ => return,
@@ -298,27 +324,25 @@ impl DebugUi {
 // LOCAL UI state (never the KneeMan transport / SimState / checksum); the relay `list` feed replaces
 // it in P2 (see lobby-netplay-plan.md §7).
 impl DebugUi {
-    /// Host a lobby for the current build version. Idempotent: only one self-hosted row ("you").
-    fn open_lobby(&mut self) {
+    /// The versioned lobby room code: same-build clients share it, so cross-build never pairs (which
+    /// would desync). Doubles as the grid `key` and the relay `&room=` dial code.
+    fn lobby_key() -> String {
+        format!("lobby-{}", crate::rtc::BUILD_HASH)
+    }
+
+    /// Host a lobby for the current build version: add the local "you" grid row (idempotent). The
+    /// actual transport (dialing the room) is done by the caller via `KneeMan::matchmake_room`.
+    fn open_lobby(&mut self, key: &str) {
         if self.lobbies.iter().any(|l| l.host == "you") {
             return;
         }
         self.lobbies.push(crate::net::LobbyRow {
-            key: "v0.3".into(),
+            key: key.into(),
             host: "you".into(),
             active: 1,
             cap: crate::sim::MAX_PLAYERS as u8,
             empty_since_ms: None,
         });
-    }
-
-    /// Join a lobby by key: bump its player count, clamped to capacity (no-op if already full).
-    fn join_lobby(&mut self, key: &str) {
-        if let Some(row) = self.lobbies.iter_mut().find(|l| l.key == key) {
-            if row.active < row.cap {
-                row.active += 1;
-            }
-        }
     }
 }
 

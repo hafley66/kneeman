@@ -100,9 +100,20 @@ pub enum CharState {
 pub enum Act {
     None,
     Fire { auto: bool }, // held gun + attack: spawn a bolt (auto = held, not a fresh tap: weaker)
-    Drop,                // held item + grab: detach to the ground
+    Drop,                // held item + neutral grab: detach to the ground (the gentle toss)
     Pickup,              // empty hands + attack over an item: claim it (else attack jabs)
     Draw,                // held pen + attack: lay a node on the owner's ink path this frame
+    Throw { dir: ThrowDir }, // held item + directional grab: launch it as a live projectile
+}
+
+/// Directional item throw (Smash-style). Neutral grab is the soft toss (`Act::Drop`); a real stick
+/// direction routes here so the item flies as an armed projectile keyed to this direction.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ThrowDir {
+    Up,
+    Down,
+    Forward,
+    Back,
 }
 
 fn airborne(st: CharState) -> bool {
@@ -589,6 +600,7 @@ fn apply_act(n: &mut SimState, idx: usize, act: Act, t: &Tune) {
         Act::None => {}
         Act::Fire { auto } => fire_gun(n, idx, auto, t),
         Act::Drop => drop_item(n, idx),
+        Act::Throw { dir } => throw_item(n, idx, dir, t),
         Act::Pickup => pickup_item(n, idx, t),
         // node-laying needs the raw stick (cursor/ruler aim), which apply_act doesn't have — it runs
         // in `update_paths`. Act::Draw exists only so `reduce_next_state` suppressed the jab; nothing to do here.

@@ -156,20 +156,20 @@ impl AttackData {
         startup: 6,
         recovery: 8,
         boxes: [
-            // foot at tuck-exit: spike opens, near waist height.
-            Hitbox { id: 0, start: 6, len: 2, off: Vector2::new(10.0, 5.0), r: 36.0,
+            // foot at tuck-exit: spike opens, near waist height. (radii scaled 1.5x for reach)
+            Hitbox { id: 0, start: 6, len: 2, off: Vector2::new(10.0, 5.0), r: 54.0,
                 damage: 12.0, angle: -80.0, bkb: 18.0, kbg: 36.0, set_kb: 0.0,
                 transcendent: true, refresh: 0 },
             // foot mid-extension: same id, next window, driven further down-and-out.
-            Hitbox { id: 0, start: 8, len: 2, off: Vector2::new(14.0, 38.0), r: 38.0,
+            Hitbox { id: 0, start: 8, len: 2, off: Vector2::new(14.0, 38.0), r: 57.0,
                 damage: 12.0, angle: -80.0, bkb: 18.0, kbg: 36.0, set_kb: 0.0,
                 transcendent: true, refresh: 0 },
             // foot near full extension: spike closes out.
-            Hitbox { id: 0, start: 10, len: 2, off: Vector2::new(18.0, 66.0), r: 40.0,
+            Hitbox { id: 0, start: 10, len: 2, off: Vector2::new(18.0, 66.0), r: 60.0,
                 damage: 12.0, angle: -80.0, bkb: 18.0, kbg: 36.0, set_kb: 0.0,
                 transcendent: true, refresh: 0 },
             // sourspot tail: foot fully extended, sends up-and-away on whiffed spike timing.
-            Hitbox { id: 1, start: 12, len: 5, off: Vector2::new(20.0, 74.0), r: 36.0,
+            Hitbox { id: 1, start: 12, len: 5, off: Vector2::new(20.0, 74.0), r: 54.0,
                 damage: 6.0, angle: 60.0, bkb: 10.0, kbg: 22.0, set_kb: 0.0,
                 transcendent: true, refresh: 0 },
         ],

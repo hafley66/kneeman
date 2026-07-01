@@ -3,7 +3,7 @@
 //! live. Split out of `lib` as plain config -- not sim state, not history.
 
 use crate::physics::{acc, vel};
-use crate::{AttackData, ItemConfig, SpecialMove, StrokeRegistry, ThrowData};
+use crate::{AttackData, ItemConfig, SpecialMove, StrokeRegistry, ThrowData, ThrowItem};
 
 /// Per-character attributes in SOURCE UNITS (units/frame @ 60fps; frames are integers).
 /// This is the canonical character definition; `Tune` (pixel-space) is derived from it.
@@ -159,6 +159,7 @@ pub struct Tune {
     pub kb_hitstun: f32,         // hitstun frames per KB unit (community 0.4: floor(0.4 * KB))
     pub laser: ItemConfig,
     pub bomb: ItemConfig,         // the red gun's arcing explosive (Bob-omb-ish)
+    pub throw_item: ThrowItem,    // directional item-throw speeds + the armed item's contact hitbox
     // drawn stroke paths
     pub strokes: StrokeRegistry,  // named stroke-material presets; row 0 = default (panel-editable)
     pub ink_budget: f32,          // total path length (px) a fresh ink item can lay before it's spent
@@ -186,6 +187,8 @@ pub struct Tune {
     // stage geometry
     pub wall_bounce: f32,         // restitution when a LAUNCHED (tumbling) body hits a stage wall;
                                   // 0 = dead stop (normal recovery), >0 = bounce off (geo::reflect)
+    pub floor_bounce: f32,        // restitution when a fast LAUNCHED (tumbling) body hits the floor;
+                                  // 0 = dead stop (land), >0 = bounce up (dair spike -> funny bounce)
 }
 
 impl Tune {
@@ -250,8 +253,10 @@ impl Tune {
             kb_hitstun: 0.4,     // community/PM constant: hitstun = floor(0.4 * KB)
             laser: ItemConfig::LASER,
             bomb: ItemConfig::BOMB,
+            throw_item: ThrowItem::DEFAULT,
             strokes: StrokeRegistry::DEFAULT,
-            ink_budget: 900.0, // ~the main stage width of drawable line per pickup
+            ink_budget: 1.0e9, // effectively infinite ink while testing (was 900.0 ~ stage width);
+                               // the pen out-of-gas unload still works, it just won't trigger here
             ink_cursor_reach: 140.0,
             ink_spawn_weight: 0.6,
             fastfall_threshold: 0.6,
@@ -272,6 +277,7 @@ impl Tune {
             knockdown_frames: 40,
             getup_frames: 24,
             wall_bounce: 0.45, // launched into the stage wall, a tumbling body kicks back off it
+            floor_bounce: 0.55, // spiked into the floor, a fast tumbling body bounces back up
         }
     }
 }

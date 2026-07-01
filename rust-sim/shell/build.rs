@@ -14,6 +14,9 @@ fn main() {
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=BUILD_HASH={hash}");
 
-    // Rebuild stamp moves whenever HEAD does, so the hash never goes stale across commits.
+    // Rebuild stamp moves whenever HEAD or the reflog does, so the hash never goes stale across
+    // same-branch commits (logs/HEAD is appended on every commit/checkout/reset; HEAD alone only
+    // changes on a branch switch).
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
 }

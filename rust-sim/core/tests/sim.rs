@@ -415,6 +415,7 @@ fn attack_over_gun_picks_it_up() {
         facing: 1.0,
         tool: ToolKind::TrailPen,
         stroke: 0,
+        thrown: false,
     };
     let after = step(&s, &[&press(|i| i.attack = true), &idle()], &t);
     assert_eq!(after.fighters[0].holding, 0, "attack over an unowned gun should pick it up");
@@ -435,6 +436,7 @@ fn grab_over_an_item_picks_it_up() {
         facing: 1.0,
         tool: ToolKind::TrailPen,
         stroke: 0,
+        thrown: false,
     };
     let after = step(&s, &[&press(|i| i.grab = true), &idle()], &t);
     assert_eq!(after.fighters[0].holding, 0, "grab over an unowned item should pick it up");
@@ -457,6 +459,7 @@ fn firing_a_held_gun_spawns_a_bolt_and_spends_ammo() {
         facing: 1.0,
         tool: ToolKind::TrailPen,
         stroke: 0,
+        thrown: false,
     };
     let after = step(&s, &[&press(|i| i.attack = true), &idle()], &t);
     let bolts = after.items.iter().filter(|x| x.kind == ItemKind::LaserBolt).count();
@@ -480,6 +483,7 @@ fn grab_drops_a_held_gun() {
         facing: 1.0,
         tool: ToolKind::TrailPen,
         stroke: 0,
+        thrown: false,
     };
     let after = step(&s, &[&press(|i| i.grab = true), &idle()], &t);
     assert_eq!(after.fighters[0].holding, -1, "grab should drop the held item");
@@ -566,4 +570,141 @@ fn a_bomb_off_stage_despawns_quietly_without_exploding() {
         [s.fighters[0].damage, s.fighters[1].damage], dmg0,
         "a bomb that fell out of bounds must not explode or damage anyone"
     );
+}
+
+#[test]
+fn dair_hitboxes_are_scaled_up() {
+    let t = Tune::default();
+    let b = t.dair.boxes;
+    assert_eq!(b[0].r, 54.0, "dair box 0 radius scaled 36 -> 54");
+    assert_eq!(b[1].r, 57.0, "dair box 1 radius scaled 38 -> 57");
+    assert_eq!(b[2].r, 60.0, "dair box 2 radius scaled 40 -> 60");
+    assert_eq!(b[3].r, 54.0, "dair sourspot radius scaled 36 -> 54");
+}
+
+#[test]
+fn an_empty_pen_settles_on_the_ground_then_despawns() {
+    // GROUND_Y = 760. An UNOWNED empty pen (gas < 1) dropped above the stage should fall, settle on
+    // the floor, and unload (despawn) — unlike a spent gun, which vanishes instantly.
+    let (mut s, t) = settled();
+    s.items[0] = Item {
+        kind: ItemKind::Pen,
+        pos: Vector2::new(600.0, 760.0 - 60.0), // over the stage, above the floor
+        owner: -1,
+        gas: 0.0, // out of ink
+        gas_max: t.ink_budget,
+        ..Item::EMPTY
+    };
+    let mut gone = false;
+    for _ in 0..120 {
+        s = step(&s, &[&idle(), &idle()], &t);
+        if !s.items[0].active() {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "an empty pen should despawn once it settles idle on the ground");
+
+    // a FULL pen resting on the floor must NOT unload — only an empty one does.
+    let (mut s2, t2) = settled();
+    s2.items[0] = Item {
+        kind: ItemKind::Pen,
+        pos: Vector2::new(400.0, 760.0 - 60.0),
+        owner: -1,
+        gas: t2.ink_budget, // full
+        gas_max: t2.ink_budget,
+        ..Item::EMPTY
+    };
+    for _ in 0..120 {
+        s2 = step(&s2, &[&idle(), &idle()], &t2);
+    }
+    assert!(s2.items[0].active(), "a full pen resting on the ground stays (only an empty pen unloads)");
+    assert_eq!(s2.items[0].pos.y, 760.0, "the full pen rests on the floor");
+}
+
+#[test]
+fn throwing_a_held_item_knocks_back_a_victim() {
+    let t = Tune::default();
+    let mut s = SimState::spawn();
+    // thrower grounded holding a gun; victim standing in front at chest height.
+    s.fighters[0].pos = Vector2::new(600.0, 760.0);
+    s.fighters[0].state = CharState::Stand;
+    s.fighters[0].ground_plat = 0;
+    s.fighters[0].facing = 1.0;
+    s.fighters[0].holding = 0;
+    s.fighters[1].pos = Vector2::new(720.0, 760.0);
+    s.fighters[1].state = CharState::Stand;
+    s.fighters[1].ground_plat = 0;
+    s.items[0] = Item {
+        kind: ItemKind::LaserGun,
+        pos: Vector2::new(600.0, 760.0 - 70.0), // chest height, in the flight path
+        owner: 0,
+        gas: 16.0,
+        gas_max: 16.0,
+        ..Item::EMPTY
+    };
+    let dmg0 = s.fighters[1].damage;
+    // grab + forward stick = a forward throw (not the neutral soft toss).
+    let throw = press(|i| {
+        i.grab = true;
+        i.dir = 1.0;
+    });
+    s = step(&s, &[&throw, &idle()], &t);
+    assert!(s.items[0].thrown, "grab + a stick direction arms the held item as a throw");
+    assert!(s.fighters[0].holding < 0, "the thrower released the item");
+    // let it fly into the victim; it should damage + knock them back, then despawn.
+    let mut hit = false;
+    for _ in 0..30 {
+        s = step(&s, &[&idle(), &idle()], &t);
+        if s.fighters[1].damage > dmg0 {
+            hit = true;
+            break;
+        }
+    }
+    assert!(hit, "a thrown item should damage + knock back the victim it hits");
+    assert!(s.fighters[1].hitstun > 0 || s.fighters[1].vel.length() > 1.0, "victim took knockback");
+}
+
+#[test]
+fn a_neutral_grab_while_holding_soft_tosses_instead_of_throwing() {
+    let t = Tune::default();
+    let mut s = SimState::spawn();
+    s.fighters[0].holding = 0;
+    s.items[0] = Item {
+        kind: ItemKind::LaserGun,
+        pos: s.fighters[0].pos,
+        owner: 0,
+        gas: 16.0,
+        gas_max: 16.0,
+        ..Item::EMPTY
+    };
+    // neutral grab (no stick): the gentle drop, NOT an armed throw.
+    let after = step(&s, &[&press(|i| i.grab = true), &idle()], &t);
+    assert!(after.fighters[0].holding < 0, "neutral grab drops the held item");
+    assert!(!after.items[0].thrown, "a neutral grab is the soft toss, not an armed throw");
+    assert!(after.items[0].owner < 0, "soft-tossed item is unowned");
+}
+
+#[test]
+fn a_tumbling_body_bounces_off_the_floor() {
+    // A fast tumbling (spiked) body should invert vel.y off the floor and STAY airborne, instead of
+    // dead-stopping to Landing. GROUND_Y = 760.
+    let (mut s, t) = settled();
+    s.fighters[0].pos = Vector2::new(600.0, 760.0 - 30.0); // just above the main floor top
+    s.fighters[0].state = CharState::Air;
+    s.fighters[0].ground_plat = -1;
+    s.fighters[0].tumble = true;
+    s.fighters[0].hitstun = 0;
+    s.fighters[0].vel = Vector2::new(0.0, t.tumble_speed + 500.0); // hard downward (above threshold)
+    let mut bounced = false;
+    for _ in 0..30 {
+        s = step(&s, &[&idle(), &idle()], &t);
+        if s.fighters[0].vel.y < 0.0 {
+            bounced = true;
+            break;
+        }
+    }
+    assert!(bounced, "a fast tumbling body should bounce (vel.y flips upward) off the floor");
+    assert_eq!(s.fighters[0].state, CharState::Air, "it stays airborne after the bounce (no Landing)");
+    assert!(s.fighters[0].ground_plat < 0, "the bounce did not pin it to a platform");
 }

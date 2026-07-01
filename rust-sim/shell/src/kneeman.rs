@@ -260,6 +260,7 @@ pub struct KneeMan {
     flashes: Vec<(Vector2, f32)>,       // special-attack flashes: world pos + age (0..1); B-move startup
     prev_state: [CharState; sim::MAX_PLAYERS], // prior-frame CharState, for transition edge detection
     prev_vel: [sim::Vector2; sim::MAX_PLAYERS], // prior-frame velocity, for landing-skid speed check
+    spawn_prev: [bool; 10],             // last-frame press state of number keys 1..0, for rising-edge test-spawns
     status: Option<Gd<Button>>,         // screen-space netplay status chip; tap it to find a match
     hud: [Option<Gd<Label>>; sim::MAX_PLAYERS], // bottom damage panel: each fighter's name + %
     cam: Option<Gd<Camera2D>>,          // sibling Camera2D, tracked to fit both fighters each frame
@@ -317,6 +318,7 @@ impl INode2D for KneeMan {
             flashes: Vec::new(),
             prev_state: [CharState::Stand; sim::MAX_PLAYERS],
             prev_vel: [sim::Vector2::new(0.0, 0.0); sim::MAX_PLAYERS],
+            spawn_prev: [false; 10],
             status: None,
             hud: Default::default(),
             cam: None,
@@ -407,29 +409,12 @@ impl INode2D for KneeMan {
             }
         }
 
-        // Always-on netplay status chip. A CanvasLayer pins it to the screen (not the world), so it
-        // stays put as the camera tracks the fighter. It's a Button, not a Label: tapping/clicking it
-        // is the one way to find a match (replaces the old hold-Enter path + the big CONNECT button).
+        // Screen-pinned CanvasLayer: bottom damage panel. The status chip (formerly top-left) has
+        // been moved into the pause menu Network page so the HUD stays clean.
         let mut layer = CanvasLayer::new_alloc();
-        let mut label = Button::new_alloc();
-        label.set_position(Vector2::new(14.0, 10.0));
-        label.add_theme_font_size_override("font_size", 20);
-        label.add_theme_color_override("font_color", Color::from_rgb(0.92, 0.96, 1.0));
-        // Dark rounded chip behind the text so it reads on the white stage (clear color is white).
-        // Override every button state to the same chip so it doesn't flash default button chrome.
-        let mut bg = godot::classes::StyleBoxFlat::new_gd();
-        bg.set_bg_color(Color::from_rgba(0.07, 0.09, 0.14, 0.85));
-        bg.set_corner_radius_all(6);
-        bg.set_content_margin_all(8.0);
-        for st in ["normal", "hover", "pressed", "focus", "disabled"] {
-            label.add_theme_stylebox_override(st, &bg);
-        }
-        let cb = self.to_gd();
-        label.connect("pressed", &Callable::from_object_method(&cb, "on_connect"));
-        layer.add_child(&label);
 
-        // Bottom damage panel: each fighter's name + %, wearing the slot color. Same screen-pinned
-        // CanvasLayer. Positioned/filled every frame in `update_hud` (handles window resize + active count).
+        // Bottom damage panel: each fighter's name + %, wearing the slot color. Positioned/filled
+        // every frame in `update_hud` (handles window resize + active count).
         for k in 0..sim::MAX_PLAYERS {
             let color = if k == 0 { self.identity.get_cloned().color } else { slot_color(k) };
             let l = make_hud_label(color);
@@ -438,7 +423,7 @@ impl INode2D for KneeMan {
         }
 
         self.base_mut().add_child(&layer);
-        self.status = Some(label);
+        // self.status stays None: status info lives in the pause menu Network page.
         // Sibling Camera2D (authored in game.tscn). We drive it each frame to keep both fighters
         // framed; without this it sits at its static authored transform and fighters leave the view.
         self.cam = self.base().try_get_node_as::<Camera2D>("../Camera2D");
@@ -796,6 +781,22 @@ impl INode2D for KneeMan {
         }
         } // end gizmos overlay
 
+        // DAIR telegraph: always draw the live hitboxes when a fighter is in Dair so the landing
+        // arc reads for opponents even with gizmos off. Skip when gizmos is on -- those boxes are
+        // already drawn above in the full overlay pass.
+        if !self.gizmos.get() {
+            let dair_col = Color::from_rgba(1.0, 0.45, 0.05, 0.55);
+            for f in &s.fighters[..active] {
+                if f.state == CharState::Dair {
+                    for hb in sim::live_hitboxes(f, &t).into_iter().flatten() {
+                        let (hc, hr) = hb;
+                        let c = gv(hc) - origin;
+                        self.base_mut().draw_circle(c, hr, dair_col);
+                    }
+                }
+            }
+        }
+
         // items + projectiles (debug shapes for now; model_id -> sprite is the later polish)
         for it in &s.items {
             if !it.active() {
@@ -1086,6 +1087,13 @@ impl KneeMan {
             offer: (self.sig.offer_out, self.sig.offer_in),
             answer: (self.sig.answer_out, self.sig.answer_in),
             ice: (self.sig.ice_out, self.sig.ice_in),
+            build_hash: rtc::BUILD_HASH,
+            stale_build: self.stale_build,
+            peer_build_mismatch: self
+                .peer_build
+                .as_deref()
+                .map(|p| !p.is_empty() && p != "unknown" && p != rtc::BUILD_HASH)
+                .unwrap_or(false),
         });
     }
 
@@ -1102,13 +1110,36 @@ impl KneeMan {
     fn step_local(&mut self) {
         let frame = Self::sample_input();
         let p2 = crate::controls::poll_p2();
-        let next = sim::step(&self.state.get(), &[&frame, &p2], &self.tune.get()); // pure scan
+        let mut next = sim::step(&self.state.get(), &[&frame, &p2], &self.tune.get()); // pure scan
+        self.poll_spawn_keys(&mut next); // number keys 1..0 force-spawn test items (local play only)
         self.state.set(next);
         self.base_mut().set_position(gv(next.fighters[0].pos));
         self.render_fighters(&next);
         self.update_camera();
         self.update_touch();
         self.base_mut().queue_redraw();
+    }
+
+    /// Testing helper: number keys 1..9,0 force-spawn the first ten items of the roster onto the
+    /// stage (rising-edge, so one press = one spawn). Local play only — it mutates state outside the
+    /// rollback loop, so it is deliberately not wired into the netplay path.
+    fn poll_spawn_keys(&mut self, s: &mut SimState) {
+        use godot::global::Key;
+        const KEYS: [Key; 10] = [
+            Key::KEY_1, Key::KEY_2, Key::KEY_3, Key::KEY_4, Key::KEY_5,
+            Key::KEY_6, Key::KEY_7, Key::KEY_8, Key::KEY_9, Key::KEY_0,
+        ];
+        let input = Input::singleton();
+        let tune = self.tune.get();
+        for (i, key) in KEYS.iter().enumerate() {
+            let down = input.is_key_pressed(*key);
+            if down && !self.spawn_prev[i] {
+                if let Some(card) = sim::MENU_ITEMS.get(i) {
+                    sim::spawn_kind(s, card.kind, &tune);
+                }
+            }
+            self.spawn_prev[i] = down;
+        }
     }
 
     /// Netplay: ggrs owns the loop. Poll the transport, feed local input, advance (rolling back as
@@ -1146,6 +1177,23 @@ impl KneeMan {
     }
 
     // --- netplay setup / signaling --------------------------------------------------------------
+
+    /// Start matchmaking on a named room (a lobby). Two clients that call this with the same key
+    /// pair up over the existing 1v1 transport. No-op unless Offline (like the status chip's tap).
+    pub fn matchmake_room(&mut self, key: &str) {
+        if self.phase != Phase::Offline {
+            return;
+        }
+        self.room = Some(Room { code: key.to_string(), deadline_ms: None });
+        self.resume_snapshot = None;
+        self.got_resume = false;
+        if !self.dial(Some(key)) {
+            self.room = None;
+            return;
+        }
+        self.phase = Phase::Signaling;
+        godot_print!("netplay: dialing lobby {} ...", key);
+    }
 
     /// Dial the signaling relay. The relay replies `matched` with a role, kicking off the handshake.
     /// A fresh match has no room yet (the host mints one once paired); reconnects re-dial with it.

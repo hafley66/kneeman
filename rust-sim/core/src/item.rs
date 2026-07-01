@@ -3,8 +3,8 @@
 //! for the slot type carried in `SimState.items`. Pure; re-exported at the crate root.
 
 use crate::{
-    airborne, hurtbox, knockback_units, out_of_bounds, Fighter, Hitbox, SimState, StrokeId, ToolKind,
-    Tune, Vector2, DT, FLOOR_LEFT, FLOOR_RIGHT, GROUND_Y, HITLAG_PER_DMG, MAX_ITEMS,
+    airborne, hurtbox, knockback_units, out_of_bounds, Fighter, Hitbox, SimState, StrokeId, ThrowDir,
+    ToolKind, Tune, Vector2, DT, FLOOR_LEFT, FLOOR_RIGHT, GROUND_Y, HITLAG_PER_DMG, MAX_ITEMS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +64,33 @@ impl ItemConfig {
     };
 }
 
+/// Directional item-throw config (Smash-style): the launch speed per stick direction plus the
+/// `hit` the armed item deals to a non-thrower it touches. Lives in Tune so the panel edits it live.
+/// Knockback runs through the same `knockback_units` formula as a fighter's hitboxes, so the box's
+/// `bkb`/`kbg`/`angle` give "any amount of knockback" the user wants.
+#[derive(Copy, Clone)]
+pub struct ThrowItem {
+    pub fwd_speed: f32,  // px/s launched forward (toward facing)
+    pub back_speed: f32, // px/s launched behind
+    pub up_speed: f32,   // px/s launched up
+    pub down_speed: f32, // px/s launched down (a spike toss)
+    pub hit: Hitbox,     // damage + knockback the flying item deals on contact (transcendent)
+}
+
+impl ThrowItem {
+    /// Strong default: a fast toss that launches hard. Panel-editable per field.
+    pub const DEFAULT: Self = Self {
+        fwd_speed: 1500.0,
+        back_speed: 1200.0,
+        up_speed: 1300.0,
+        down_speed: 1700.0,
+        hit: Hitbox {
+            r: 34.0, damage: 9.0, angle: 45.0, // up-and-out pop
+            bkb: 42.0, kbg: 92.0, transcendent: true, ..Hitbox::NONE // launches hard = a kill at mid %
+        },
+    };
+}
+
 /// What an item slot is. `None` = empty slot. Add kinds freely; behavior dispatches by `match`
 /// (the "trait methods" are functions keyed on kind), config lives per-kind in Tune.
 #[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +144,9 @@ pub struct Item {
     pub facing: f32,
     pub tool: ToolKind, // which drawing tool, when `kind == Pen` (ignored otherwise)
     pub stroke: StrokeId, // which StrokeRegistry preset this pen stamps (row 0 = default)
+    pub thrown: bool, // armed in flight from a directional throw: deals `throw_item.hit` to non-throwers.
+                      // While thrown, `owner` still holds the thrower idx (skips self); disarms to a
+                      // normal unowned ground item (owner -1, thrown false) once it settles.
 }
 
 impl Item {
@@ -131,6 +161,7 @@ impl Item {
         facing: 1.0,
         tool: ToolKind::TrailPen,
         stroke: 0,
+        thrown: false,
     };
     pub fn active(&self) -> bool {
         !matches!(self.kind, ItemKind::None)
@@ -226,6 +257,7 @@ pub(crate) fn maybe_spawn_item(n: &mut SimState, t: &Tune) {
         facing: 1.0,
         tool: ToolKind::TrailPen, // todo: roll a random tool when more than one pen ships
         stroke: 0, // default preset; roll/assign a StrokeId when more materials ship
+        thrown: false,
     };
 }
 
@@ -258,6 +290,7 @@ pub fn spawn_kind(n: &mut SimState, kind: ItemKind, t: &Tune) {
         facing: 1.0,
         tool: ToolKind::TrailPen,
         stroke: 0,
+        thrown: false,
     };
 }
 
@@ -327,6 +360,7 @@ pub(crate) fn fire_gun(n: &mut SimState, idx: usize, auto: bool, t: &Tune) {
             facing: f.facing,
             tool: ToolKind::TrailPen,
             stroke: 0,
+            thrown: false,
         };
     }
     n.items[k].gas -= 1.0;
@@ -350,6 +384,46 @@ pub(crate) fn drop_item(n: &mut SimState, idx: usize) {
     n.fighters[idx].holding = -1;
 }
 
+/// Throw intent (directional grab): launch the held item as a live projectile in the stick
+/// direction. `owner` stays the thrower so the armed item skips its own body; `thrown` arms it.
+/// Speeds + the contact hitbox are `Tune.throw_item` (panel-editable, generous by default).
+pub(crate) fn throw_item(n: &mut SimState, idx: usize, dir: ThrowDir, t: &Tune) {
+    let holding = n.fighters[idx].holding;
+    if holding < 0 {
+        return;
+    }
+    let k = holding as usize;
+    let f = n.fighters[idx];
+    let ti = t.throw_item;
+    let vel = match dir {
+        ThrowDir::Up => Vector2::new(0.0, -ti.up_speed),
+        ThrowDir::Down => Vector2::new(0.0, ti.down_speed),
+        ThrowDir::Forward => Vector2::new(f.facing * ti.fwd_speed, 0.0),
+        ThrowDir::Back => Vector2::new(-f.facing * ti.back_speed, 0.0),
+    };
+    n.items[k].vel = vel;
+    n.items[k].facing = f.facing;
+    n.items[k].thrown = true; // owner kept = thrower: the armed item passes through its own thrower
+    n.fighters[idx].holding = -1;
+}
+
+/// An armed thrown item connecting with a non-thrower: damage + knockback from `throw_item.hit`,
+/// launch direction = the throw's travel direction (the item's `facing`). Mirrors `apply_bolt_hit`.
+fn apply_item_throw_hit(b: &mut Fighter, facing: f32, t: &Tune) {
+    if b.invuln > 0 || b.intangible {
+        return; // spawn i-frames / active dodge
+    }
+    let atk = t.throw_item.hit;
+    b.damage += atk.damage;
+    let kb = knockback_units(b.damage, atk.damage, t.weight, &atk);
+    let speed = kb * t.kb_speed * t.knockback_mult;
+    let ang = atk.angle.to_radians();
+    b.vel = Vector2::new(ang.cos() * facing, -ang.sin()) * speed;
+    b.hitstun = (kb * t.kb_hitstun) as i64;
+    b.tumble = speed > t.tumble_speed;
+    b.hitlag = (atk.damage * HITLAG_PER_DMG) as i64 + 2;
+}
+
 /// Pickup intent: claim the nearest reachable unowned ground item.
 pub(crate) fn pickup_item(n: &mut SimState, idx: usize, t: &Tune) {
     let f = n.fighters[idx];
@@ -368,6 +442,38 @@ pub(crate) fn update_items(n: &mut SimState, t: &Tune) {
             continue;
         }
         match it.kind {
+            ItemKind::LaserGun | ItemKind::BobGun | ItemKind::Pen if it.thrown => {
+                // armed throw in flight: arc under gravity, damage the first non-thrower it grazes,
+                // then despawn. Landing without a hit disarms it into a normal unowned ground pickup.
+                let mut v = it.vel;
+                v.y += t.gravity * DT;
+                let p = it.pos + v * DT;
+                n.items[k].pos = p;
+                n.items[k].vel = v;
+                let over_stage = p.x >= FLOOR_LEFT && p.x <= FLOOR_RIGHT;
+                let mut hit_someone = false;
+                for fi in 0..2 {
+                    if fi as i8 == it.owner {
+                        continue; // your own throw passes through you
+                    }
+                    let (bc, br) = hurtbox(&n.fighters[fi]);
+                    if (p - bc).length() <= br + t.throw_item.hit.r {
+                        apply_item_throw_hit(&mut n.fighters[fi], it.facing, t);
+                        hit_someone = true;
+                    }
+                }
+                if out_of_bounds(p) {
+                    n.items[k] = Item::EMPTY; // crossed a blast zone: quiet despawn
+                } else if hit_someone {
+                    n.items[k] = Item::EMPTY; // spent on impact
+                } else if over_stage && p.y >= GROUND_Y {
+                    // landed harmlessly: disarm back into a normal unowned ground item
+                    n.items[k].pos = Vector2::new(p.x, GROUND_Y);
+                    n.items[k].vel = Vector2::ZERO;
+                    n.items[k].thrown = false;
+                    n.items[k].owner = -1;
+                }
+            }
             ItemKind::LaserGun | ItemKind::BobGun | ItemKind::Pen if it.owner >= 0 => {
                 let o = it.owner as usize;
                 if n.fighters[o].holding != k as i8 {
@@ -388,9 +494,11 @@ pub(crate) fn update_items(n: &mut SimState, t: &Tune) {
                 let mut v = it.vel;
                 p += v * DT;
                 let over_stage = p.x >= FLOOR_LEFT && p.x <= FLOOR_RIGHT;
+                let mut rested = false;
                 if over_stage && p.y >= GROUND_Y {
                     p.y = GROUND_Y;
                     v = Vector2::ZERO;
+                    rested = true;
                 } else {
                     v.y += t.gravity * DT; // off the span (or above the floor): keep falling
                 }
@@ -398,6 +506,11 @@ pub(crate) fn update_items(n: &mut SimState, t: &Tune) {
                 n.items[k].vel = v;
                 if out_of_bounds(p) {
                     n.items[k] = Item::EMPTY; // crossed a blast zone: quiet despawn
+                } else if rested && it.kind == ItemKind::Pen && it.gas < 1.0 {
+                    // an empty pen's "unload": once it's idle on the ground with no ink left it
+                    // despawns (unlike a spent gun, which vanishes the instant it empties). It stays
+                    // pickup-able while it falls/settles; guns keep resting here forever.
+                    n.items[k] = Item::EMPTY;
                 }
             }
             ItemKind::LaserBolt => {

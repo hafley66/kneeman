@@ -1,33 +1,18 @@
-use super::router::{Intent, MenuCtx, Route};
+use super::router::{Intent, MenuCtx};
 use super::Screen;
 use crate::ui::themes::Theme;
 
-/// Pause-menu root: big buttons to each page, plus resume.
+/// Pause-menu landing pane. The left rail is the nav (one menu); this pane is just the content for
+/// the Home entry — a short hint + resume — so it never duplicates the rail's list.
 pub struct Home;
 
 impl Screen for Home {
     fn view<T: Theme>(&self, ui: &mut egui::Ui, theme: &T, _cx: &MenuCtx, out: &mut Vec<Intent>) {
         ui.label(egui::RichText::new("Pause Menu").size(16.0).strong());
         ui.add_space(8.0);
-        for (r, label) in [
-            (Route::Items, "Items"),
-            (Route::Charss, "Characters"),
-            (Route::Rules, "Rules"),
-            (Route::Background, "Background"),
-            (Route::Feel, "Feel"),
-            (Route::Controls, "Controls"),
-            (Route::Network, "Network"),
-        ] {
-            if theme.button(ui, label).clicked() {
-                out.push(Intent::Nav(r));
-            }
-        }
-        // Debug opens the egui panel and closes the menu so the panel is immediately visible.
-        if theme.button(ui, "Debug").clicked() {
-            out.push(Intent::OpenDebugPanel);
-            out.push(Intent::Nav(Route::Closed));
-        }
-        ui.add_space(10.0);
+        ui.label("Pick a page from the rail on the left.");
+        ui.label(egui::RichText::new("Esc or ○/B closes the menu and resumes the fight.").weak());
+        ui.add_space(14.0);
         if theme.button(ui, "Resume (Esc)").clicked() {
             out.push(Intent::Back);
         }
