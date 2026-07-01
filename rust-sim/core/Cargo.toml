@@ -3,8 +3,17 @@ name = "smash_core"
 version = "0.1.0"
 edition = "2021"
 
-# PURE sim crate. No godot, no IO. Vectors are glam (same version godot already pulls),
-# so this compiles standalone on native + wasm for the rollback/netcode path.
+# PURE sim crate. No godot, no IO by default. Vectors are glam (same version godot already pulls),
+# so this compiles standalone on native + wasm for the rollback/netcode path. The durable-world layer
+# (v2 mvp) lives in `mod world`: pure event-sourcing here, the sqlite store behind `features=["storage"]`
+# so the deterministic core stays C-free unless a consumer actually persists.
 [dependencies]
 glam = { version = "0.30", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+bincode = "1.3" # canonical (deterministic, positional) encoder — world hashing AND storage
+blake3 = "1"    # 32-byte content hashes: WorldId, AssetId, EventId
+rusqlite = { version = "0.32", features = ["bundled"], optional = true } # SqliteStore, gated by `storage`
+
+[features]
+default = []
+storage = ["dep:rusqlite"] # enable world::store (bundled C sqlite); off for the pure rollback build

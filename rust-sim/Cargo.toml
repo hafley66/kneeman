@@ -7,7 +7,7 @@
 #   shell/  smash_sim   — gdext cdylib Godot loads: samples input -> step -> render.
 [workspace]
 resolver = "2"
-members = ["core", "net", "shell", "world"]
+members = ["core", "net", "shell"]
 exclude = ["vendor/gdext-egui", "vendor/ggrs"]
 
 # Vendored crates patched to build for the emscripten web export (both desktop-identical):

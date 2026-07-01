@@ -18,6 +18,8 @@ pub use tune::*;
 mod za_warudo; // the per-fighter state machine (reduce_next_state): freeze, re-derive, resume
 use za_warudo::reduce_next_state;
 
+pub mod world; // v2 mvp: the durable event-sourced world layer (types/fold/bridge/migrate; store gated)
+
 // fixed timestep; the sim never uses wall-clock delta (determinism).
 pub const DT: f32 = 1.0 / 60.0;
 pub const FPS: f32 = 60.0;
