@@ -19,8 +19,7 @@ use serde::{Deserialize, Serialize};
 pub mod bridge; // ggrs -> durable gate (§D.5): confirmed-frame diff, pure
 pub mod fold; // the World scan: apply/fold/fold_from/chain/ingest + relation/ingest_topo, pure
 pub mod migrate; // schema decode + upcast (Envelope -> WorldEvent), pure
-#[cfg(feature = "storage")]
-pub mod store; // side effects: WorldStore save/load + snapshot/compact (MemStore + SqliteStore)
+pub mod store; // WorldStore trait + MemStore (always); SqliteStore gated behind `storage` (rusqlite)
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // Identities — fixed-size, self-verifying. A hash IS the name; equality is byte equality.
@@ -177,6 +176,18 @@ pub struct Node {
 /// peer computes matches the hash the author committed. (bincode 1.x default is fixint LE, stable.)
 pub fn canon<T: Serialize>(v: &T) -> Vec<u8> {
     bincode::serialize(v).expect("world types are infallible to encode")
+}
+
+/// Inverse of `canon` for the current schema. Lets a non-`bincode` crate (the shell's GodotStore)
+/// decode `Seed`/`WorldEvent` blobs it wrote. Old-schema rows still go through `migrate::decode`.
+pub fn decanon<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> T {
+    bincode::deserialize(bytes).expect("canon bytes decode")
+}
+
+/// An asset's identity = `blake3(bytes)`. The id IS the content, so a put is idempotent and a fetch
+/// self-verifies. Shared by every `WorldStore` backend so their asset ids match.
+pub fn asset_id(bytes: &[u8]) -> AssetId {
+    AssetId(*blake3::hash(bytes).as_bytes())
 }
 
 /// A world's identity. `build` first (namespace split), then the canonical seed bytes.

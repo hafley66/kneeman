@@ -25,6 +25,12 @@ pub trait WorldStore {
     /// Drop every event at or before `upto` (the low-water mark). Caller guarantees a snapshot through
     /// `upto` exists and that `upto <= min(live participants' head)`. `since(None)` then returns the tail.
     fn compact(&mut self, id: WorldId, upto: EventId);
+
+    // --- content-addressed asset blobs (gif backgrounds): id = blake3(bytes), stored out of the log ---
+    /// Store bytes under their own hash; idempotent. Returns the `AssetId` a `SetBackground` records.
+    fn put_asset(&mut self, bytes: &[u8]) -> AssetId;
+    /// Fetch by id (self-verifying: the id IS the content hash). `None` = not held.
+    fn get_asset(&self, id: AssetId) -> Option<Vec<u8>>;
 }
 
 /// Compute the id an append onto `parent` would get. Shared by both impls so their ids match.
@@ -41,6 +47,7 @@ pub struct MemStore {
     seeds: std::collections::HashMap<WorldId, Seed>,
     logs: std::collections::HashMap<WorldId, Vec<Node>>,
     snaps: std::collections::HashMap<WorldId, (EventId, Vec<u8>)>,
+    assets: std::collections::HashMap<AssetId, Vec<u8>>,
 }
 
 impl MemStore {
@@ -100,22 +107,33 @@ impl WorldStore for MemStore {
             }
         }
     }
+    fn put_asset(&mut self, bytes: &[u8]) -> AssetId {
+        let id = AssetId(*blake3::hash(bytes).as_bytes());
+        self.assets.entry(id).or_insert_with(|| bytes.to_vec());
+        id
+    }
+    fn get_asset(&self, id: AssetId) -> Option<Vec<u8>> {
+        self.assets.get(&id).cloned()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // SqliteStore — the real, durable, per-peer store (rusqlite bundled). Schema mirrors §4.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "storage")]
 pub struct SqliteStore {
     conn: rusqlite::Connection,
 }
 
+#[cfg(feature = "storage")]
 fn to32(v: Vec<u8>) -> [u8; 32] {
     let mut a = [0u8; 32];
     a.copy_from_slice(&v);
     a
 }
 
+#[cfg(feature = "storage")]
 impl SqliteStore {
     /// Open (file path or ":memory:") and create the schema if absent.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
@@ -142,24 +160,9 @@ impl SqliteStore {
              CREATE TABLE IF NOT EXISTS asset(id BLOB PRIMARY KEY, bytes BLOB NOT NULL);",
         )
     }
-
-    /// Content-addressed asset blob store (gif backgrounds, authored stage blobs). The id IS the
-    /// blake3 of `bytes`, so a put is idempotent and a get is self-verifying. `SetBackground` stores
-    /// the `AssetId`; the pixels live here, out of the event log.
-    pub fn put_asset(&mut self, bytes: &[u8]) -> AssetId {
-        let id = AssetId(*blake3::hash(bytes).as_bytes());
-        self.conn
-            .execute("INSERT OR IGNORE INTO asset(id, bytes) VALUES(?1, ?2)", rusqlite::params![&id.0[..], bytes])
-            .expect("put_asset");
-        id
-    }
-    pub fn get_asset(&self, id: AssetId) -> Option<Vec<u8>> {
-        self.conn
-            .query_row("SELECT bytes FROM asset WHERE id=?1", [&id.0[..]], |r| r.get::<_, Vec<u8>>(0))
-            .ok()
-    }
 }
 
+#[cfg(feature = "storage")]
 impl WorldStore for SqliteStore {
     fn publish(&mut self, seed: &Seed) -> WorldId {
         let id = world_id(seed);
@@ -281,9 +284,21 @@ impl WorldStore for SqliteStore {
                 .expect("compact");
         }
     }
+    fn put_asset(&mut self, bytes: &[u8]) -> AssetId {
+        let id = AssetId(*blake3::hash(bytes).as_bytes());
+        self.conn
+            .execute("INSERT OR IGNORE INTO asset(id, bytes) VALUES(?1, ?2)", rusqlite::params![&id.0[..], bytes])
+            .expect("put_asset");
+        id
+    }
+    fn get_asset(&self, id: AssetId) -> Option<Vec<u8>> {
+        self.conn
+            .query_row("SELECT bytes FROM asset WHERE id=?1", [&id.0[..]], |r| r.get::<_, Vec<u8>>(0))
+            .ok()
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "storage"))]
 mod tests {
     use super::*;
     use crate::world::fold::fold;

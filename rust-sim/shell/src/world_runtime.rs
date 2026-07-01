@@ -4,30 +4,31 @@
 //! through (Stage 1). Save/load is just: `boot` (open + load-or-create) and `world` (fold the log).
 
 use smash_core::world::fold::{fold, World};
-use smash_core::world::store::{SqliteStore, WorldStore};
+use smash_core::world::store::WorldStore;
 use smash_core::world::{AssetId, BuildVersion, EventId, PlayerId, Seed, StageId, WorldEvent, WorldId};
 use smash_core::Tune;
 
 /// Genesis build of a home world. Bumping it is a namespace split (new `WorldId`), so it is pinned.
 const HOME_BUILD: BuildVersion = BuildVersion(1);
 
-pub struct WorldRuntime {
-    store: SqliteStore,
+/// Generic over the storage backend so the client mounts `GodotStore` (user:// = disk/IndexedDB) and
+/// the server mounts `SqliteStore`, with everything above the store unchanged.
+pub struct WorldRuntime<S: WorldStore> {
+    store: S,
     current: WorldId, // the loaded world (a player's home, for now)
     head: Option<EventId>,
     owner: PlayerId,
 }
 
-impl WorldRuntime {
-    /// Open (or create) the on-disk world db and load-or-create the caller's home world. `owner` is the
-    /// player's persistent key (KneeMan supplies + persists it; it distinguishes one home from another).
-    /// Idempotent: same owner -> same home, re-opened. `None` on a sqlite failure (caller logs + skips).
-    pub fn boot(db_path: &str, owner: PlayerId) -> Option<Self> {
-        let mut store = SqliteStore::open(db_path).ok()?;
-        // publish is INSERT OR IGNORE: first boot creates the home, later boots re-attach to it.
+impl<S: WorldStore> WorldRuntime<S> {
+    /// Load-or-create the caller's home world on the given backend. `owner` is the player's persistent
+    /// key (KneeMan supplies + persists it; it distinguishes one home from another). Idempotent: same
+    /// owner -> same home, re-attached.
+    pub fn boot(mut store: S, owner: PlayerId) -> Self {
+        // publish is idempotent (re-attach on disk / INSERT OR IGNORE): create once, re-open after.
         let current = store.publish(&home_seed(owner));
         let head = store.head(current);
-        Some(WorldRuntime { store, current, head, owner })
+        WorldRuntime { store, current, head, owner }
     }
 
     pub fn owner(&self) -> PlayerId {
