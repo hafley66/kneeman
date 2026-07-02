@@ -103,6 +103,7 @@ pub struct StrokeProps {
     pub density: f32,     // mass per px of stroke length (finalize: mass = Σ|seg| · density); 0 = never a body
     pub solid: bool,      // true = blocks all sides; false = soft (land from above, drop through w/ down)
     pub force_wall: bool, // classify EVERY segment as Wall (ignore slope) — a pure wall pen, no hollow bits
+    pub zone: bool,       // still ink of this material EXTENDS the blast zone (the zone-maker pen)
 }
 
 impl StrokeProps {
@@ -120,6 +121,7 @@ impl StrokeProps {
         density: 1.0,      // 1 mass unit per px: a 300px stroke weighs 300 (kb formula rescales)
         solid: true,       // solid surface: land on it, never fade/drop through
         force_wall: false, // classify by slope (flat Floor / steep Wall / mid sloped Floor)
+        zone: false,       // the prototype pencil: temporary ink, does NOT grow the blast zone
     };
 }
 
@@ -539,6 +541,81 @@ pub(crate) fn update_paths(n: &mut SimState, inputs: &[&InputFrame], t: &Tune) {
     }
 }
 
+/// Traveling-ink integrator: gravity arc, then settle (the lock) when a node crosses a surface top
+/// this frame. Translation-only, so the cached `class[]` (direction-based) stays valid in flight —
+/// settling is just `vel = ZERO` plus a snap so the crossing node rests ON the surface. Reuses the
+/// fighters' gravity/terminal so ink and bodies share one feel.
+pub(crate) fn integrate_ink(p: &mut InkPath, t: &Tune) {
+    if !p.traveling() {
+        return;
+    }
+    p.vel.y = (p.vel.y + t.gravity).min(t.max_fall);
+    p.pos += p.vel;
+    if p.pos.y > BLAST_Y {
+        *p = InkPath::EMPTY; // fell off the world mid-flight: dies like a launched fighter
+        return;
+    }
+    if p.vel.y <= 0.0 {
+        return; // rising ink can't land
+    }
+    // settle test: a node crossed a platform TOP this frame (prev above-or-on, now on-or-below).
+    // The main floor is PLATFORMS[0], so off-stage ink keeps falling — no infinite ground plane.
+    // Track the DEEPEST penetration so the snap leaves the lowest crossing node on its surface.
+    let mut snap: f32 = -1.0;
+    for i in 0..p.len as usize {
+        let w = p.world_pt(i);
+        let prev_y = w.y - p.vel.y;
+        for pl in &PLATFORMS {
+            if w.x >= pl.left && w.x <= pl.right && prev_y <= pl.y && w.y >= pl.y {
+                snap = snap.max(w.y - pl.y);
+            }
+        }
+    }
+    if snap >= 0.0 {
+        p.pos.y -= snap;
+        p.vel = Vector2::ZERO; // locked: Still IS the cluster; class needs no recompute
+    }
+}
+
+/// The live blast zone: AABB (min, max corner) of every STILL, zone-material player stroke.
+/// `None` when no zone ink exists — callers fall back to the static `BLAST_*` frame.
+pub fn ink_blast_zone(paths: &[InkPath; MAX_DRAWN]) -> Option<(Vector2, Vector2)> {
+    let mut zone: Option<(Vector2, Vector2)> = None;
+    for p in paths {
+        if !p.active() || p.owner < 0 || p.mass <= 0.0 || p.traveling() || !p.props.zone {
+            continue;
+        }
+        for i in 0..p.len as usize {
+            let w = p.world_pt(i);
+            zone = Some(match zone {
+                None => (w, w),
+                Some((lo, hi)) => (lo.min(w), hi.max(w)),
+            });
+        }
+    }
+    zone
+}
+
+/// Kill still player ink whose reference point settled outside the blast zone (reading A: the zone
+/// is the weapon — knock enemy ink out, it dies where it lands). Traveling ink is exempt (it gets
+/// judged when it settles); baked stage (mass 0 / owner < 0) is exempt always. With no zone ink
+/// down yet, the static fighter blast frame is the boundary.
+pub(crate) fn prune_outside(n: &mut SimState) {
+    let (lo, hi) = ink_blast_zone(&n.paths).unwrap_or((
+        Vector2::new(BLAST_LEFT, BLAST_TOP),
+        Vector2::new(BLAST_RIGHT, BLAST_Y),
+    ));
+    for p in n.paths.iter_mut() {
+        if !p.active() || p.owner < 0 || p.mass <= 0.0 || p.traveling() || p.drawing {
+            continue;
+        }
+        let c = p.pos;
+        if c.x < lo.x || c.x > hi.x || c.y < lo.y || c.y > hi.y {
+            *p = InkPath::EMPTY;
+        }
+    }
+}
+
 /// Stop drawing a path and cache its per-segment surface classes (the grabbability the collision read
 /// consumes). Called on button release or budget exhaustion. Also rebases the geometry: `pos` becomes
 /// the node centroid and `pts` become offsets from it, leaving every `world_pt` identical up to f32
@@ -652,6 +729,85 @@ mod tests {
         finalize_path(&mut baked);
         assert_eq!(baked.mass, 0.0);
         assert!(!baked.traveling());
+    }
+
+
+    /// A small finalized body-stroke centered at `at` (a 60px flat bar), ready to fly.
+    fn body_at(at: Vector2) -> InkPath {
+        let mut p = InkPath::EMPTY;
+        p.owner = 0;
+        p.drawing = true;
+        p.push(at + Vector2::new(-30.0, 0.0), 0);
+        p.push(at + Vector2::new(30.0, 0.0), 1);
+        finalize_path(&mut p);
+        p
+    }
+
+    #[test]
+    fn traveling_ink_arcs_and_locks_on_the_ground() {
+        let t = crate::Tune::default();
+        let mut p = body_at(Vector2::new(600.0, 300.0));
+        p.vel = Vector2::new(2.0, -4.0); // lobbed up-right
+        let before = p.pos;
+        let mut frames = 0;
+        while p.traveling() && frames < 1200 {
+            integrate_ink(&mut p, &t);
+            frames += 1;
+        }
+        assert!(!p.traveling(), "ink settled within {frames} frames");
+        assert!(p.pos.x > before.x, "carried its horizontal momentum");
+        let lowest = (0..p.len as usize).map(|i| p.world_pt(i).y).fold(f32::MIN, f32::max);
+        let on_a_top = PLATFORMS.iter().any(|pl| (lowest - pl.y).abs() < 1e-2);
+        assert!(on_a_top, "lowest node sits ON a platform top, got y={lowest}");
+    }
+
+    #[test]
+    fn off_stage_traveling_ink_falls_to_the_blast_floor_and_dies() {
+        let t = crate::Tune::default();
+        let mut p = body_at(Vector2::new(FLOOR_RIGHT + 400.0, 300.0)); // past the stage edge
+        p.vel = Vector2::new(0.0, 1.0);
+        for _ in 0..2000 {
+            integrate_ink(&mut p, &t);
+            if !p.active() {
+                break;
+            }
+        }
+        assert!(!p.active(), "no surface off-stage: ink falls past BLAST_Y and despawns");
+    }
+
+    #[test]
+    fn blast_zone_is_the_aabb_of_still_zone_ink_and_prunes_outsiders() {
+        let mut n = crate::SimState::spawn();
+        // zone ink: a bar around x=600 marks the zone
+        let mut zone_ink = body_at(Vector2::new(600.0, 500.0));
+        zone_ink.props.zone = true;
+        n.paths[0] = zone_ink;
+        // pencil ink inside the zone survives; pencil ink far outside dies
+        n.paths[1] = body_at(Vector2::new(600.0, 500.0));
+        n.paths[2] = body_at(Vector2::new(2500.0, 500.0));
+        // traveling ink outside is exempt until it settles
+        let mut flying = body_at(Vector2::new(2500.0, 200.0));
+        flying.vel = Vector2::new(1.0, 1.0);
+        n.paths[3] = flying;
+
+        let (lo, hi) = ink_blast_zone(&n.paths).expect("zone ink defines a zone");
+        assert!((lo.x - 570.0).abs() < 1e-3 && (hi.x - 630.0).abs() < 1e-3, "AABB of the zone bar");
+
+        prune_outside(&mut n);
+        assert!(n.paths[1].active(), "still ink inside the zone survives");
+        assert!(!n.paths[2].active(), "still ink outside the zone is pruned");
+        assert!(n.paths[3].active(), "traveling ink is exempt");
+    }
+
+    #[test]
+    fn without_zone_ink_the_static_blast_frame_bounds_pruning() {
+        let mut n = crate::SimState::spawn();
+        n.paths[0] = body_at(Vector2::new(600.0, 500.0)); // well inside the frame
+        n.paths[1] = body_at(Vector2::new(BLAST_RIGHT + 300.0, 500.0)); // past the right edge
+        assert!(ink_blast_zone(&n.paths).is_none(), "no zone material down");
+        prune_outside(&mut n);
+        assert!(n.paths[0].active());
+        assert!(!n.paths[1].active());
     }
 
     #[test]

@@ -255,6 +255,7 @@ pub fn checksum(s: &SimState) -> u128 {
         fold(p.props.density.to_bits() as u64);
         fold(p.props.solid as u64);
         fold(p.props.force_wall as u64);
+        fold(p.props.zone as u64);
     }
     h as u128
 }
