@@ -225,6 +225,36 @@ pub fn checksum(s: &SimState) -> u128 {
         fold(it.stroke as u64);
         fold(it.thrown as u64);
     }
+    // ink paths ARE sim state (fighters stand on them, walls block off them) — fold every live
+    // field. The node arrays fold only their live prefix (0..len): slots past `len` are dead
+    // scratch no sim read touches, so they can't carry a divergence that matters.
+    for p in &s.paths {
+        fold(p.len as u64);
+        fold(p.owner as u64);
+        fold(p.drawing as u64);
+        fold(p.kind as u64);
+        fold(p.budget.to_bits() as u64);
+        fold(p.pos.x.to_bits() as u64);
+        fold(p.pos.y.to_bits() as u64);
+        fold(p.vel.x.to_bits() as u64);
+        fold(p.vel.y.to_bits() as u64);
+        fold(p.hp.to_bits() as u64);
+        fold(p.mass.to_bits() as u64);
+        for i in 0..p.len as usize {
+            fold(p.pts[i].x.to_bits() as u64);
+            fold(p.pts[i].y.to_bits() as u64);
+            fold(p.born[i]);
+            fold(p.class[i] as u64);
+        }
+        fold(p.props.stroke_life as u64);
+        fold(p.props.floor_tol.to_bits() as u64);
+        fold(p.props.wall_tol.to_bits() as u64);
+        fold(p.props.ledge_curve.to_bits() as u64);
+        fold(p.props.min_seg.to_bits() as u64);
+        fold(p.props.bounce.to_bits() as u64);
+        fold(p.props.solid as u64);
+        fold(p.props.force_wall as u64);
+    }
     h as u128
 }
 

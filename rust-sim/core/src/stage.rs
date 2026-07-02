@@ -225,9 +225,13 @@ pub fn tool_sample(k: ToolKind, f: &Fighter, i: &InputFrame, p: &InkPath, t: &Tu
 /// One drawn polyline. Forward-packed (`pts[0..len]`); the oldest node expires first (front), the
 /// newest appends at the back, so per-node decay is a front-trim + classify recompute. `Copy` +
 /// fixed-cap so it rides inside `SimState` and rolls back / checksums like everything else.
+///
+/// Geometry is LOCAL: `pts[i]` is an offset from `pos`; `world_pt(i)` is the only world read.
+/// While drawing, `pos` stays ZERO (local == world); `finalize_path` rebases to the centroid.
+/// Translation-only body, no rotation (see plans/ink-billiards.md).
 #[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InkPath {
-    pub pts: [Vector2; MAX_PATH_PTS],   // node positions, world space, indices 0..len
+    pub pts: [Vector2; MAX_PATH_PTS],   // node offsets from `pos` (world = pts[i] + pos), 0..len
     pub born: [u64; MAX_PATH_PTS],      // global tick each node was laid (per-node expiry)
     pub class: [SegClass; MAX_PATH_PTS], // class of the segment STARTING at node i (i<len-1 valid)
     pub len: u8,                         // live node count
@@ -236,6 +240,11 @@ pub struct InkPath {
     pub owner: i8,                       // who drew it (-1 = baked stage stroke, never expires/draws)
     pub drawing: bool,                   // true while the owner is still laying it
     pub budget: f32,                     // remaining length budget (px); ≤0 = finalize
+    // ── rigid body (translation only) ──
+    pub pos: Vector2,                    // reference point (centroid at finalize), world space
+    pub vel: Vector2,                    // px/s; ZERO = still, nonzero = traveling
+    pub hp: f32,                         // damage %, scales knockback taken (fighters' formula)
+    pub mass: f32,                       // Σ|seg|·density at finalize; 0.0 = not a body (baked/drawing)
 }
 
 impl InkPath {
@@ -249,24 +258,54 @@ impl InkPath {
         owner: -1,
         drawing: false,
         budget: 0.0,
+        pos: Vector2::ZERO,
+        vel: Vector2::ZERO,
+        hp: 0.0,
+        mass: 0.0,
     };
 
     pub fn active(&self) -> bool {
         self.len > 0
     }
 
-    /// The most recently laid node, if any.
-    pub fn last(&self) -> Option<Vector2> {
-        (self.len > 0).then(|| self.pts[self.len as usize - 1])
+    /// World-space node `i`. The ONLY way to read a node as world coords.
+    #[inline]
+    pub fn world_pt(&self, i: usize) -> Vector2 {
+        self.pts[i] + self.pos
     }
 
-    /// Append a node (drops the oldest if full). Records its birth tick for per-node expiry.
+    /// World-space segment starting at node `i`. The collision / hurtbox primitive.
+    #[inline]
+    pub fn world_seg(&self, i: usize) -> (Vector2, Vector2) {
+        (self.world_pt(i), self.world_pt(i + 1))
+    }
+
+    /// Bounding circle for coarse (billiard) passes: `pos` + the farthest local node.
+    /// No thickness pad yet — the capsule radius arrives with the hurtbox work.
+    pub fn bound_circle(&self) -> (Vector2, f32) {
+        let r = self.pts[..self.len as usize].iter().map(|p| p.length()).fold(0.0, f32::max);
+        (self.pos, r)
+    }
+
+    /// Airborne body? Baked stage (`mass == 0`) never travels.
+    #[inline]
+    pub fn traveling(&self) -> bool {
+        self.mass > 0.0 && self.vel != Vector2::ZERO
+    }
+
+    /// The most recently laid node (world space), if any.
+    pub fn last(&self) -> Option<Vector2> {
+        (self.len > 0).then(|| self.world_pt(self.len as usize - 1))
+    }
+
+    /// Append a node (world coords in; stored as a `pos`-relative offset). Drops the oldest if
+    /// full. Records its birth tick for per-node expiry.
     pub(crate) fn push(&mut self, p: Vector2, tick: u64) {
         if self.len as usize == MAX_PATH_PTS {
             self.trim_front(1);
         }
         let n = self.len as usize;
-        self.pts[n] = p;
+        self.pts[n] = p - self.pos;
         self.born[n] = tick;
         self.len += 1;
     }
@@ -352,7 +391,7 @@ pub(crate) fn ink_floor_y_at(p: &InkPath, x: f32) -> Option<f32> {
         if !matches!(p.class[s], SegClass::Floor | SegClass::Ledge) {
             continue;
         }
-        let (a, b) = (p.pts[s], p.pts[s + 1]);
+        let (a, b) = p.world_seg(s);
         let (lo, hi) = if a.x <= b.x { (a, b) } else { (b, a) };
         if x < lo.x || x > hi.x {
             continue;
@@ -387,7 +426,7 @@ pub(crate) fn ink_wall_block(
         if p.class[s] != SegClass::Wall {
             continue;
         }
-        let (a, b) = (p.pts[s], p.pts[s + 1]);
+        let (a, b) = p.world_seg(s);
         let (lo, hi) = if a.y <= b.y { (a, b) } else { (b, a) }; // order by y
         if cy < lo.y || cy > hi.y {
             continue; // ECB center above/below this wall's vertical span
@@ -499,8 +538,95 @@ pub(crate) fn update_paths(n: &mut SimState, inputs: &[&InputFrame], t: &Tune) {
 }
 
 /// Stop drawing a path and cache its per-segment surface classes (the grabbability the collision read
-/// consumes). Called on button release or budget exhaustion.
+/// consumes). Called on button release or budget exhaustion. Also rebases the geometry: `pos` becomes
+/// the node centroid and `pts` become offsets from it, leaving every `world_pt` identical up to f32
+/// rounding (pure translation bookkeeping — it lets the whole path move later by writing `pos` alone).
 fn finalize_path(p: &mut InkPath) {
     p.drawing = false;
+    let n = p.len as usize;
+    if n > 0 {
+        let c = p.pts[..n].iter().copied().fold(Vector2::ZERO, |a, b| a + b) / n as f32 + p.pos;
+        let shift = p.pos - c;
+        for q in p.pts[..n].iter_mut() {
+            *q += shift;
+        }
+        p.pos = c;
+    }
     classify(p);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Push some world points as a finished (non-drawing) stroke and classify, WITHOUT the
+    /// finalize rebase — the "old representation" (pos = ZERO, pts world) as a control.
+    fn raw_path(world: &[Vector2]) -> InkPath {
+        let mut p = InkPath::EMPTY;
+        p.owner = 0;
+        for (i, w) in world.iter().enumerate() {
+            p.push(*w, i as u64);
+        }
+        classify(&mut p);
+        p
+    }
+
+    #[test]
+    fn finalize_rebases_pos_to_centroid_without_moving_world_geometry() {
+        let world =
+            [Vector2::new(100.0, 50.0), Vector2::new(220.0, 64.0), Vector2::new(300.0, 40.0)];
+        let mut p = InkPath::EMPTY;
+        p.owner = 0;
+        p.drawing = true;
+        for (i, w) in world.iter().enumerate() {
+            p.push(*w, i as u64);
+        }
+        assert_eq!(p.pos, Vector2::ZERO, "while drawing local == world");
+        finalize_path(&mut p);
+        let c = (world[0] + world[1] + world[2]) / 3.0;
+        assert!((p.pos - c).length() < 1e-3, "pos is the node centroid");
+        for (i, w) in world.iter().enumerate() {
+            assert!((p.world_pt(i) - *w).length() < 1e-3, "world_pt {i} unmoved by rebase");
+        }
+    }
+
+    #[test]
+    fn rebased_path_collides_identically_to_world_space_path() {
+        let world = [
+            Vector2::new(100.0, 400.0),
+            Vector2::new(260.0, 400.0), // flat floor span
+            Vector2::new(262.0, 250.0), // near-vertical wall up
+        ];
+        let control = raw_path(&world); // pos = ZERO, pts world (the old representation)
+        let mut rebased = control;
+        finalize_path(&mut rebased);
+        for x in [100.0f32, 150.0, 200.0, 259.0] {
+            let a = ink_floor_y_at(&control, x);
+            let b = ink_floor_y_at(&rebased, x);
+            match (a, b) {
+                (Some(ya), Some(yb)) => assert!((ya - yb).abs() < 1e-3, "floor y at {x}"),
+                (a, b) => assert_eq!(a.is_some(), b.is_some(), "floor presence at {x}"),
+            }
+        }
+        // wall block: approach the near-vertical segment from the left at its mid height
+        let hit_c = ink_wall_block(&control, 220.0, Vector2::new(258.0, 340.0), 10.0, 20.0);
+        let hit_r = ink_wall_block(&rebased, 220.0, Vector2::new(258.0, 340.0), 10.0, 20.0);
+        match (hit_c, hit_r) {
+            (Some((xa, na)), Some((xb, nb))) => {
+                assert!((xa - xb).abs() < 1e-3);
+                assert_eq!(na, nb);
+            }
+            (a, b) => assert_eq!(a.is_some(), b.is_some(), "wall block presence"),
+        }
+    }
+
+    #[test]
+    fn empty_and_baked_paths_are_not_bodies() {
+        let p = InkPath::EMPTY;
+        assert_eq!(p.mass, 0.0);
+        assert!(!p.traveling());
+        let mut moving = p;
+        moving.vel = Vector2::new(5.0, 0.0);
+        assert!(!moving.traveling(), "mass 0 never travels even with vel set");
+    }
 }

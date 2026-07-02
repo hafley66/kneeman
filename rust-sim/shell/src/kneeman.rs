@@ -913,8 +913,8 @@ impl INode2D for KneeMan {
             }
             let n = p.len as usize;
             for seg in 0..n.saturating_sub(1) {
-                let a = gv(p.pts[seg]) - origin;
-                let b = gv(p.pts[seg + 1]) - origin;
+                let a = gv(p.world_pt(seg)) - origin;
+                let b = gv(p.world_pt(seg + 1)) - origin;
                 // While the owner is still laying the stroke, every segment is class None (classify
                 // runs at finalize), so a live draw would read as a weak faded line. Paint it solid
                 // ink instead so the drawing shows up live under the pen, then it recolors to its
@@ -942,9 +942,9 @@ impl INode2D for KneeMan {
                 let remaining = p.props.stroke_life - s.tick.saturating_sub(p.born[n - 1]) as i64;
                 if remaining > 0 {
                     let top = (0..n)
-                        .map(|k| p.pts[k])
+                        .map(|k| p.world_pt(k))
                         .reduce(|a, b| if a.y <= b.y { a } else { b })
-                        .unwrap_or(p.pts[0]);
+                        .unwrap_or(p.world_pt(0));
                     let secs = remaining as f32 / 60.0;
                     let text = format!("{secs:.1}s");
                     let fs = 14;

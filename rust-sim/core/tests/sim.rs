@@ -349,11 +349,13 @@ fn a_drawn_ink_wall_blocks_horizontal_movement() {
 
 #[test]
 fn stroke_registry_resolves_by_id_and_falls_back_to_default() {
+    // probe with force_wall: no built-in preset sets it, so it marks row 1 unambiguously
+    // (solid stopped distinguishing rows when PEN itself became solid).
     let mut reg = StrokeRegistry::DEFAULT;
-    reg.presets[1] = StrokeProps { solid: true, ..StrokeProps::PEN };
-    assert!(reg.get(1).solid, "id 1 resolves to its own preset");
-    assert!(!reg.get(0).solid, "row 0 is the untouched default");
-    assert!(!reg.get(99).solid, "an out-of-range id falls back to the default row");
+    reg.presets[1] = StrokeProps { force_wall: true, ..StrokeProps::PEN };
+    assert!(reg.get(1).force_wall, "id 1 resolves to its own preset");
+    assert!(!reg.get(0).force_wall, "row 0 is the untouched default");
+    assert!(!reg.get(99).force_wall, "an out-of-range id falls back to the default row");
 }
 
 #[test]
