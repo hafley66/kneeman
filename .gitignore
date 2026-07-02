@@ -18,6 +18,8 @@ chat_log/
 .gitmodules
 # CC0 test art lives on disk + is bundled into web builds locally; not in the source repo.
 assets/
+# pose-capture ghost refs: sliced from downloaded workshop art (make_refs.py regenerates)
+tools/pose-capture/ref/
 
 # old git history, backed up before the clean re-init
 .git-old/

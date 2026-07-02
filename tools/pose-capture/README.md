@@ -31,6 +31,10 @@ npx cloudflared tunnel --url http://localhost:8000   # or: ngrok http 8000
    Multi-frame clips (walk, jab, dair…) ask for each frame in turn.
 4. **Export .zip**.
 
+Captures persist in the browser (IndexedDB, keyed by prefix): close the tab, come
+back next week, the shots are still there — key just the new clips and re-export.
+**Clear clip** deletes that clip's saved frames; switching prefix switches profiles.
+
 ## Into the game
 
 ```
@@ -40,6 +44,36 @@ cp -r assets/friends  <godot-project>/assets/     # -> res://assets/friends/chri
 
 Then register `character.json` through the same JSON path `roster.rs` already parses
 (`sheet:"poses"`, `<prefix>_<file>.png`). idle-only is enough to load; fill the rest later.
+
+## Reference ghosts from a spritesheet
+
+Drop PNGs in `ref/` named after the frame stems the exporter writes
+(`idle1.png idle2.png`, `walk1.png walk2.png`, `skid.png`, …) and the tool overlays
+the matching one at 45% opacity on the camera — the friend poses to line up with it.
+Missing files just skip the ghost; the `ref` checkbox in the header toggles it.
+
+From an imported RoA character (after `roa_get.py` + `fetch_packs.py`):
+
+```sh
+python3 tools/pose-capture/make_refs.py                 # assets/falcon (default)
+python3 tools/pose-capture/make_refs.py assets/other    # any strip character
+```
+
+samples the right number of frames per clip straight from the `_stripN` files.
+Clips the character lacks (RoA has no hang/climb) keep their existing refs.
+
+To cut a ripped sheet (spriters-resource style, irregular packing) into frames:
+
+```sh
+python3 slice_sheet.py falcon_sheet.png -o /tmp/frames --list   # preview boxes
+python3 slice_sheet.py falcon_sheet.png -o /tmp/frames          # write crops
+# eyeball /tmp/frames, then copy + rename the keepers:
+cp /tmp/frames/frame_004.png ref/idle1.png
+```
+
+Auto mode samples the background color from the sheet border and cuts connected
+regions (`--bg ff00ff --tol --min-area --merge` to tune); `--grid 8x4` for uniform
+sheets. Needs Pillow. Redeploy with `just poses-deploy` so the phone sees `ref/`.
 
 ## Tips for clean cutouts
 

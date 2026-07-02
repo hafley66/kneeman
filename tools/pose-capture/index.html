@@ -49,6 +49,8 @@
   .thumbs img { height:34px; border-radius:4px; background:#0d0d14; }
   .hint { font-size:12px; opacity:.7; padding:4px 6px; }
   .seg-off #view { filter:none; }
+  #ghost { position:absolute; inset:0; margin:auto; height:78%; width:auto; max-width:92%; opacity:.45;
+    object-fit:contain; pointer-events:none; image-rendering:pixelated; filter:drop-shadow(0 0 6px #000); display:none; }
 </style>
 </head>
 <body>
@@ -58,6 +60,7 @@
   <label class="hint">prefix <input id="prefix" type="text" value="chris" size="8"></label>
   <select id="camsel"></select>
   <label class="hint"><input id="mirror" type="checkbox" checked> mirror</label>
+  <label class="hint" title="overlay ref/<clip><n>.png as a ghost to match"><input id="showref" type="checkbox" checked> ref</label>
   <button id="export" class="good" disabled>Export .zip</button>
   <button id="send" disabled title="PUT the zip to /game/poses/uploads/ on the box">⬆ Send to box</button>
 </header>
@@ -66,6 +69,7 @@
   <section id="stage">
     <video id="cam" playsinline muted></video>
     <canvas id="view"></canvas>
+    <img id="ghost" alt="">
     <div id="overlay">
       <div id="prompt">
         <div class="clip" id="pClip">idle</div>
@@ -111,6 +115,45 @@ const cam = $('#cam'), view = $('#view'), vctx = view.getContext('2d');
 const shots = {}; // name -> [dataURL, ...]
 let active = 0, W = 640, H = 640;
 
+// ── local persistence: shots live in IndexedDB under "<prefix>/<clip>", so a session
+// survives reloads and a friend can come back later to key clips added to CLIPS since.
+// dir/prefix themselves persist in localStorage so the page reopens on the same profile.
+function idb(){ return new Promise((res,rej)=>{
+  const r = indexedDB.open('pose-capture', 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('shots');
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});}
+function profile(){ return $('#prefix').value.trim() || 'custom'; }
+async function saveClip(name){
+  const db = await idb(), t = db.transaction('shots','readwrite'), st = t.objectStore('shots');
+  const key = `${profile()}/${name}`, arr = shots[name]||[];
+  arr.length ? st.put(arr, key) : st.delete(key);
+  return new Promise((res,rej)=>{ t.oncomplete=res; t.onerror=()=>rej(t.error); });
+}
+async function restoreShots(){
+  Object.keys(shots).forEach(k => delete shots[k]);
+  const p = profile(), db = await idb();
+  await new Promise((res,rej)=>{
+    const cur = db.transaction('shots').objectStore('shots')
+      .openCursor(IDBKeyRange.bound(p+'/', p+'/￿'));
+    cur.onsuccess = () => { const c = cur.result;
+      if (!c) return res();
+      shots[c.key.slice(p.length+1)] = c.value; c.continue(); };
+    cur.onerror = () => rej(cur.error);
+  });
+  paintList(); updatePrompt();
+}
+function savePrefs(){
+  localStorage.setItem('pose-capture:dir', $('#dir').value);
+  localStorage.setItem('pose-capture:prefix', $('#prefix').value);
+}
+function loadPrefs(){
+  const d = localStorage.getItem('pose-capture:dir'), p = localStorage.getItem('pose-capture:prefix');
+  if (d) $('#dir').value = d;
+  if (p) $('#prefix').value = p;
+}
+
 // ── camera ────────────────────────────────────────────────────────────────
 async function listCams(){
   const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');
@@ -155,6 +198,7 @@ async function shootFrame(withCountdown){
   render();
   // grab as PNG (transparent if seg on)
   shots[c.name].push(view.toDataURL('image/png'));
+  saveClip(c.name);
   paintList();
   // auto-advance to next needed frame within the clip
   updatePrompt();
@@ -192,6 +236,19 @@ function updatePrompt(){
   $('#pDesc').textContent = c.desc;
   $('#pProg').textContent = `frame ${Math.min(got+1,c.frames)} of ${c.frames}`;
   $('#shoot').textContent = c.frames>1 ? `Capture frame ${Math.min(got+1,c.frames)} (3s)` : 'Capture (3s)';
+  updateGhost(c, got);
+}
+
+// ── reference ghost: ref/<stem>.png (same stems buildZip writes: idle / walk1,walk2).
+// Missing file just hides the ghost, so ref/ is optional per clip.
+function updateGhost(c, got){
+  const g = $('#ghost');
+  const stem = c.frames>1 ? `${c.name}${Math.min(got+1,c.frames)}` : c.name;
+  g.style.display = 'none';
+  if (!$('#showref').checked) return;
+  g.onload = () => { g.style.display = 'block'; };
+  g.onerror = () => { g.style.display = 'none'; };
+  g.src = `ref/${stem}.png`;
 }
 
 // ── build: PNGs named <prefix>_<clip><n>.png + character.json (roster schema) ─
@@ -247,15 +304,20 @@ async function uploadZip(){
 
 // ── wire up ───────────────────────────────────────────────────────────────
 $('#camsel').onchange = e => startCam(e.target.value);
+$('#showref').onchange = () => updatePrompt();
 $('#shoot').onclick   = () => shootFrame(true);
 $('#shootNow').onclick= () => shootFrame(false);
-$('#retake').onclick  = () => { shots[CLIPS[active].name]=[]; paintList(); updatePrompt(); };
+$('#retake').onclick  = () => { const n=CLIPS[active].name; shots[n]=[]; saveClip(n); paintList(); updatePrompt(); };
 $('#prev').onclick    = () => { active=(active-1+CLIPS.length)%CLIPS.length; updatePrompt(); paintList(); };
 $('#next').onclick    = () => { active=(active+1)%CLIPS.length; updatePrompt(); paintList(); };
 $('#export').onclick  = exportZip;
 $('#send').onclick    = uploadZip;
+$('#dir').onchange    = savePrefs;
+$('#prefix').onchange = () => { savePrefs(); restoreShots(); };
 
 (async () => {
+  loadPrefs();
+  await restoreShots().catch(e => console.warn('restore failed:', e));
   try { await startCam(); } catch(e){ alert('Camera error: '+e.message+'\nServe over http://localhost or https and allow the camera.'); }
   paintList(); updatePrompt(); loop();
 })();
