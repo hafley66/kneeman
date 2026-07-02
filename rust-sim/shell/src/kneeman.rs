@@ -528,7 +528,7 @@ impl INode2D for KneeMan {
         self.update_hud();
     }
 
-    fn physics_process(&mut self, _delta: f64) {
+    fn physics_process(&mut self, delta: f64) {
         // MENU pause freezes the LOCAL sim, but a live netplay handshake/session must keep pumping:
         // a lobby opened from the Network page (menu still up) has to finish connecting, and a running
         // match can't stall ggrs. The old early-return here skipped pump_signaling while paused, so a
@@ -578,6 +578,7 @@ impl INode2D for KneeMan {
         self.sync_charsel();
         self.place_tags();
         self.pump_analytics();
+        self.tick_autosave(delta as f32);
     }
 
     /// Window/tab regained focus (desktop WM focus or browser tab focus on web). Re-ping the relay
@@ -1173,6 +1174,66 @@ impl KneeMan {
 
     pub fn toasts_cell(&self) -> crate::toast::Toasts {
         self.toasts.clone()
+    }
+
+    /// Per-frame auto-save of the durable home. Every minute of session time the world runtime
+    /// bookmarks the current head; a return value means it just saved, and we warn if the cache is
+    /// over the soft cap (mostly gif blobs — nothing is auto-deleted).
+    fn tick_autosave(&mut self, dt: f32) {
+        let Some(w) = self.world.as_mut() else { return };
+        if let Some(bytes) = w.autosave(dt, now_ms()) {
+            if bytes > crate::world_runtime::CACHE_WARN_BYTES {
+                let mb = bytes / (1024 * 1024);
+                crate::toast::push(
+                    &self.toasts,
+                    crate::toast::ToastKind::Warn,
+                    &format!("World cache is {mb} MB — delete old saves to free space"),
+                );
+            }
+        }
+    }
+
+    // --- durable-world CRUD, driven by the debug panel's Saves tab (it holds a Gd<KneeMan>) ---
+
+    /// Every save for the home world, oldest first (empty if the world failed to boot).
+    pub fn world_slots(&self) -> Vec<smash_core::world::store::Slot> {
+        self.world.as_ref().map(|w| w.slots()).unwrap_or_default()
+    }
+
+    /// Rough stored footprint of the home world, in bytes.
+    pub fn world_cache_bytes(&self) -> u64 {
+        self.world.as_ref().map(|w| w.cache_bytes()).unwrap_or(0)
+    }
+
+    /// Save the current home under `label` (overwrites a same-label save).
+    pub fn world_save(&mut self, label: &str) {
+        if let Some(w) = self.world.as_mut() {
+            w.save_slot(label, now_ms());
+            crate::toast::push(&self.toasts, crate::toast::ToastKind::Success, &format!("Saved “{label}”"));
+        }
+    }
+
+    /// Restore a saved home by label.
+    pub fn world_load(&mut self, label: &str) {
+        if let Some(w) = self.world.as_mut() {
+            w.load_slot(label);
+            crate::toast::push(&self.toasts, crate::toast::ToastKind::Info, &format!("Loaded “{label}”"));
+        }
+    }
+
+    /// Forget a save by label.
+    pub fn world_delete(&mut self, label: &str) {
+        if let Some(w) = self.world.as_mut() {
+            w.delete_slot(label);
+        }
+    }
+
+    /// Reset the home to the blank static defaults (undo-able forward event).
+    pub fn world_reset(&mut self) {
+        if let Some(w) = self.world.as_mut() {
+            w.reset_home();
+            crate::toast::push(&self.toasts, crate::toast::ToastKind::Info, "Home reset to defaults");
+        }
     }
 
     /// Once per frame: heartbeat the live phase/channel while connected (so a stall shows as repeated

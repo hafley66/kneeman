@@ -15,7 +15,7 @@ use godot::classes::{DirAccess, FileAccess};
 use godot::prelude::*;
 
 use smash_core::world::fold::chain;
-use smash_core::world::store::{WorldStore, SCHEMA};
+use smash_core::world::store::{Slot, WorldStore, SCHEMA};
 use smash_core::world::{
     asset_id, canon, decanon, event_id, world_id, AssetId, EventId, Node, PlayerId, Seed, WorldEvent, WorldId,
 };
@@ -130,6 +130,15 @@ impl GodotStore {
         out
     }
 
+    /// Read the `.slots` sidecar (canon `Vec<Slot>`), empty if absent. Slots are infrequent, so this
+    /// stays off the RAM cache and reads on demand.
+    fn read_slots(id: WorldId) -> Vec<Slot> {
+        match Self::read_file(&Self::world_path(id, "slots")) {
+            Some(b) if !b.is_empty() => decanon::<Vec<Slot>>(&b),
+            _ => Vec::new(),
+        }
+    }
+
     /// Load a world's cache from disk (seed + log + snapshot) if the seed file is present.
     fn load(id: WorldId) -> Option<Cache> {
         let seed: Seed = decanon(&Self::read_file(&Self::world_path(id, "seed"))?);
@@ -218,5 +227,35 @@ impl WorldStore for GodotStore {
     }
     fn get_asset(&self, id: AssetId) -> Option<Vec<u8>> {
         Self::read_file(&Self::asset_path(id))
+    }
+
+    fn put_slot(&mut self, id: WorldId, slot: &Slot) {
+        let mut v = Self::read_slots(id);
+        v.retain(|s| s.label != slot.label); // upsert by label
+        v.push(slot.clone());
+        Self::write_file(&Self::world_path(id, "slots"), &canon(&v));
+    }
+    fn slots(&self, id: WorldId) -> Vec<Slot> {
+        Self::read_slots(id)
+    }
+    fn del_slot(&mut self, id: WorldId, label: &str) {
+        let mut v = Self::read_slots(id);
+        v.retain(|s| s.label != label);
+        Self::write_file(&Self::world_path(id, "slots"), &canon(&v));
+    }
+    fn cache_bytes(&self, id: WorldId) -> u64 {
+        let file_len = |path: String| -> u64 {
+            FileAccess::open(&GString::from(path.as_str()), ModeFlags::READ).map_or(0, |f| f.get_length() as u64)
+        };
+        let log = file_len(Self::world_path(id, "log"));
+        let snap = file_len(Self::world_path(id, "snap"));
+        // sweep the shared asset dir (gif blobs dominate the footprint).
+        let mut assets = 0u64;
+        if let Some(mut da) = DirAccess::open(&GString::from(ASSET_DIR)) {
+            for name in da.get_files().as_slice() {
+                assets += file_len(format!("{ASSET_DIR}/{name}"));
+            }
+        }
+        log + snap + assets
     }
 }

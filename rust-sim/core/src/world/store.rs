@@ -3,9 +3,21 @@
 //! rusqlite bundled — the min-db, per-peer, SQLite-everywhere decision).
 
 use crate::world::{canon, event_id, world_id, AssetId, EventId, Node, Schema, Seed, Seq, WorldEvent, WorldId};
+use serde::{Deserialize, Serialize};
 
 /// Current write schema. Read dispatches on the stored per-event schema (upcast); writes stamp this.
 pub const SCHEMA: Schema = Schema(1);
+
+/// A named save = a bookmark to a retained log point. Restore is just `append(Reset { to: head })`,
+/// so a slot carries no state blob (the log holds it) — cheap while compaction is deferred. `at_ms` is
+/// the client's wall clock at save (display/sort only); `seq` is the chain height then (display only).
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Slot {
+    pub label: String,
+    pub at_ms: u64,
+    pub head: EventId,
+    pub seq: Seq,
+}
 
 /// The store contract. `append` chains onto the current head (content-addressed, so it is idempotent
 /// and needs no seq allocator). `since`/`head` back P2P have/want sync.
@@ -31,6 +43,16 @@ pub trait WorldStore {
     fn put_asset(&mut self, bytes: &[u8]) -> AssetId;
     /// Fetch by id (self-verifying: the id IS the content hash). `None` = not held.
     fn get_asset(&self, id: AssetId) -> Option<Vec<u8>>;
+
+    // --- named save slots: bookmarks into the retained log (restore = Reset{to: head}) ---
+    /// Upsert a slot by label (re-saving a label overwrites it).
+    fn put_slot(&mut self, id: WorldId, slot: &Slot);
+    /// All slots for a world, oldest first.
+    fn slots(&self, id: WorldId) -> Vec<Slot>;
+    /// Remove a slot by label (no-op if absent). Does not touch the log.
+    fn del_slot(&mut self, id: WorldId, label: &str);
+    /// Rough stored footprint (log payloads + assets + snapshot) for the size watch, in bytes.
+    fn cache_bytes(&self, id: WorldId) -> u64;
 }
 
 /// Compute the id an append onto `parent` would get. Shared by both impls so their ids match.
@@ -48,6 +70,7 @@ pub struct MemStore {
     logs: std::collections::HashMap<WorldId, Vec<Node>>,
     snaps: std::collections::HashMap<WorldId, (EventId, Vec<u8>)>,
     assets: std::collections::HashMap<AssetId, Vec<u8>>,
+    slots: std::collections::HashMap<WorldId, Vec<Slot>>,
 }
 
 impl MemStore {
@@ -115,6 +138,25 @@ impl WorldStore for MemStore {
     fn get_asset(&self, id: AssetId) -> Option<Vec<u8>> {
         self.assets.get(&id).cloned()
     }
+    fn put_slot(&mut self, id: WorldId, slot: &Slot) {
+        let v = self.slots.entry(id).or_default();
+        v.retain(|s| s.label != slot.label); // upsert by label
+        v.push(slot.clone());
+    }
+    fn slots(&self, id: WorldId) -> Vec<Slot> {
+        self.slots.get(&id).cloned().unwrap_or_default()
+    }
+    fn del_slot(&mut self, id: WorldId, label: &str) {
+        if let Some(v) = self.slots.get_mut(&id) {
+            v.retain(|s| s.label != label);
+        }
+    }
+    fn cache_bytes(&self, id: WorldId) -> u64 {
+        let log: usize = self.logs.get(&id).map_or(0, |l| l.iter().map(|n| canon(&n.ev).len()).sum());
+        let snap: usize = self.snaps.get(&id).map_or(0, |(_, b)| b.len());
+        let assets: usize = self.assets.values().map(|b| b.len()).sum(); // assets are shared, not per-world
+        (log + snap + assets) as u64
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -157,7 +199,10 @@ impl SqliteStore {
              CREATE TABLE IF NOT EXISTS world_head(world_id BLOB PRIMARY KEY, head BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS world_snapshot(
                  world_id BLOB PRIMARY KEY, upto BLOB NOT NULL, blob BLOB NOT NULL);
-             CREATE TABLE IF NOT EXISTS asset(id BLOB PRIMARY KEY, bytes BLOB NOT NULL);",
+             CREATE TABLE IF NOT EXISTS asset(id BLOB PRIMARY KEY, bytes BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS world_slot(
+                 world_id BLOB NOT NULL, label TEXT NOT NULL, at_ms INTEGER NOT NULL,
+                 head BLOB NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(world_id, label));",
         )
     }
 }
@@ -295,6 +340,52 @@ impl WorldStore for SqliteStore {
         self.conn
             .query_row("SELECT bytes FROM asset WHERE id=?1", [&id.0[..]], |r| r.get::<_, Vec<u8>>(0))
             .ok()
+    }
+    fn put_slot(&mut self, id: WorldId, slot: &Slot) {
+        self.conn
+            .execute(
+                "INSERT INTO world_slot(world_id, label, at_ms, head, seq) VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(world_id, label) DO UPDATE SET at_ms=?3, head=?4, seq=?5",
+                rusqlite::params![&id.0[..], slot.label, slot.at_ms, &slot.head.0[..], slot.seq.0],
+            )
+            .expect("put_slot");
+    }
+    fn slots(&self, id: WorldId) -> Vec<Slot> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT label, at_ms, head, seq FROM world_slot WHERE world_id=?1 ORDER BY at_ms")
+            .expect("prepare slots");
+        stmt.query_map([&id.0[..]], |r| {
+            Ok(Slot {
+                label: r.get(0)?,
+                at_ms: r.get::<_, i64>(1)? as u64,
+                head: EventId(to32(r.get::<_, Vec<u8>>(2)?)),
+                seq: Seq(r.get::<_, i64>(3)? as u64),
+            })
+        })
+        .expect("query slots")
+        .map(|r| r.expect("slot row"))
+        .collect()
+    }
+    fn del_slot(&mut self, id: WorldId, label: &str) {
+        self.conn
+            .execute("DELETE FROM world_slot WHERE world_id=?1 AND label=?2", rusqlite::params![&id.0[..], label])
+            .expect("del_slot");
+    }
+    fn cache_bytes(&self, id: WorldId) -> u64 {
+        let log: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(SUM(LENGTH(payload)),0) FROM world_event WHERE world_id=?1", [&id.0[..]], |r| r.get(0))
+            .unwrap_or(0);
+        let snap: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(LENGTH(blob),0) FROM world_snapshot WHERE world_id=?1", [&id.0[..]], |r| r.get(0))
+            .unwrap_or(0);
+        let assets: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(SUM(LENGTH(bytes)),0) FROM asset", [], |r| r.get(0))
+            .unwrap_or(0);
+        (log + snap + assets).max(0) as u64
     }
 }
 

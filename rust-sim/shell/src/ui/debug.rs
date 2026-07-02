@@ -27,6 +27,15 @@ enum Tab {
     Server,
 }
 
+/// A CRUD action the Saves window emitted this frame; actuated after the draw via the KneeMan handle
+/// (egui can't call Godot mid-draw, mirrors the `want_status` pattern).
+enum SaveAction {
+    Save,
+    Load(String),
+    Delete(String),
+    Reset,
+}
+
 /// Initial delay (s) before dpad direction starts repeating when held.
 const PAD_INITIAL_DELAY_S: f64 = 0.35;
 /// Interval (s) between repeat firings once the initial delay has elapsed.
@@ -57,6 +66,7 @@ pub struct DebugUi {
     pad_held: Option<JoyButton>,
     pad_hold_secs: f64,
     pad_repeats_fired: u32,
+    save_label: String, // text field in the Saves window; the label a manual save writes under
 }
 
 #[godot_api]
@@ -80,6 +90,7 @@ impl INode for DebugUi {
             pad_held: None,
             pad_hold_secs: 0.0,
             pad_repeats_fired: 0,
+            save_label: String::from("save 1"),
         }
     }
 
@@ -289,6 +300,28 @@ impl INode for DebugUi {
         if !self.show {
             return;
         }
+        // Saved-worlds CRUD. Read the slot list + cache size through the KneeMan handle, draw the window,
+        // then actuate whatever button was pressed (bind_mut after the borrow ends).
+        {
+            let (slots, bytes) = {
+                let f = fighter.bind();
+                (f.world_slots(), f.world_cache_bytes())
+            };
+            let mut action: Option<SaveAction> = None;
+            draw_saves_window(&ctx, &slots, bytes, &mut self.save_label, &mut action);
+            match action {
+                Some(SaveAction::Save) => {
+                    let label = self.save_label.trim().to_string();
+                    if !label.is_empty() {
+                        fighter.bind_mut().world_save(&label);
+                    }
+                }
+                Some(SaveAction::Load(l)) => fighter.bind_mut().world_load(&l),
+                Some(SaveAction::Delete(l)) => fighter.bind_mut().world_delete(&l),
+                Some(SaveAction::Reset) => fighter.bind_mut().world_reset(),
+                None => {}
+            }
+        }
         let mut want_status = false;
         draw_panel(
             &ctx,
@@ -458,6 +491,55 @@ impl DebugUi {
         rows.extend(self.lobbies.iter().cloned());
         rows
     }
+}
+
+/// The Saved-worlds window: cache-size line, a name field + Save, a Reset-to-defaults button, and the
+/// slot list with per-row Load/delete. Pure view — clicks flow out through `out`, the caller actuates.
+fn draw_saves_window(
+    ctx: &egui::Context,
+    slots: &[smash_core::world::store::Slot],
+    cache_bytes: u64,
+    label: &mut String,
+    out: &mut Option<SaveAction>,
+) {
+    egui::Window::new("Saved worlds")
+        .default_size(egui::vec2(280.0, 320.0))
+        .show(ctx, |ui| {
+            let over = cache_bytes > crate::world_runtime::CACHE_WARN_BYTES;
+            let mb = cache_bytes as f32 / (1024.0 * 1024.0);
+            let col = if over { egui::Color32::from_rgb(0xE0, 0x80, 0x30) } else { dark::MUTED };
+            ui.colored_label(col, format!("cache {mb:.1} MB  ·  auto-saves every 60s"));
+            ui.separator();
+            ui.horizontal(|ui| {
+                egui::TextEdit::singleline(label).char_limit(24).desired_width(150.0).show(ui);
+                if ui.button("Save").clicked() {
+                    *out = Some(SaveAction::Save);
+                }
+            });
+            if ui.button("Reset home to defaults").clicked() {
+                *out = Some(SaveAction::Reset);
+            }
+            ui.separator();
+            if slots.is_empty() {
+                ui.colored_label(dark::MUTED, "no saves yet");
+            }
+            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                for s in slots {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&s.label).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✕").clicked() {
+                                *out = Some(SaveAction::Delete(s.label.clone()));
+                            }
+                            if ui.small_button("Load").clicked() {
+                                *out = Some(SaveAction::Load(s.label.clone()));
+                            }
+                            ui.colored_label(dark::MUTED, format!("#{}", s.seq.0));
+                        });
+                    });
+                }
+            });
+        });
 }
 
 // the view is a function of the signal cells: read .get(), write .set() on change.
