@@ -385,13 +385,22 @@ pub(crate) fn fire_gun(n: &mut SimState, idx: usize, auto: bool, t: &Tune) {
         // birth — integrate_ink arcs it, stacks it, locks it into standable/strikeable terrain.
         // Shape rolls off the sim's LCG so both peers lob the same piece. Spawn a bit above the
         // muzzle so a tall piece's bottom edge starts clear of the floor it must cross to settle.
-        if let Some(slot) = n.paths.iter().position(|p| !p.active() && !p.drawing) {
-            let shape = (next_rng(&mut n.rng) % TETROMINO_SHAPES as u64) as u8;
-            let props = t.strokes.get(n.items[k].stroke);
-            let vel = Vector2::new(f.facing * cfg.speed, -cfg.speed * 0.6) * DT; // ink vel is px/frame
-            let at = muzzle + Vector2::new(0.0, -40.0);
-            n.paths[slot] = tetromino_path(shape, at, vel, props, idx as i8, n.tick);
-        }
+        // A full board evicts the OLDEST settled player stroke (never a baked stage stroke, never
+        // ink mid-draw or in flight); if even that fails, keep the ammo — the shot never happened.
+        let slot = n.paths.iter().position(|p| !p.active() && !p.drawing).or_else(|| {
+            n.paths
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.active() && !p.drawing && !p.traveling() && p.owner >= 0)
+                .min_by_key(|(_, p)| p.born[0])
+                .map(|(i, _)| i)
+        });
+        let Some(slot) = slot else { return };
+        let shape = (next_rng(&mut n.rng) % TETROMINO_SHAPES as u64) as u8;
+        let props = t.strokes.get(n.items[k].stroke);
+        let vel = Vector2::new(f.facing * cfg.speed, -cfg.speed * 0.6) * DT; // ink vel is px/frame
+        let at = muzzle + Vector2::new(0.0, -40.0);
+        n.paths[slot] = tetromino_path(shape, at, vel, props, idx as i8, n.tick);
     } else if let Some(slot) = n.items.iter().position(|x| !x.active()) {
         let (kind, vel) = if gun == ItemKind::BobGun {
             // lob up-and-forward; gravity in update_items bends it into an arc.

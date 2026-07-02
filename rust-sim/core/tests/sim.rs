@@ -710,3 +710,65 @@ fn a_tumbling_body_bounces_off_the_floor() {
     assert_eq!(s.fighters[0].state, CharState::Air, "it stays airborne after the bounce (no Landing)");
     assert!(s.fighters[0].ground_plat < 0, "the bounce did not pin it to a platform");
 }
+
+#[test]
+fn special_on_ink_stays_pinned_to_the_ink() {
+    // The old bug: landing on ink sets ground_plat = 0 ("reads as grounded"), so a grounded
+    // special pinned pos.y to PLATFORMS[0].y — teleport to the stage floor for the move, then
+    // back up when it ended. The special must integrate on the INK surface.
+    let (mut s, t) = settled();
+    // a settled permanent bar at y=600 in the clear column left of the left platform (x 170..270)
+    s.paths[0] = rehydrate_stroke(
+        &[Vector2::new(170.0, 600.0), Vector2::new(270.0, 600.0)],
+        StrokeRegistry::TETRIS_ROW,
+        0,
+        &t,
+    );
+    s.fighters[0].pos = Vector2::new(220.0, 560.0);
+    s.fighters[0].vel = Vector2::ZERO;
+    s.fighters[0].state = CharState::Air;
+    s.fighters[0].ground_plat = -1;
+    // fall onto the bar
+    for _ in 0..90 {
+        s = step(&s, &[&idle(), &idle()], &t);
+        if s.fighters[0].ground_ink >= 0 && s.fighters[0].state == CharState::Stand {
+            break;
+        }
+    }
+    assert_eq!(s.fighters[0].ground_ink, 0, "standing on the drawn bar");
+    let surf = s.fighters[0].pos.y;
+    assert!((surf - 600.0).abs() < 2.0, "feet on the ink surface, got {surf}");
+    // press B (neutral special) and ride the whole move out: never leave the bar's surface
+    s = step(&s, &[&press(|i| i.special = true), &idle()], &t);
+    for _ in 0..60 {
+        assert!(
+            (s.fighters[0].pos.y - 600.0).abs() < 4.0,
+            "special frame teleported off the ink: y = {} (state {:?})",
+            s.fighters[0].pos.y,
+            s.fighters[0].state
+        );
+        s = step(&s, &[&idle(), &idle()], &t);
+    }
+}
+
+#[test]
+fn a_jab_strikes_the_ink_it_touches() {
+    // Melee hits ink now: the jab's first hitbox, on its start frame, sweeps the drawn strokes.
+    // (shake decays over the ride-out frames, so damage on the bar is the durable evidence)
+    let (mut s, t) = settled();
+    let f = s.fighters[0];
+    // park a settled bar exactly across the jab's first box (off (44,-64), r 32)
+    let c = f.pos + Vector2::new(44.0 * f.facing, -64.0);
+    s.paths[0] = rehydrate_stroke(
+        &[c + Vector2::new(-40.0, 0.0), c + Vector2::new(40.0, 0.0)],
+        StrokeRegistry::TETRIS_ROW,
+        0,
+        &t,
+    );
+    assert!(s.paths[0].mass > 0.0, "the bar is a strikeable body");
+    s = step(&s, &[&press(|i| i.attack = true), &idle()], &t);
+    for _ in 0..12 {
+        s = step(&s, &[&idle(), &idle()], &t);
+    }
+    assert!(s.paths[0].hp > 0.0, "the jab connected with the ink (hp = {})", s.paths[0].hp);
+}

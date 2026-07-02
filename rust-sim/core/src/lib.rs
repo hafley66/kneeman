@@ -476,6 +476,24 @@ pub fn step(s: &SimState, inputs: &[&InputFrame], t: &Tune) -> SimState {
     for p in 0..np {
         apply_act(&mut n, p, acts[p], t);
     }
+    // Melee strikes ink: each hitbox sweeps the drawn strokes ON ITS FIRST ACTIVE FRAME only —
+    // ink has no per-victim re-hit grid, so the start frame is the one-hit-per-box-per-swing gate.
+    // Runs before the fighter pass so this tick's fresh hitlag can't freeze `frame` at `start`
+    // and re-trigger; a fighter mid-hitlag from an earlier hit is skipped outright.
+    for p in 0..np {
+        let f = n.fighters[p];
+        if f.hitlag > 0 {
+            continue;
+        }
+        let Some(atk) = attack_for(t, f.state) else { continue };
+        for hb in atk.live_boxes() {
+            if f.frame != hb.start {
+                continue;
+            }
+            let (hc, hr) = hitbox_center(&f, hb);
+            stage::strike_ink(&mut n.paths, hc, hr, hb, hb.damage, f.facing, t);
+        }
+    }
     // Phase 3: pairwise combat + grabs over every ordered (attacker, victim) pair. The victim's stick
     // this frame feeds trajectory DI, so each call passes the defender's aim. `pair_mut` borrows the
     // two distinct fighters at once (generalizes the old hand split).

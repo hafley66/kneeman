@@ -124,10 +124,17 @@ impl StrokeProps {
         zone: false,       // the prototype pencil: temporary ink, does NOT grow the blast zone
     };
 
-    /// Permanent platform material (the tetris pen): identical surface feel to PEN but the stroke
-    /// never times out — it dies only by leaving the blast zone. `stroke_life < 0` is the
-    /// never-expires sentinel the decay loop honors.
-    pub const TETRIS: Self = Self { stroke_life: -1, ..Self::PEN };
+    /// Permanent piece material (the tetris gun): never times out (`stroke_life < 0` is the
+    /// never-expires sentinel the decay loop honors), dies only past the blast zone. SOFT like a
+    /// soft platform — stand on top, drop through with held down. `ledge_curve` sits above π
+    /// (`ang_diff` maxes at π) so the piece's right-angle corners are plain Floor, never grabbable
+    /// lips: the whole top reads blue, not a ring of yellow.
+    pub const TETRIS: Self = Self {
+        stroke_life: -1,
+        solid: false,
+        ledge_curve: 9.0,
+        ..Self::PEN
+    };
 }
 
 /// Index into a `StrokeRegistry`'s preset table. Plain `u8` so it rides inside `Item`/`SimState` as
@@ -377,13 +384,16 @@ pub fn classify(p: &mut InkPath) {
         };
     }
     // ledge pass: a Floor segment whose join to the NEXT segment turns sharply (a corner, not a smooth
-    // continuation) is grabbable. The two end Floor segments are also candidate lips (open ends).
+    // continuation) is grabbable. The two end Floor segments are also candidate lips (open ends) —
+    // unless the path is a CLOSED loop (last node back on the first, e.g. a tetromino outline),
+    // where "first" and "last" are an arbitrary seam, not real tips.
+    let closed = n >= 3 && (p.pts[0] - p.pts[n - 1]).length() < 0.01;
     for s in 0..n - 1 {
         if p.class[s] != SegClass::Floor {
             continue;
         }
         let a = (p.pts[s + 1] - p.pts[s]).y.atan2((p.pts[s + 1] - p.pts[s]).x);
-        let open_end = s == 0 || s == n - 2;
+        let open_end = !closed && (s == 0 || s == n - 2);
         let corner = if s + 2 < n {
             let b = (p.pts[s + 2] - p.pts[s + 1]).y.atan2((p.pts[s + 2] - p.pts[s + 1]).x);
             ang_diff(a, b) >= p.props.ledge_curve
@@ -1140,8 +1150,14 @@ mod tests {
                 "shape {shape}: outline closes on itself"
             );
             assert!(
-                (0..n - 1).any(|s| p.class[s] == SegClass::Floor || p.class[s] == SegClass::Ledge),
+                (0..n - 1).any(|s| p.class[s] == SegClass::Floor),
                 "shape {shape}: has a standable top"
+            );
+            // closed loop + TETRIS ledge_curve: no seam lips, no corner lips — all-Floor tops
+            // render blue, right-angle corners are never grabbable yellow.
+            assert!(
+                (0..n - 1).all(|s| p.class[s] != SegClass::Ledge),
+                "shape {shape}: a closed piece has no grabbable Ledge"
             );
         }
         // the O piece is character-sized: 2 cells = 100px across
@@ -1202,6 +1218,43 @@ mod tests {
             n.items.iter().filter(|it| it.active()).count() == 1,
             "no Item projectile spawned — the gun itself is the only item"
         );
+    }
+
+    #[test]
+    fn full_board_evicts_the_oldest_stroke_and_a_dry_fire_keeps_ammo() {
+        let t = crate::Tune::default();
+        let mut n = crate::SimState::spawn();
+        crate::spawn_kind(&mut n, crate::ItemKind::TetrisGun, ToolKind::TrailPen, StrokeRegistry::TETRIS_ROW, &t);
+        let k = n.items.iter().position(|it| it.active()).unwrap();
+        n.items[k].owner = 0;
+        n.fighters[0].holding = k as i8;
+        // every path slot taken by a settled player stroke; slot 5 is the OLDEST (smallest born)
+        for i in 0..MAX_DRAWN {
+            let mut p = body_at(Vector2::new(200.0 + 40.0 * i as f32, 400.0));
+            p.born[0] = if i == 5 { 1 } else { 100 + i as u64 };
+            n.paths[i] = p;
+        }
+        let gas = n.items[k].gas;
+        crate::fire_gun(&mut n, 0, false, &t);
+        assert_eq!(n.items[k].gas, gas - 1.0, "the shot happened: ammo spent");
+        assert!(n.paths[5].traveling(), "the oldest stroke's slot now holds the flying piece");
+        assert!(n.paths[5].props == StrokeProps::TETRIS, "and it wears the piece material");
+
+        // nothing evictable (all baked stage strokes): the shot never happens, ammo stays
+        let mut n2 = crate::SimState::spawn();
+        crate::spawn_kind(&mut n2, crate::ItemKind::TetrisGun, ToolKind::TrailPen, StrokeRegistry::TETRIS_ROW, &t);
+        let k2 = n2.items.iter().position(|it| it.active()).unwrap();
+        n2.items[k2].owner = 0;
+        n2.fighters[0].holding = k2 as i8;
+        for i in 0..MAX_DRAWN {
+            let mut p = body_at(Vector2::new(200.0 + 40.0 * i as f32, 400.0));
+            p.owner = -1;
+            n2.paths[i] = p;
+        }
+        let gas2 = n2.items[k2].gas;
+        crate::fire_gun(&mut n2, 0, false, &t);
+        assert_eq!(n2.items[k2].gas, gas2, "dry fire against an un-evictable board keeps the ammo");
+        assert!(n2.paths.iter().all(|p| !p.traveling()), "and lobs nothing");
     }
 
     #[test]

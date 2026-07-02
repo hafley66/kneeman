@@ -811,6 +811,40 @@ pub(crate) fn reduce_next_state(f: &mut Fighter, items: &[Item; MAX_ITEMS], path
                         break;
                     }
                 }
+                // drawn ink catches an aerial special too (mirrors the airborne ink landing above)
+                if n.state != CharState::Landing {
+                    for (idx, p) in paths.iter().enumerate() {
+                        let Some(surf) = ink_floor_y_at(p, n.pos.x) else { continue };
+                        let crossed = prev_y <= surf + 1.0 && n.pos.y >= surf;
+                        if crossed && (p.props.solid || !i.down) {
+                            n.pos.y = surf;
+                            n.vel.y = 0.0;
+                            n.air_jumps = t.max_air_jumps as u8;
+                            n.air_dodges = t.max_air_dodges as u8;
+                            n.ground_plat = 0; // reads as grounded (same convention as ink landing)
+                            n.ground_ink = idx as i8;
+                            n.state = CharState::Landing;
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if n.ground_ink >= 0 {
+            // special launched while standing on ink: ground_plat reads 0 there (the "grounded"
+            // convention from the ink landing), so pin to the INK surface, not PLATFORMS[0] — the
+            // platform pin below teleported you to the stage floor and back. Ink gone mid-move:
+            // fall out as an aerial special.
+            let p = paths[n.ground_ink as usize];
+            n.pos.x += n.vel.x * DT;
+            match ink_floor_y_at(&p, n.pos.x) {
+                Some(y) => {
+                    n.pos.y = y;
+                    n.vel.y = 0.0;
+                }
+                None => {
+                    n.ground_ink = -1;
+                    n.ground_plat = -1;
+                }
             }
         } else {
             let p = PLATFORMS[n.ground_plat.clamp(0, PLATFORMS.len() as i32 - 1) as usize];
