@@ -500,8 +500,11 @@ pub fn step(s: &SimState, inputs: &[&InputFrame], t: &Tune) -> SimState {
     }
 
     update_items(&mut n, t); // move bolts, follow held guns, resolve bolt hits
-    for p in n.paths.iter_mut() {
-        stage::integrate_ink(p, t); // traveling ink arcs + settles (locks)
+    let snap = n.paths; // frame-start ink snapshot: traveling paths stack onto STILL ink as-of-now
+    for i in 0..stage::MAX_DRAWN {
+        let mut p = n.paths[i];
+        stage::integrate_ink(&mut p, &snap, i, t); // traveling ink arcs + settles/stacks (locks)
+        n.paths[i] = p;
     }
     stage::prune_outside(&mut n); // still ink that settled outside the blast zone dies
     stage::update_paths(&mut n, inputs, t); // lay/extend/finalize drawn ink, decay old nodes

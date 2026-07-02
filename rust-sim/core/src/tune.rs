@@ -160,6 +160,7 @@ pub struct Tune {
     pub kb_hitstun: f32,         // hitstun frames per KB unit (community 0.4: floor(0.4 * KB))
     pub laser: ItemConfig,
     pub bomb: ItemConfig,         // the red gun's arcing explosive (Bob-omb-ish)
+    pub tetris: ItemConfig,       // the tetris gun's lob (its shot is an ink body, not a projectile)
     pub throw_item: ThrowItem,    // directional item-throw speeds + the armed item's contact hitbox
     // drawn stroke paths
     pub strokes: StrokeRegistry,  // named stroke-material presets; row 0 = default (panel-editable)
@@ -255,6 +256,7 @@ impl Tune {
             kb_hitstun: 0.4,     // community/PM constant: hitstun = floor(0.4 * KB)
             laser: ItemConfig::LASER,
             bomb: ItemConfig::BOMB,
+            tetris: ItemConfig::TETRIS,
             throw_item: ThrowItem::DEFAULT,
             strokes: StrokeRegistry::DEFAULT,
             ink_budget: 1.0e9, // effectively infinite ink while testing (was 900.0 ~ stage width);

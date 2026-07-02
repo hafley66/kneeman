@@ -3,9 +3,9 @@
 //! for the slot type carried in `SimState.items`. Pure; re-exported at the crate root.
 
 use crate::{
-    airborne, hurtbox, knockback_units, out_of_bounds, resolve_hit_ink, strike_ink, Fighter, Hitbox,
-    SimState, StrokeId, ThrowDir, ToolKind, Tune, Vector2, DT, FLOOR_LEFT, FLOOR_RIGHT, GROUND_Y,
-    HITLAG_PER_DMG, MAX_ITEMS,
+    airborne, hurtbox, knockback_units, out_of_bounds, resolve_hit_ink, strike_ink, tetromino_path,
+    Fighter, Hitbox, SimState, StrokeId, ThrowDir, ToolKind, Tune, Vector2, DT, FLOOR_LEFT,
+    FLOOR_RIGHT, GROUND_Y, HITLAG_PER_DMG, MAX_ITEMS, TETROMINO_SHAPES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +42,24 @@ impl ItemConfig {
             r: 12.0, damage: 2.5, angle: 12.0, // near-flat: lasers push, don't launch
             bkb: 10.0, kbg: 18.0, transcendent: true, ..Hitbox::NONE
         },
+    };
+
+    /// Tetris gun: lobs a whole closed tetromino INK BODY per shot (no Item projectile — the piece
+    /// claims a path slot and is the plan's "fired ink": Traveling from birth, stacks on still ink,
+    /// standable + strikeable the moment it locks). `speed` is the lob px/s; `hit` unused for now
+    /// (piece-vs-fighter impact is the traveling-ink→fighter follow-up).
+    pub const TETRIS: Self = Self {
+        spawn_weight: 0.6,
+        ammo: 8,           // eight pieces per gun
+        cooldown: 30,      // deliberate lob, ~2/sec
+        autofire_cd: 30,
+        autofire_dmg: 1.0,
+        speed: 950.0,      // lobbed up-and-forward; ink gravity arcs it down
+        range: 0,          // unused: the piece is ink, not a timed projectile
+        proj_gravity: 0.0, // unused: integrate_ink owns the arc
+        blast_r: 0.0,
+        model_id: 2,
+        hit: Hitbox::NONE,
     };
 
     /// Red gun: low ammo, lobs a slow arcing bomb that detonates on contact or fuse and blasts
@@ -102,6 +120,7 @@ pub enum ItemKind {
     BobGun,    // red pickup weapon: lobs an arcing explosive (Bob-omb-ish) per shot
     Bomb,      // the arcing explosive a BobGun fires; detonates on contact or fuse with radial knockback
     Pen,       // drawing tool: hold + attack to lay down an ink path (the tool is in `Item.tool`)
+    TetrisGun, // lobs a whole closed tetromino ink body — instantly standable, strikeable terrain
 }
 
 impl ItemKind {
@@ -111,9 +130,9 @@ impl ItemKind {
         matches!(self, ItemKind::LaserBolt | ItemKind::Bomb)
     }
 
-    /// A held weapon that fires on the attack button. Both guns count toward the one-pickup cap.
+    /// A held weapon that fires on the attack button. Guns count toward the one-pickup cap.
     pub fn is_gun(self) -> bool {
-        matches!(self, ItemKind::LaserGun | ItemKind::BobGun)
+        matches!(self, ItemKind::LaserGun | ItemKind::BobGun | ItemKind::TetrisGun)
     }
 
     /// A held drawing tool: attack lays ink instead of firing. Counts toward the pickup cap, follows
@@ -187,10 +206,10 @@ pub const MENU_ITEMS: &[ItemCard] = &[
     ItemCard { kind: ItemKind::BobGun, name: "Bob Gun", blurb: "lobs an arcing bomb that blasts", tool: ToolKind::TrailPen, stroke: 0 },
     ItemCard { kind: ItemKind::Pen, name: "Pen", blurb: "draw ink terrain to stand on", tool: ToolKind::TrailPen, stroke: 0 },
     ItemCard {
-        kind: ItemKind::Pen,
-        name: "Tetris Pen",
-        blurb: "aimed straight strokes that never expire — strike them away",
-        tool: ToolKind::StrokeRuler,
+        kind: ItemKind::TetrisGun,
+        name: "Tetris Gun",
+        blurb: "lobs a big blocky boy — stand on it, smack it away",
+        tool: ToolKind::TrailPen, // unused: it's a gun
         stroke: crate::StrokeRegistry::TETRIS_ROW,
     },
 ];
@@ -238,6 +257,7 @@ pub(crate) fn maybe_spawn_item(n: &mut SimState, t: &Tune) {
         (ItemKind::LaserGun, t.laser.spawn_weight),
         (ItemKind::BobGun, t.bomb.spawn_weight),
         (ItemKind::Pen, t.ink_spawn_weight),
+        (ItemKind::TetrisGun, t.tetris.spawn_weight),
     ];
     let total: f32 = table.iter().map(|&(_, w)| w.max(0.0)).sum();
     if total <= 0.0 {
@@ -278,6 +298,7 @@ pub(crate) fn maybe_spawn_item(n: &mut SimState, t: &Tune) {
 fn fresh_gas(kind: ItemKind, t: &Tune) -> f32 {
     match kind {
         ItemKind::BobGun => t.bomb.ammo as f32,
+        ItemKind::TetrisGun => t.tetris.ammo as f32,
         ItemKind::Pen => t.ink_budget,
         _ => t.laser.ammo as f32,
     }
@@ -352,10 +373,26 @@ pub(crate) fn fire_gun(n: &mut SimState, idx: usize, auto: bool, t: &Tune) {
     if !gun.is_gun() || n.items[k].timer > 0 || n.items[k].gas < 1.0 {
         return; // wrong item, on cooldown, or empty — the intent fired but nothing comes out
     }
-    let cfg = if gun == ItemKind::BobGun { &t.bomb } else { &t.laser };
+    let cfg = match gun {
+        ItemKind::BobGun => &t.bomb,
+        ItemKind::TetrisGun => &t.tetris,
+        _ => &t.laser,
+    };
     let f = n.fighters[idx];
     let muzzle = f.pos + Vector2::new((HOLD_OFFSET.x + 20.0) * f.facing, HOLD_OFFSET.y);
-    if let Some(slot) = n.items.iter().position(|x| !x.active()) {
+    if gun == ItemKind::TetrisGun {
+        // the shot IS ink: the piece claims a path slot (not an item slot) and is Traveling from
+        // birth — integrate_ink arcs it, stacks it, locks it into standable/strikeable terrain.
+        // Shape rolls off the sim's LCG so both peers lob the same piece. Spawn a bit above the
+        // muzzle so a tall piece's bottom edge starts clear of the floor it must cross to settle.
+        if let Some(slot) = n.paths.iter().position(|p| !p.active() && !p.drawing) {
+            let shape = (next_rng(&mut n.rng) % TETROMINO_SHAPES as u64) as u8;
+            let props = t.strokes.get(n.items[k].stroke);
+            let vel = Vector2::new(f.facing * cfg.speed, -cfg.speed * 0.6) * DT; // ink vel is px/frame
+            let at = muzzle + Vector2::new(0.0, -40.0);
+            n.paths[slot] = tetromino_path(shape, at, vel, props, idx as i8, n.tick);
+        }
+    } else if let Some(slot) = n.items.iter().position(|x| !x.active()) {
         let (kind, vel) = if gun == ItemKind::BobGun {
             // lob up-and-forward; gravity in update_items bends it into an arc.
             (ItemKind::Bomb, Vector2::new(f.facing * cfg.speed, -cfg.speed * 0.5))
@@ -455,7 +492,7 @@ pub(crate) fn update_items(n: &mut SimState, t: &Tune) {
             continue;
         }
         match it.kind {
-            ItemKind::LaserGun | ItemKind::BobGun | ItemKind::Pen if it.thrown => {
+            ItemKind::LaserGun | ItemKind::BobGun | ItemKind::TetrisGun | ItemKind::Pen if it.thrown => {
                 // armed throw in flight: arc under gravity, damage the first non-thrower it grazes,
                 // then despawn. Landing without a hit disarms it into a normal unowned ground pickup.
                 let mut v = it.vel;
@@ -492,7 +529,7 @@ pub(crate) fn update_items(n: &mut SimState, t: &Tune) {
                     n.items[k].owner = -1;
                 }
             }
-            ItemKind::LaserGun | ItemKind::BobGun | ItemKind::Pen if it.owner >= 0 => {
+            ItemKind::LaserGun | ItemKind::BobGun | ItemKind::TetrisGun | ItemKind::Pen if it.owner >= 0 => {
                 let o = it.owner as usize;
                 if n.fighters[o].holding != k as i8 {
                     n.items[k].owner = -1; // owner let go / died: drop to the ground where it is
@@ -505,7 +542,7 @@ pub(crate) fn update_items(n: &mut SimState, t: &Tune) {
                     }
                 }
             }
-            ItemKind::LaserGun | ItemKind::BobGun | ItemKind::Pen => {
+            ItemKind::LaserGun | ItemKind::BobGun | ItemKind::TetrisGun | ItemKind::Pen => {
                 // unowned: gravity, settle on the floor — but ONLY over the stage span. Off the edge
                 // (past a wall) there is no floor, so it keeps falling and despawns at the blast zone.
                 let mut p = it.pos;

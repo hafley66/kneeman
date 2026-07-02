@@ -560,10 +560,11 @@ pub(crate) fn update_paths(n: &mut SimState, inputs: &[&InputFrame], t: &Tune) {
 }
 
 /// Traveling-ink integrator: gravity arc, then settle (the lock) when a node crosses a surface top
-/// this frame. Translation-only, so the cached `class[]` (direction-based) stays valid in flight —
-/// settling is just `vel = ZERO` plus a snap so the crossing node rests ON the surface. Reuses the
-/// fighters' gravity/terminal so ink and bodies share one feel.
-pub(crate) fn integrate_ink(p: &mut InkPath, t: &Tune) {
+/// this frame — a platform, OR another still stroke's walkable face (`others[me]` is skipped), so
+/// lobbed tetris pieces STACK. Translation-only, so the cached `class[]` (direction-based) stays
+/// valid in flight — settling is just `vel = ZERO` plus a snap so the crossing node rests ON the
+/// surface. Reuses the fighters' gravity/terminal so ink and bodies share one feel.
+pub(crate) fn integrate_ink(p: &mut InkPath, others: &[InkPath; MAX_DRAWN], me: usize, t: &Tune) {
     if !p.traveling() {
         return;
     }
@@ -576,7 +577,7 @@ pub(crate) fn integrate_ink(p: &mut InkPath, t: &Tune) {
     if p.vel.y <= 0.0 {
         return; // rising ink can't land
     }
-    // settle test: a node crossed a platform TOP this frame (prev above-or-on, now on-or-below).
+    // settle test: a node crossed a surface TOP this frame (prev above-or-on, now on-or-below).
     // The main floor is PLATFORMS[0], so off-stage ink keeps falling — no infinite ground plane.
     // Track the DEEPEST penetration so the snap leaves the lowest crossing node on its surface.
     let mut snap: f32 = -1.0;
@@ -588,11 +589,80 @@ pub(crate) fn integrate_ink(p: &mut InkPath, t: &Tune) {
                 snap = snap.max(w.y - pl.y);
             }
         }
+        // still ink is landable terrain too (the stack): crossing another stroke's highest
+        // walkable face under this node locks exactly like a platform top.
+        for (j, q) in others.iter().enumerate() {
+            if j == me || !q.active() || q.drawing || q.traveling() {
+                continue;
+            }
+            if let Some(fy) = ink_floor_y_at(q, w.x) {
+                if prev_y <= fy && w.y >= fy {
+                    snap = snap.max(w.y - fy);
+                }
+            }
+        }
     }
     if snap >= 0.0 {
         p.pos.y -= snap;
         p.vel = Vector2::ZERO; // locked: Still IS the cluster; class needs no recompute
     }
+}
+
+// ── tetromino bodies (the lobbed "blocky boy": a closed ink shape, fired not drawn) ──────────────
+
+/// Tetromino cell size in px. 50 makes the O piece 100×100 — character-sized.
+pub const TETRIS_CELL: f32 = 50.0;
+/// How many shapes `tetromino_path` knows (index with `shape % TETROMINO_SHAPES`).
+pub const TETROMINO_SHAPES: u8 = 5;
+
+/// Closed outline vertices per shape, in cell units, y-down. The path closes by re-pushing the
+/// first vertex, so every side is a real collision segment (top = Floor to stand on, sides = Wall).
+fn tetromino_outline(shape: u8) -> &'static [Vector2] {
+    const I: &[Vector2] = &[
+        Vector2::new(0.0, 0.0), Vector2::new(4.0, 0.0), Vector2::new(4.0, 1.0), Vector2::new(0.0, 1.0),
+    ];
+    const O: &[Vector2] = &[
+        Vector2::new(0.0, 0.0), Vector2::new(2.0, 0.0), Vector2::new(2.0, 2.0), Vector2::new(0.0, 2.0),
+    ];
+    const T: &[Vector2] = &[
+        Vector2::new(0.0, 0.0), Vector2::new(3.0, 0.0), Vector2::new(3.0, 1.0), Vector2::new(2.0, 1.0),
+        Vector2::new(2.0, 2.0), Vector2::new(1.0, 2.0), Vector2::new(1.0, 1.0), Vector2::new(0.0, 1.0),
+    ];
+    const L: &[Vector2] = &[
+        Vector2::new(0.0, 0.0), Vector2::new(1.0, 0.0), Vector2::new(1.0, 2.0), Vector2::new(2.0, 2.0),
+        Vector2::new(2.0, 3.0), Vector2::new(0.0, 3.0),
+    ];
+    const S: &[Vector2] = &[
+        Vector2::new(1.0, 0.0), Vector2::new(3.0, 0.0), Vector2::new(3.0, 1.0), Vector2::new(2.0, 1.0),
+        Vector2::new(2.0, 2.0), Vector2::new(0.0, 2.0), Vector2::new(0.0, 1.0), Vector2::new(1.0, 1.0),
+    ];
+    match shape % TETROMINO_SHAPES {
+        0 => I,
+        1 => O,
+        2 => T,
+        3 => L,
+        _ => S,
+    }
+}
+
+/// Build a finalized tetromino ink body centered on `at`, already Traveling (`vel` px/FRAME —
+/// spawned finalized + moving is the plan's "fired ink" lifecycle: it arcs, stacks/settles, and
+/// then lives exactly like drawn ink: standable terrain, strikeable one-bone body, persistable.
+pub fn tetromino_path(shape: u8, at: Vector2, vel: Vector2, props: StrokeProps, owner: i8, tick: u64) -> InkPath {
+    let outline = tetromino_outline(shape);
+    let center =
+        outline.iter().copied().fold(Vector2::ZERO, |a, b| a + b) / outline.len() as f32;
+    let mut p = InkPath::EMPTY;
+    p.owner = owner;
+    p.drawing = true; // local == world while pushing, like a live draw
+    p.props = props;
+    for v in outline {
+        p.push(at + (*v - center) * TETRIS_CELL, tick);
+    }
+    p.push(at + (outline[0] - center) * TETRIS_CELL, tick); // close the loop
+    finalize_path(&mut p);
+    p.vel = vel;
+    p
 }
 
 /// The live blast zone: AABB (min, max corner) of every STILL, zone-material player stroke.
@@ -887,9 +957,10 @@ mod tests {
         let mut p = body_at(Vector2::new(600.0, 300.0));
         p.vel = Vector2::new(2.0, -4.0); // lobbed up-right
         let before = p.pos;
+        let empty = [InkPath::EMPTY; MAX_DRAWN];
         let mut frames = 0;
         while p.traveling() && frames < 1200 {
-            integrate_ink(&mut p, &t);
+            integrate_ink(&mut p, &empty, 0, &t);
             frames += 1;
         }
         assert!(!p.traveling(), "ink settled within {frames} frames");
@@ -904,8 +975,9 @@ mod tests {
         let t = crate::Tune::default();
         let mut p = body_at(Vector2::new(FLOOR_RIGHT + 400.0, 300.0)); // past the stage edge
         p.vel = Vector2::new(0.0, 1.0);
+        let empty = [InkPath::EMPTY; MAX_DRAWN];
         for _ in 0..2000 {
-            integrate_ink(&mut p, &t);
+            integrate_ink(&mut p, &empty, 0, &t);
             if !p.active() {
                 break;
             }
@@ -1046,6 +1118,90 @@ mod tests {
             assert!((p.world_pt(i) - *w).length() < 1e-3, "world geometry preserved");
         }
         assert!(p.class[0] == SegClass::Floor || p.class[0] == SegClass::Ledge, "classified on load");
+    }
+
+    #[test]
+    fn tetromino_is_a_closed_traveling_body() {
+        let t = crate::Tune::default();
+        for shape in 0..TETROMINO_SHAPES {
+            let p = tetromino_path(
+                shape,
+                Vector2::new(600.0, 300.0),
+                Vector2::new(5.0, -8.0),
+                StrokeProps::TETRIS,
+                0,
+                7,
+            );
+            let n = p.len as usize;
+            assert!(p.traveling(), "shape {shape}: traveling from birth");
+            assert!(p.mass > 0.0, "shape {shape}: a real body");
+            assert!(
+                (p.world_pt(0) - p.world_pt(n - 1)).length() < 1e-3,
+                "shape {shape}: outline closes on itself"
+            );
+            assert!(
+                (0..n - 1).any(|s| p.class[s] == SegClass::Floor || p.class[s] == SegClass::Ledge),
+                "shape {shape}: has a standable top"
+            );
+        }
+        // the O piece is character-sized: 2 cells = 100px across
+        let o = tetromino_path(1, Vector2::new(600.0, 300.0), Vector2::ZERO, StrokeProps::TETRIS, 0, 0);
+        let xs: Vec<f32> = (0..o.len as usize).map(|i| o.world_pt(i).x).collect();
+        let w = xs.iter().cloned().fold(f32::MIN, f32::max) - xs.iter().cloned().fold(f32::MAX, f32::min);
+        assert!((w - 2.0 * TETRIS_CELL).abs() < 1e-3, "O width = 2 cells, got {w}");
+        let _ = t;
+    }
+
+    #[test]
+    fn lobbed_piece_stacks_on_still_ink() {
+        let t = crate::Tune::default();
+        let mut paths = [InkPath::EMPTY; MAX_DRAWN];
+        // a settled WIDE bar hovering above the floor (wider than the piece: settle tests nodes,
+        // so a pad narrower than the corner spacing would let corners straddle it). Placed at
+        // x=300 to stay clear of the stage's soft platforms.
+        let mut pad = InkPath::EMPTY;
+        pad.owner = 0;
+        pad.drawing = true;
+        pad.push(Vector2::new(150.0, 500.0), 0);
+        pad.push(Vector2::new(450.0, 500.0), 1);
+        finalize_path(&mut pad);
+        paths[0] = pad;
+        // an O piece dropped from above it
+        paths[1] = tetromino_path(1, Vector2::new(300.0, 300.0), Vector2::new(0.0, 1.0), StrokeProps::TETRIS, 0, 0);
+        let mut frames = 0;
+        while paths[1].traveling() && frames < 1200 {
+            let snap = paths;
+            integrate_ink(&mut paths[1], &snap, 1, &t);
+            frames += 1;
+        }
+        assert!(!paths[1].traveling(), "piece locked within {frames} frames");
+        let lowest = (0..paths[1].len as usize).map(|i| paths[1].world_pt(i).y).fold(f32::MIN, f32::max);
+        assert!(
+            (lowest - 500.0).abs() < 1e-2,
+            "piece bottom rests ON the bar (y=500), got {lowest} — the stack"
+        );
+    }
+
+    #[test]
+    fn firing_the_tetris_gun_spawns_a_piece_not_a_projectile() {
+        let t = crate::Tune::default();
+        let mut n = crate::SimState::spawn();
+        // hand P0 a tetris gun
+        crate::spawn_kind(&mut n, crate::ItemKind::TetrisGun, ToolKind::TrailPen, StrokeRegistry::TETRIS_ROW, &t);
+        let k = n.items.iter().position(|it| it.active()).unwrap();
+        n.items[k].owner = 0;
+        n.fighters[0].holding = k as i8;
+        let gas_before = n.items[k].gas;
+        crate::fire_gun(&mut n, 0, false, &t);
+        assert_eq!(n.items[k].gas, gas_before - 1.0, "one piece of ammo spent");
+        let piece = n.paths.iter().find(|p| p.active()).expect("a path slot claimed");
+        assert!(piece.traveling(), "the shot IS traveling ink");
+        assert!(piece.props == StrokeProps::TETRIS, "piece wears the permanent material");
+        assert_eq!(piece.owner, 0, "attributed to the shooter");
+        assert!(
+            n.items.iter().filter(|it| it.active()).count() == 1,
+            "no Item projectile spawned — the gun itself is the only item"
+        );
     }
 
     #[test]

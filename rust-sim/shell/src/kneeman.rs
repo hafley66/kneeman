@@ -926,6 +926,16 @@ impl INode2D for KneeMan {
                         Color::from_rgb(0.20, 0.55, 1.0),
                     );
                 }
+                sim::ItemKind::TetrisGun => {
+                    // tetromino lobber: a 2x2 mini-O in the piece hue so it reads as "block gun".
+                    let cell = 11.0;
+                    for (dx, dy) in [(0.0, 0.0), (cell, 0.0), (0.0, cell), (cell, cell)] {
+                        self.base_mut().draw_rect(
+                            Rect2::new(c + Vector2::new(dx - cell, dy - cell), Vector2::new(cell - 1.0, cell - 1.0)),
+                            Color::from_rgb(0.95, 0.45, 0.95),
+                        );
+                    }
+                }
                 sim::ItemKind::None => {}
             }
         }
@@ -1330,8 +1340,17 @@ impl KneeMan {
     pub fn world_reset(&mut self) {
         if let Some(w) = self.world.as_mut() {
             w.reset_home();
-            // the log's strokes are gone; drop the diff base so live permanent ink re-persists
             self.ink_base.clear();
+            // wipe the LIVE drawn ink too — without this the persist diff re-appends every stroke
+            // still standing in the sim ~0.5s later and the reset undoes itself (the "lines won't
+            // go away" loop). Baked stage strokes (owner < 0) stay.
+            let mut s = self.state.get();
+            for p in s.paths.iter_mut() {
+                if p.owner >= 0 {
+                    *p = sim::InkPath::EMPTY;
+                }
+            }
+            self.state.set(s);
             crate::toast::push(&self.toasts, crate::toast::ToastKind::Info, "Home reset to defaults");
         }
     }
