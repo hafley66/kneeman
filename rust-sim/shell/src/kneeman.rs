@@ -1209,9 +1209,10 @@ impl KneeMan {
         self.toasts.clone()
     }
 
-    /// A4: mirror the sim's PERMANENT ink (stroke_life < 0 materials) into the durable world log.
-    /// Runs offline-only on a ~0.5s cadence: diff the settled permanent strokes against `ink_base`
-    /// (content-keyed), append `AddStroke` for new ones and `Revert` for ones knocked away or moved
+    /// A4: mirror the sim's settled drawn ink — pencil AND pen — into the durable world log.
+    /// Runs offline-only on a ~0.5s cadence: diff the settled strokes against `ink_base`
+    /// (content-keyed), append `AddStroke` for new ones and `Revert` for ones knocked away, moved,
+    /// or decayed (a pencil stroke's expiry IS a disappearance in this diff)
     /// (a moved stroke is revert + re-add — forward events, history kept). Points are RDP-simplified
     /// (bends only; segments interpolate) then snapped to a 1/8px grid so a rehydrate → re-diff
     /// round-trip is byte-stable and boot never churns the log. Netplay persistence waits on the
@@ -1227,16 +1228,21 @@ impl KneeMan {
         let mut cur: std::collections::BTreeMap<Vec<u8>, (sim::StrokeId, Vec<sim::Vector2>)> =
             std::collections::BTreeMap::new();
         for p in s.paths.iter() {
-            if !p.active() || p.drawing || p.traveling() || p.mass <= 0.0 || p.props.stroke_life >= 0 {
-                continue; // only settled permanent bodies are durable facts
+            if !p.active() || p.drawing || p.traveling() || p.mass <= 0.0 {
+                continue; // only settled bodies are durable facts (baked stage = mass 0, skipped)
             }
+            // ALL drawing is world-visible, pencil included: an expiring stroke persists on settle
+            // and its later decay shows up as a disappearance in this same diff -> Revert. So the
+            // log always mirrors what's actually standing, and a joiner sees live pencil ink too.
             let world: Vec<sim::Vector2> = (0..p.len as usize).map(|i| p.world_pt(i)).collect();
             let pts: Vec<sim::Vector2> =
                 sim::simplify_polyline(&world, 2.0).into_iter().map(quant).collect();
             // sim strokes don't know their registry row; recover it by matching props (row order
-            // stable, tiny table). No match (props panel-edited mid-flight) falls back to the
-            // tetris row — eligibility already guarantees this stroke is permanent, and a row-0
-            // fallback would rehydrate it as expiring pencil (a silent delete on next boot).
+            // stable, tiny table). No match (props panel-edited mid-flight): a permanent stroke
+            // falls back to the tetris row (a row-0 fallback would rehydrate it as expiring
+            // pencil, a silent delete on next boot); an expiring one falls back to row 0.
+            let fallback =
+                if p.props.stroke_life < 0 { sim::StrokeRegistry::TETRIS_ROW as usize } else { 0 };
             let stroke = self
                 .tune
                 .get()
@@ -1244,7 +1250,7 @@ impl KneeMan {
                 .presets
                 .iter()
                 .position(|pr| *pr == p.props)
-                .unwrap_or(sim::StrokeRegistry::TETRIS_ROW as usize) as sim::StrokeId;
+                .unwrap_or(fallback) as sim::StrokeId;
             cur.insert(sim::world::canon(&(stroke, pts.clone())), (stroke, pts));
         }
         // additions: settled permanent ink not yet in the log
