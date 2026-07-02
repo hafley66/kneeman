@@ -241,6 +241,8 @@ pub fn checksum(s: &SimState) -> u128 {
         fold(p.hp.to_bits() as u64);
         fold(p.mass.to_bits() as u64);
         fold(p.shake as u64);
+        fold(p.rot.to_bits() as u64);
+        fold(p.omega.to_bits() as u64);
         for i in 0..p.len as usize {
             fold(p.pts[i].x.to_bits() as u64);
             fold(p.pts[i].y.to_bits() as u64);

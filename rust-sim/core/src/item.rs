@@ -398,9 +398,11 @@ pub(crate) fn fire_gun(n: &mut SimState, idx: usize, auto: bool, t: &Tune) {
         let Some(slot) = slot else { return };
         let shape = (next_rng(&mut n.rng) % TETROMINO_SHAPES as u64) as u8;
         let props = t.strokes.get(n.items[k].stroke);
-        let vel = Vector2::new(f.facing * cfg.speed, -cfg.speed * 0.6) * DT; // ink vel is px/frame
+        // steep mortar lob (ink vel is px/frame); birth spin toward travel = the tumbling ball
+        let vel = Vector2::new(f.facing * cfg.speed * 0.8, -cfg.speed) * DT;
         let at = muzzle + Vector2::new(0.0, -40.0);
         n.paths[slot] = tetromino_path(shape, at, vel, props, idx as i8, n.tick);
+        n.paths[slot].omega = f.facing * 0.12;
     } else if let Some(slot) = n.items.iter().position(|x| !x.active()) {
         let (kind, vel) = if gun == ItemKind::BobGun {
             // lob up-and-forward; gravity in update_items bends it into an arc.
@@ -681,7 +683,9 @@ fn explode(n: &mut SimState, center: Vector2, t: &Tune) {
         }
         let falloff = 1.0 - 0.5 * (dist / t.bomb.blast_r);
         let facing = if d.x >= 0.0 { 1.0 } else { -1.0 };
-        resolve_hit_ink(&atk, atk.damage * falloff, facing, ink, t);
+        // contact = the rim point facing the blast, so an off-center blast also torques the body
+        let contact = c - d.normalize_or_zero() * br;
+        resolve_hit_ink(&atk, atk.damage * falloff, facing, contact, ink, t);
     }
 }
 

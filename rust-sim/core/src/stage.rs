@@ -270,6 +270,8 @@ pub struct InkPath {
     pub hp: f32,                         // damage %, scales knockback taken (fighters' formula)
     pub mass: f32,                       // Σ|seg|·density at finalize; 0.0 = not a body (baked/drawing)
     pub shake: i64,                      // hitstun frames left from a too-weak strike (cosmetic jitter)
+    pub rot: f32,                        // orientation (rad) — nonzero ONLY in flight; settle bakes it
+    pub omega: f32,                      // angular vel (rad/frame): spin from an off-center hit / the lob
 }
 
 impl InkPath {
@@ -288,16 +290,25 @@ impl InkPath {
         hp: 0.0,
         mass: 0.0,
         shake: 0,
+        rot: 0.0,
+        omega: 0.0,
     };
 
     pub fn active(&self) -> bool {
         self.len > 0
     }
 
-    /// World-space node `i`. The ONLY way to read a node as world coords.
+    /// World-space node `i`. The ONLY way to read a node as world coords. `rot` spins the local
+    /// offsets about `pos`; it is 0 for everything except a body in flight, so the settled/drawn
+    /// hot path stays the plain add.
     #[inline]
     pub fn world_pt(&self, i: usize) -> Vector2 {
-        self.pts[i] + self.pos
+        if self.rot == 0.0 {
+            return self.pts[i] + self.pos;
+        }
+        let (s, c) = self.rot.sin_cos();
+        let p = self.pts[i];
+        Vector2::new(p.x * c - p.y * s, p.x * s + p.y * c) + self.pos
     }
 
     /// World-space segment starting at node `i`. The collision / hurtbox primitive.
@@ -569,17 +580,34 @@ pub(crate) fn update_paths(n: &mut SimState, inputs: &[&InputFrame], t: &Tune) {
     }
 }
 
-/// Traveling-ink integrator: gravity arc, then settle (the lock) when a node crosses a surface top
-/// this frame — a platform, OR another still stroke's walkable face (`others[me]` is skipped), so
-/// lobbed tetris pieces STACK. Translation-only, so the cached `class[]` (direction-based) stays
-/// valid in flight — settling is just `vel = ZERO` plus a snap so the crossing node rests ON the
-/// surface. Reuses the fighters' gravity/terminal so ink and bodies share one feel.
+/// Faster than this into a floor (px/frame) the body BOUNCES (Brawl soccer ball); at or below it
+/// locks into terrain. `props.bounce` is the restitution.
+pub const INK_SETTLE_SPEED: f32 = 3.5;
+/// Sideways speed kept through a bounce (ground friction of the hop).
+pub const INK_BOUNCE_FRICTION: f32 = 0.8;
+/// Spin picked up rolling out of a bounce: omega per px/frame of ground speed.
+pub const INK_ROLL_SPIN: f32 = 0.02;
+/// Air drag on spin per frame (pure feel: the ball slows its tumble).
+pub const INK_SPIN_DAMP: f32 = 0.995;
+/// Hardest allowed tumble (rad/frame) off a strike, either direction.
+pub const INK_MAX_SPIN: f32 = 0.35;
+
+/// Traveling-ink integrator: gravity arc + tumble, then either BOUNCE off a surface top it crosses
+/// — a platform, OR another still stroke's walkable face (`others[me]` is skipped), so lobbed
+/// tetris pieces STACK — or settle (the lock) once the impact is slow. `rot` spins the world reads
+/// in flight; the lock bakes it into `pts` and re-classifies, so settled ink is axis-fixed again
+/// and everything downstream (standing, persist, strike) sees plain geometry. Reuses the fighters'
+/// gravity/terminal so ink and bodies share one feel.
 pub(crate) fn integrate_ink(p: &mut InkPath, others: &[InkPath; MAX_DRAWN], me: usize, t: &Tune) {
     if !p.traveling() {
         return;
     }
-    p.vel.y = (p.vel.y + t.gravity).min(t.max_fall);
+    // ink vel is px/FRAME: convert the fighters' px/s² gravity and px/s terminal. (Un-converted,
+    // gravity slammed vel to terminal in ONE frame — the "lob lands flat instantly" bug.)
+    p.vel.y = (p.vel.y + t.gravity * DT * DT).min(t.max_fall * DT);
     p.pos += p.vel;
+    p.rot += p.omega;
+    p.omega *= INK_SPIN_DAMP;
     if p.pos.y > BLAST_Y {
         *p = InkPath::EMPTY; // fell off the world mid-flight: dies like a launched fighter
         return;
@@ -614,8 +642,32 @@ pub(crate) fn integrate_ink(p: &mut InkPath, others: &[InkPath; MAX_DRAWN], me: 
     }
     if snap >= 0.0 {
         p.pos.y -= snap;
-        p.vel = Vector2::ZERO; // locked: Still IS the cluster; class needs no recompute
+        if p.vel.y > INK_SETTLE_SPEED {
+            // lively impact: hop off the surface, keep rolling forward, spin with the roll
+            p.vel.y = -p.vel.y * p.props.bounce;
+            p.vel.x *= INK_BOUNCE_FRICTION;
+            p.omega = p.vel.x * INK_ROLL_SPIN;
+        } else {
+            bake_rotation(p);
+            p.vel = Vector2::ZERO; // locked: Still IS the cluster
+            p.omega = 0.0;
+        }
     }
+}
+
+/// Fold a flight rotation into the body's geometry: rotate every local offset by `rot`, zero it,
+/// and re-classify (segment slopes changed with the orientation). After this the path is a plain
+/// axis-fixed stroke again — the only place `rot` is ever consumed.
+fn bake_rotation(p: &mut InkPath) {
+    if p.rot == 0.0 {
+        return;
+    }
+    let (s, c) = p.rot.sin_cos();
+    for v in p.pts[..p.len as usize].iter_mut() {
+        *v = Vector2::new(v.x * c - v.y * s, v.x * s + v.y * c);
+    }
+    p.rot = 0.0;
+    classify(p);
 }
 
 // ── tetromino bodies (the lobbed "blocky boy": a closed ink shape, fired not drawn) ──────────────
@@ -730,8 +782,10 @@ pub fn mass_as_weight(mass: f32) -> f32 {
 /// does NOT un-lock the stroke — it shakes in place for a few frames (the ink "hitstun"), so a
 /// weak graze can't knock a platform out from under someone, but chip damage still builds `hp`
 /// toward a real launch. `dmg` is passed separately so callers keep their own scaling
-/// (auto-fire weakness, blast falloff).
-pub fn resolve_hit_ink(hb: &Hitbox, dmg: f32, facing: f32, ink: &mut InkPath, t: &Tune) {
+/// (auto-fire weakness, blast falloff). `contact` is the world point the hit landed at: an
+/// off-center contact torques the body (rigid-body ω = r×v / |r|²), so clipping a piece's corner
+/// sends it tumbling — the Brawl soccer ball.
+pub fn resolve_hit_ink(hb: &Hitbox, dmg: f32, facing: f32, contact: Vector2, ink: &mut InkPath, t: &Tune) {
     if ink.mass <= 0.0 || ink.drawing {
         return; // baked stage / still-being-authored ink is not a body
     }
@@ -742,6 +796,12 @@ pub fn resolve_hit_ink(hb: &Hitbox, dmg: f32, facing: f32, ink: &mut InkPath, t:
         let ang = hb.angle.to_radians();
         // ink vel is px/frame (integrate_ink adds gravity and steps pos += vel with no DT).
         ink.vel = Vector2::new(ang.cos() * facing, -ang.sin()) * speed * DT;
+        let r = contact - ink.pos;
+        let rr = r.length_squared();
+        if rr > 1.0 {
+            // spin as if the launch impulse acted at the contact: ω matches the tangential rate there
+            ink.omega = ((r.x * ink.vel.y - r.y * ink.vel.x) / rr).clamp(-INK_MAX_SPIN, INK_MAX_SPIN);
+        }
         ink.shake = 0; // launched: the travel IS the reaction
     } else {
         ink.shake = (dmg * HITLAG_PER_DMG) as i64 + 2; // too weak to un-lock: jiggle in place
@@ -770,12 +830,14 @@ pub(crate) fn strike_ink(
             continue;
         }
         let n = ink.len as usize;
-        let touched = (0..n.saturating_sub(1)).any(|s| {
+        // contact = the closest segment point inside the strike circle (feeds the launch torque)
+        let touched = (0..n.saturating_sub(1)).find_map(|s| {
             let (a, b) = ink.world_seg(s);
-            (p - geo::closest_on_seg(p, a, b)).length() <= r
+            let q = geo::closest_on_seg(p, a, b);
+            ((p - q).length() <= r).then_some(q)
         });
-        if touched {
-            resolve_hit_ink(hb, dmg, facing, ink, t);
+        if let Some(contact) = touched {
+            resolve_hit_ink(hb, dmg, facing, contact, ink, t);
             hit = true;
         }
     }
@@ -975,9 +1037,13 @@ mod tests {
         }
         assert!(!p.traveling(), "ink settled within {frames} frames");
         assert!(p.pos.x > before.x, "carried its horizontal momentum");
-        let lowest = (0..p.len as usize).map(|i| p.world_pt(i).y).fold(f32::MIN, f32::max);
-        let on_a_top = PLATFORMS.iter().any(|pl| (lowest - pl.y).abs() < 1e-2);
-        assert!(on_a_top, "lowest node sits ON a platform top, got y={lowest}");
+        // roll spin can settle the body TILTED with an end hanging past the platform edge, so the
+        // guarantee is: the snapped node rests ON a top it spans — not that the whole body is flat.
+        let on_a_top = (0..p.len as usize).any(|i| {
+            let w = p.world_pt(i);
+            PLATFORMS.iter().any(|pl| (w.y - pl.y).abs() < 1e-2 && w.x >= pl.left && w.x <= pl.right)
+        });
+        assert!(on_a_top, "a node sits ON a platform top (pos {:?}, rot {})", p.pos, p.rot);
     }
 
     #[test]
@@ -1060,16 +1126,18 @@ mod tests {
     fn weak_strike_shakes_without_unlocking_and_strong_strike_launches() {
         let t = crate::Tune::default();
         let mut ink = body_at(Vector2::new(600.0, 500.0));
-        // weak: the laser bolt's near-flat chip on a fresh stroke
-        resolve_hit_ink(&t.laser.hit, t.laser.hit.damage, 1.0, &mut ink, &t);
+        // weak: the laser bolt's near-flat chip on a fresh stroke (center contact: no torque)
+        resolve_hit_ink(&t.laser.hit, t.laser.hit.damage, 1.0, ink.pos, &mut ink, &t);
         assert_eq!(ink.vel, Vector2::ZERO, "below ink_launch_speed: still locked");
         assert!(ink.shake > 0, "shakes as its hitstun");
         assert!(ink.hp > 0.0, "chip damage builds hp");
-        // strong: the item-throw hit launches
+        // strong: the item-throw hit launches; an off-center contact spins it (the soccer ball)
         let hp_before = ink.hp;
-        resolve_hit_ink(&t.throw_item.hit, t.throw_item.hit.damage, 1.0, &mut ink, &t);
+        let corner = ink.world_pt(0);
+        resolve_hit_ink(&t.throw_item.hit, t.throw_item.hit.damage, 1.0, corner, &mut ink, &t);
         assert!(ink.traveling(), "a real hit un-locks the body");
         assert!(ink.vel.x > 0.0 && ink.vel.y < 0.0, "launched up-and-out toward facing");
+        assert!(ink.omega != 0.0, "an off-center hit torques the body");
         assert!(ink.hp > hp_before);
     }
 
@@ -1078,13 +1146,13 @@ mod tests {
         let t = crate::Tune::default();
         let mut baked = body_at(Vector2::new(600.0, 500.0));
         baked.mass = 0.0; // baked stage sentinel
-        resolve_hit_ink(&t.throw_item.hit, 9.0, 1.0, &mut baked, &t);
+        resolve_hit_ink(&t.throw_item.hit, 9.0, 1.0, baked.pos, &mut baked, &t);
         assert_eq!(baked.vel, Vector2::ZERO);
         assert_eq!(baked.hp, 0.0);
 
         let mut drawing = body_at(Vector2::new(600.0, 500.0));
         drawing.drawing = true;
-        resolve_hit_ink(&t.throw_item.hit, 9.0, 1.0, &mut drawing, &t);
+        resolve_hit_ink(&t.throw_item.hit, 9.0, 1.0, drawing.pos, &mut drawing, &t);
         assert_eq!(drawing.vel, Vector2::ZERO);
         assert_eq!(drawing.hp, 0.0);
     }
