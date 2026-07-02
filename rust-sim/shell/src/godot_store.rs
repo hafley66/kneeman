@@ -12,16 +12,50 @@ use std::collections::HashMap;
 
 use godot::classes::file_access::ModeFlags;
 use godot::classes::{DirAccess, FileAccess};
-use godot::prelude::{GString, PackedByteArray};
+use godot::prelude::*;
 
 use smash_core::world::fold::chain;
 use smash_core::world::store::{WorldStore, SCHEMA};
 use smash_core::world::{
-    asset_id, canon, decanon, event_id, world_id, AssetId, EventId, Node, Seed, WorldEvent, WorldId,
+    asset_id, canon, decanon, event_id, world_id, AssetId, EventId, Node, PlayerId, Seed, WorldEvent, WorldId,
 };
 
 const WORLD_DIR: &str = "user://world";
 const ASSET_DIR: &str = "user://asset";
+const OWNER_PATH: &str = "user://player.cfg";
+
+pub(crate) fn hex32(b: &[u8; 32]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+fn unhex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// This player's stable 32-byte world identity, loaded from `user://` or generated + persisted once.
+/// It is the durable owner key (distinct from the ggrs handle / the editable display name), so a rename
+/// never moves your home world. Later this becomes a claimed keypair; for now it is random-on-first-run.
+pub fn load_or_make_owner() -> PlayerId {
+    let mut cfg = godot::classes::ConfigFile::new_gd();
+    let _ = cfg.load(&GString::from(OWNER_PATH));
+    if let Ok(h) = cfg.get_value("player", "key").try_to::<GString>() {
+        if let Some(id) = unhex32(&h.to_string()) {
+            return PlayerId(id);
+        }
+    }
+    let rng = godot::classes::Crypto::new_gd().generate_random_bytes(32);
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&rng.to_vec());
+    cfg.set_value("player", "key", &GString::from(hex32(&id).as_str()).to_variant());
+    cfg.save(&GString::from(OWNER_PATH));
+    PlayerId(id)
+}
 
 struct Cache {
     seed: Seed,

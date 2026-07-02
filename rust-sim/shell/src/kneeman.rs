@@ -278,6 +278,7 @@ pub struct KneeMan {
     saved_identity: Identity,           // last value written to localStorage (change detection)
     charsel: Mutable<[i64; 2]>,         // P1/P2 roster pick, written by the menu, applied live
     toasts: crate::toast::Toasts,       // global snackbar queue, emitted on phase changes, drawn by DebugUi
+    world: Option<crate::world_runtime::WorldRuntime<crate::godot_store::GodotStore>>, // durable home world (user://)
     characters: [usize; sim::MAX_PLAYERS], // per-fighter index into ROSTER; charsel drives slots 0..2
     base_scale: [f32; sim::MAX_PLAYERS],   // each sprite's resting scale (impact-pop multiplies it)
 
@@ -354,6 +355,7 @@ impl INode2D for KneeMan {
             saved_identity: Identity::default(),
             charsel: Mutable::new([0, 1]),
             toasts: Mutable::new(Vec::new()),
+            world: None,
             characters: [0, 1, 0, 1], // default: frog/zombie alternating; charsel overrides slots 0..2
             base_scale: [1.0; sim::MAX_PLAYERS],
             phase: Phase::Offline,
@@ -383,6 +385,14 @@ impl INode2D for KneeMan {
         let id = load_identity();
         self.identity.set(id.clone());
         self.saved_identity = id.clone();
+
+        // Boot the durable home world (user:// via GodotStore). Owner key is persisted + stable, so the
+        // same home re-attaches every launch. This is load/save; nothing renders it yet.
+        let owner = crate::godot_store::load_or_make_owner();
+        let rt = crate::world_runtime::WorldRuntime::boot(crate::godot_store::GodotStore::open(), owner);
+        let w = rt.world();
+        godot_print!("world: home {}… loaded, {} platforms, bg={}", &crate::godot_store::hex32(&owner.0)[..8], w.platforms.len(), w.bg.is_some());
+        self.world = Some(rt);
 
         // Legacy P2 block: hide it, the per-fighter sprites replace it.
         self.dummy = self
