@@ -252,6 +252,7 @@ pub fn checksum(s: &SimState) -> u128 {
         fold(p.props.ledge_curve.to_bits() as u64);
         fold(p.props.min_seg.to_bits() as u64);
         fold(p.props.bounce.to_bits() as u64);
+        fold(p.props.density.to_bits() as u64);
         fold(p.props.solid as u64);
         fold(p.props.force_wall as u64);
     }

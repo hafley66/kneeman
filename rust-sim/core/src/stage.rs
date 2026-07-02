@@ -100,6 +100,7 @@ pub struct StrokeProps {
     pub ledge_curve: f32, // Δangle between adjacent segments at a Floor tip ≥ this ⇒ grabbable Ledge
     pub min_seg: f32,     // segments shorter than this (px) classify as None
     pub bounce: f32,      // wall restitution if `solid`
+    pub density: f32,     // mass per px of stroke length (finalize: mass = Σ|seg| · density); 0 = never a body
     pub solid: bool,      // true = blocks all sides; false = soft (land from above, drop through w/ down)
     pub force_wall: bool, // classify EVERY segment as Wall (ignore slope) — a pure wall pen, no hollow bits
 }
@@ -116,6 +117,7 @@ impl StrokeProps {
         ledge_curve: 0.7, // ~40° corner makes a lip grabbable
         min_seg: 10.0,
         bounce: 0.4,
+        density: 1.0,      // 1 mass unit per px: a 300px stroke weighs 300 (kb formula rescales)
         solid: true,       // solid surface: land on it, never fade/drop through
         force_wall: false, // classify by slope (flat Floor / steep Wall / mid sloped Floor)
     };
@@ -552,6 +554,12 @@ fn finalize_path(p: &mut InkPath) {
         }
         p.pos = c;
     }
+    // body mass: stroke length × material density. density 0 (baked stage presets) leaves
+    // mass 0 = the not-a-body sentinel, so those strokes can never be knocked into Traveling.
+    p.mass = (0..n.saturating_sub(1))
+        .map(|s| (p.pts[s + 1] - p.pts[s]).length())
+        .sum::<f32>()
+        * p.props.density;
     classify(p);
 }
 
@@ -618,6 +626,32 @@ mod tests {
             }
             (a, b) => assert_eq!(a.is_some(), b.is_some(), "wall block presence"),
         }
+    }
+
+
+    #[test]
+    fn finalize_computes_mass_from_length_times_density() {
+        let world =
+            [Vector2::new(0.0, 0.0), Vector2::new(100.0, 0.0), Vector2::new(100.0, 50.0)];
+        let mut p = InkPath::EMPTY;
+        p.owner = 0;
+        p.drawing = true;
+        for (i, w) in world.iter().enumerate() {
+            p.push(*w, i as u64);
+        }
+        assert_eq!(p.mass, 0.0, "no mass while drawing");
+        finalize_path(&mut p);
+        assert!((p.mass - 150.0 * p.props.density).abs() < 1e-2, "mass = length x density, got {}", p.mass);
+
+        // a zero-density material never becomes a body, even finalized (baked stage preset shape)
+        let mut baked = InkPath::EMPTY;
+        baked.props.density = 0.0;
+        for (i, w) in world.iter().enumerate() {
+            baked.push(*w, i as u64);
+        }
+        finalize_path(&mut baked);
+        assert_eq!(baked.mass, 0.0);
+        assert!(!baked.traveling());
     }
 
     #[test]
