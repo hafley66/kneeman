@@ -38,6 +38,26 @@
 # rows = 6
 # rows_order = ["idle", "walk", "jump", "fall", "jab", "nair"]
 
+[[pack]]
+name = "falcon"
+path = "tools/.cache/workshop/2112527215/sprites"   # Melee Captain Falcon (RoA workshop), via roa_get.py
+kind = "rivals_strip"
+
+[[pack]]
+name = "lucario"
+path = "tools/.cache/workshop/2035128973/sprites"   # Lucario (RoA workshop, 127k subs)
+kind = "rivals_strip"
+
+[[pack]]
+name = "ness"
+path = "tools/.cache/workshop/1915998598/sprites"   # Ness V3.1 (RoA workshop, 104k subs)
+kind = "rivals_strip"
+
+[[pack]]
+name = "lucas"
+path = "tools/.cache/workshop/3493698392/sprites"   # Lucas DE (RoA workshop, 18k subs)
+kind = "rivals_strip"
+
 # --- smoke-test packs (single-frame static images, just to exercise the pipeline) -------------
 
 [[pack]]

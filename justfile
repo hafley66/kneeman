@@ -51,6 +51,35 @@ import:
 packs: && import
     python3 {{proj}}/tools/fetch_packs.py
 
+# --- RoA workshop -> roster (search, QR login, headless download; see tools/roa_*.py) ---
+# Full chain: roa-search -> steam-login (once) -> roa-get -> [[pack]] in packs.toml -> packs -> refs
+
+tools_py := proj / "tools/.venv/bin/python3"
+
+# ensure tools/.venv has the workshop deps (pinned in tools/requirements.txt)
+_tools-venv:
+    @[ -x {{tools_py}} ] || python3 -m venv {{proj}}/tools/.venv
+    @{{tools_py}} -c "import steam.client, qrcode, PIL" 2>/dev/null || \
+      {{proj}}/tools/.venv/bin/pip install -q -r {{proj}}/tools/requirements.txt
+
+# search the RoA workshop for character packs, ranked by subscribers (stdlib, no auth)
+roa-search query pages="1": _tools-venv
+    {{tools_py}} {{proj}}/tools/roa_search.py "{{query}}" --pages {{pages}}
+
+# one-time Steam login: pops a QR png, scan with the Steam mobile app. Token (a credential,
+# keep it out of the repo) -> ~/.config/smash/steam_token.json
+steam-login: _tools-venv
+    {{tools_py}} {{proj}}/tools/steam_qr.py login
+
+# download workshop item(s) headlessly -> tools/.cache/workshop/<id>/ (prints packs.toml lines).
+# Pass several ids at once: one Steam session covers them all.
+roa-get +ids: _tools-venv
+    {{tools_py}} {{proj}}/tools/roa_get.py {{ids}}
+
+# regenerate pose-capture ghost refs from an imported character's strips (after `just packs`)
+refs char="assets/falcon": _tools-venv
+    {{tools_py}} {{proj}}/tools/pose-capture/make_refs.py {{char}}
+
 rust-release:
     cd {{proj}}/rust-sim && cargo build --release
 

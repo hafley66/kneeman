@@ -36,13 +36,19 @@ TARGET_H = 140.0
 # Source clip name -> our CharState clip name (see clip_for in kneeman.rs). Anything not listed
 # passes through unchanged, so extra source clips are still available if the sim ever asks for them.
 ALIAS = {
-    "dash": "run", "walkturn": "skid", "land": "fall", "jumpstart": "jump",
+    "dash": "run", "walkturn": "skid", "dashstop": "skid", "land": "fall", "jumpstart": "jump",
     "doublejump": "jump", "airjump": "jump", "djump": "jump",
     "crouchidle": "crouch", "duck": "crouch",
     "attack": "jab", "jab1": "jab", "nattack": "jab", "ftilt": "jab",
     "nair_": "nair", "airattack": "nair",
     "ladder": "climb", "wall": "hang",
+    "hurt": "wallbounce",
 }
+
+# Non-animation sprites in Rivals workshop dumps: hitstun overlay variants, collision masks,
+# projectiles, portraits. Skip any clip whose source name ends with / equals one of these.
+SKIP_SUFFIXES = ("_hurt", "hurtbox", "_proj")
+SKIP_NAMES = {"portrait", "charselect", "icon", "hud", "result_small", "offscreen", "usa", "plat"}
 
 # Default playback fps + loop flag by (resolved) clip name. packs.toml [pack.fps] overrides fps.
 CLIP_DEFAULTS = {
@@ -140,11 +146,24 @@ def build_strip_pack(pack: dict, files: dict[str, bytes], outdir: Path) -> dict:
     for fname, data in files.items():
         stem = Path(fname).stem
         src_name, frames = parse_strip_name(stem)
+        low = src_name.lower().strip()
+        if low in SKIP_NAMES or low.endswith(SKIP_SUFFIXES):
+            continue
         name = resolve_clip(src_name)
+        if name in clips:
+            print(f"[packs] {pack['name']}: {src_name} -> {name} collides with {clips[name]['file']}; keeping first")
+            continue
         outfile = f"{name}_strip{frames}.png"
-        (outdir / outfile).write_bytes(data)
         with Image.open(io.BytesIO(data)) as im:
             h = im.height
+            if frames > 1 and im.width % frames:
+                # GM strips are sometimes exported with stray padding; the renderer slices
+                # width/frames, so trim to an exact multiple or every frame drifts.
+                even_w = (im.width // frames) * frames
+                print(f"[packs] {pack['name']}: {stem} width {im.width} not /{frames}; cropping to {even_w}")
+                im.convert("RGBA").crop((0, 0, even_w, h)).save(outdir / outfile)
+            else:
+                (outdir / outfile).write_bytes(data)
         if name == "idle" or idle_h is None:
             idle_h = h
         clips[name] = {"file": Path(outfile).stem, "frames": frames}
