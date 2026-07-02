@@ -279,6 +279,7 @@ pub struct KneeMan {
     charsel: Mutable<[i64; 2]>,         // P1/P2 roster pick, written by the menu, applied live
     toasts: crate::toast::Toasts,       // global snackbar queue, emitted on phase changes, drawn by DebugUi
     world: Option<crate::world_runtime::WorldRuntime<crate::godot_store::GodotStore>>, // durable home world (user://)
+    ink_base: std::collections::BTreeMap<Vec<u8>, sim::world::EventId>, // persisted-ink diff base: stroke content key -> placing event
     characters: [usize; sim::MAX_PLAYERS], // per-fighter index into ROSTER; charsel drives slots 0..2
     base_scale: [f32; sim::MAX_PLAYERS],   // each sprite's resting scale (impact-pop multiplies it)
 
@@ -356,6 +357,7 @@ impl INode2D for KneeMan {
             charsel: Mutable::new([0, 1]),
             toasts: Mutable::new(Vec::new()),
             world: None,
+            ink_base: std::collections::BTreeMap::new(),
             characters: [0, 1, 0, 1], // default: frog/zombie alternating; charsel overrides slots 0..2
             base_scale: [1.0; sim::MAX_PLAYERS],
             phase: Phase::Offline,
@@ -391,7 +393,29 @@ impl INode2D for KneeMan {
         let owner = crate::godot_store::load_or_make_owner();
         let rt = crate::world_runtime::WorldRuntime::boot(crate::godot_store::GodotStore::open(), owner);
         let w = rt.world();
-        godot_print!("world: home {}… loaded, {} platforms, bg={}", &crate::godot_store::hex32(&owner.0)[..8], w.platforms.len(), w.bg.is_some());
+        godot_print!(
+            "world: home {}… loaded, {} platforms, {} strokes, bg={}",
+            &crate::godot_store::hex32(&owner.0)[..8], w.platforms.len(), w.strokes.len(), w.bg.is_some()
+        );
+        // Rehydrate persisted permanent ink into live sim paths (a joiner sees the chaos immediately).
+        // Seed the diff base with the same content keys `persist_ink` computes, so boot doesn't
+        // re-append what's already in the log.
+        {
+            let mut s = self.state.get();
+            let t = self.tune.get();
+            let mut slot = 0usize;
+            for (id, st) in w.strokes.iter() {
+                while slot < sim::MAX_DRAWN && s.paths[slot].active() {
+                    slot += 1;
+                }
+                if slot >= sim::MAX_DRAWN {
+                    break; // more persisted strokes than slots: the rest stay in the log only
+                }
+                s.paths[slot] = sim::rehydrate_stroke(&st.pts, st.stroke, 0, &t);
+                self.ink_base.insert(sim::world::canon(&(st.stroke, st.pts.clone())), *id);
+            }
+            self.state.set(s);
+        }
         self.world = Some(rt);
 
         // Legacy P2 block: hide it, the per-fighter sprites replace it.
@@ -578,6 +602,7 @@ impl INode2D for KneeMan {
         self.sync_charsel();
         self.place_tags();
         self.pump_analytics();
+        self.persist_ink();
         self.tick_autosave(delta as f32);
     }
 
@@ -907,14 +932,22 @@ impl INode2D for KneeMan {
 
         // drawn ink paths: stroke each live polyline. Cosmetic read of the sim's cached classes —
         // grabbable lips get a hotter tint so the playable surface is legible.
-        for p in &s.paths {
+        for (pi, p) in s.paths.iter().enumerate() {
             if !p.active() {
                 continue;
             }
+            // struck-but-not-launched ink jiggles for `shake` frames (the ink "hitstun"): a small
+            // per-path phase-offset wobble, cosmetic only — the sim geometry never moves.
+            let jit = if p.shake > 0 {
+                let ph = s.tick as f32 * 1.9 + pi as f32 * 2.1;
+                Vector2::new(ph.sin() * 2.5, (ph * 1.7).cos() * 2.5)
+            } else {
+                Vector2::ZERO
+            };
             let n = p.len as usize;
             for seg in 0..n.saturating_sub(1) {
-                let a = gv(p.world_pt(seg)) - origin;
-                let b = gv(p.world_pt(seg + 1)) - origin;
+                let a = gv(p.world_pt(seg)) - origin + jit;
+                let b = gv(p.world_pt(seg + 1)) - origin + jit;
                 // While the owner is still laying the stroke, every segment is class None (classify
                 // runs at finalize), so a live draw would read as a weak faded line. Paint it solid
                 // ink instead so the drawing shows up live under the pen, then it recolors to its
@@ -1176,6 +1209,65 @@ impl KneeMan {
         self.toasts.clone()
     }
 
+    /// A4: mirror the sim's PERMANENT ink (stroke_life < 0 materials) into the durable world log.
+    /// Runs offline-only on a ~0.5s cadence: diff the settled permanent strokes against `ink_base`
+    /// (content-keyed), append `AddStroke` for new ones and `Revert` for ones knocked away or moved
+    /// (a moved stroke is revert + re-add — forward events, history kept). Points are RDP-simplified
+    /// (bends only; segments interpolate) then snapped to a 1/8px grid so a rehydrate → re-diff
+    /// round-trip is byte-stable and boot never churns the log. Netplay persistence waits on the
+    /// confirmed-frame bridge (world/bridge.rs) — mispredicted frames must never become facts.
+    fn persist_ink(&mut self) {
+        if self.phase != Phase::Offline || self.ev_tick % 30 != 0 {
+            return;
+        }
+        let Some(rt) = self.world.as_mut() else { return };
+        let me = rt.owner();
+        let s = self.state.get();
+        let quant = |v: sim::Vector2| sim::Vector2::new((v.x * 8.0).round() / 8.0, (v.y * 8.0).round() / 8.0);
+        let mut cur: std::collections::BTreeMap<Vec<u8>, (sim::StrokeId, Vec<sim::Vector2>)> =
+            std::collections::BTreeMap::new();
+        for p in s.paths.iter() {
+            if !p.active() || p.drawing || p.traveling() || p.mass <= 0.0 || p.props.stroke_life >= 0 {
+                continue; // only settled permanent bodies are durable facts
+            }
+            let world: Vec<sim::Vector2> = (0..p.len as usize).map(|i| p.world_pt(i)).collect();
+            let pts: Vec<sim::Vector2> =
+                sim::simplify_polyline(&world, 2.0).into_iter().map(quant).collect();
+            // sim strokes don't know their registry row; recover it by matching props (row order
+            // stable, tiny table). No match (props panel-edited mid-flight) falls back to the
+            // tetris row — eligibility already guarantees this stroke is permanent, and a row-0
+            // fallback would rehydrate it as expiring pencil (a silent delete on next boot).
+            let stroke = self
+                .tune
+                .get()
+                .strokes
+                .presets
+                .iter()
+                .position(|pr| *pr == p.props)
+                .unwrap_or(sim::StrokeRegistry::TETRIS_ROW as usize) as sim::StrokeId;
+            cur.insert(sim::world::canon(&(stroke, pts.clone())), (stroke, pts));
+        }
+        // additions: settled permanent ink not yet in the log
+        for (k, (stroke, pts)) in &cur {
+            if !self.ink_base.contains_key(k) {
+                let id = rt.append(&sim::world::WorldEvent::AddStroke {
+                    owner: me,
+                    stroke: *stroke,
+                    pts: pts.clone(),
+                });
+                self.ink_base.insert(k.clone(), id);
+            }
+        }
+        // removals: persisted strokes that no longer exist at that shape/place (struck away, or
+        // mid-flight right now — a traveling stroke reverts here and re-adds when it settles)
+        let stale: Vec<Vec<u8>> = self.ink_base.keys().filter(|k| !cur.contains_key(*k)).cloned().collect();
+        for k in stale {
+            if let Some(placed) = self.ink_base.remove(&k) {
+                rt.append(&sim::world::WorldEvent::Revert { target: placed });
+            }
+        }
+    }
+
     /// Per-frame auto-save of the durable home. Every minute of session time the world runtime
     /// bookmarks the current head; a return value means it just saved, and we warn if the cache is
     /// over the soft cap (mostly gif blobs — nothing is auto-deleted).
@@ -1232,6 +1324,8 @@ impl KneeMan {
     pub fn world_reset(&mut self) {
         if let Some(w) = self.world.as_mut() {
             w.reset_home();
+            // the log's strokes are gone; drop the diff base so live permanent ink re-persists
+            self.ink_base.clear();
             crate::toast::push(&self.toasts, crate::toast::ToastKind::Info, "Home reset to defaults");
         }
     }
@@ -1252,6 +1346,30 @@ impl KneeMan {
                     self.sig.offer_in,
                     self.sig.answer_in,
                     self.sig.ice_in,
+                ),
+            );
+        }
+        // slow world-size sample (~30s): durable footprint + live ink/item counts, so a growing
+        // persistent home (permanent strokes, gif blobs, autosaves) is visible in the firehose
+        // across sessions. Fires in every phase — the offline home room is exactly the world
+        // whose growth we want to watch.
+        if self.ev_tick % 1800 == 0 {
+            let s = self.state.get();
+            let live = || s.paths.iter().filter(|p| p.active());
+            let paths = live().count();
+            let pts: u32 = live().map(|p| p.len as u32).sum();
+            let mass: f32 = live().map(|p| p.mass).sum();
+            let perm = live().filter(|p| p.props.stroke_life < 0).count();
+            let items = s.items.iter().filter(|i| i.active()).count();
+            let (cb, slots) = self
+                .world
+                .as_ref()
+                .map(|w| (w.cache_bytes(), w.slots().len()))
+                .unwrap_or((0, 0));
+            crate::analytics::log(
+                "world",
+                &format!(
+                    r#","cb":{cb},"slots":{slots},"paths":{paths},"pts":{pts},"mass":{mass:.0},"perm":{perm},"items":{items}"#
                 ),
             );
         }
@@ -1402,7 +1520,7 @@ impl KneeMan {
         let tune = self.tune.get();
         for i in crate::controls::number_key_edges(&mut self.spawn_prev) {
             if let Some(card) = sim::MENU_ITEMS.get(i) {
-                sim::spawn_kind(s, card.kind, &tune);
+                sim::spawn_kind(s, card.kind, card.tool, card.stroke, &tune);
             }
         }
     }

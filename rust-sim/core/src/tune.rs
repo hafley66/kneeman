@@ -166,6 +166,7 @@ pub struct Tune {
     pub ink_budget: f32,          // total path length (px) a fresh ink item can lay before it's spent
     pub ink_cursor_reach: f32,    // CursorBrush: how far the drawing cursor floats off the body (px)
     pub ink_spawn_weight: f32,    // relative spawn chance of a pen vs the guns (0 = never random-spawns)
+    pub ink_launch_speed: f32,    // computed launch px/s below this only shakes struck ink (no un-lock)
     pub fastfall_threshold: f32,  // stick aim_y must reach this (and beat |dir|) to fast fall
     // grab -> pummel -> throw
     pub grab_startup: i64,        // wind-up before the grab reach turns on
@@ -260,6 +261,7 @@ impl Tune {
                                // the pen out-of-gas unload still works, it just won't trigger here
             ink_cursor_reach: 140.0,
             ink_spawn_weight: 0.6,
+            ink_launch_speed: 240.0, // lasers chip+shake (~115 px/s computed); throws/bombs launch (500+)
             fastfall_threshold: 0.6,
             grab_startup: 6,
             grab_active: 4,

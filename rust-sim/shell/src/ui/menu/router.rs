@@ -12,7 +12,7 @@
 use futures_signals::signal::Mutable;
 
 use crate::net::NetDebug;
-use crate::sim::{self, ItemKind, SimState, Tune};
+use crate::sim::{self, ItemKind, SimState, StrokeId, ToolKind, Tune};
 
 // ============================ pure nav reducer (extractable crate) ============================
 
@@ -183,7 +183,8 @@ pub enum Intent {
     OpenDialog(Dialog),
     DialogConfirm,
     DialogCancel,
-    SpawnItem(ItemKind),
+    /// Spawn a menu-card item: kind + the pen loadout (tool, stroke registry row; guns ignore them).
+    SpawnItem(ItemKind, ToolKind, StrokeId),
     ClearItems,
     SetChar { slot: usize, idx: i64 },
     /// Signal to the shell (`DebugUi::process`) to open the egui debug panel. The pure Router
@@ -228,7 +229,7 @@ impl Router {
             Intent::OpenDialog(d) => self.dispatch(NavCmd::OpenDialog(d), cells),
             Intent::DialogCancel => self.dispatch(NavCmd::CancelDialog, cells),
             Intent::DialogConfirm => self.dispatch(NavCmd::Confirm, cells),
-            Intent::SpawnItem(k) => spawn_item(cells, k),
+            Intent::SpawnItem(k, tool, stroke) => spawn_item(cells, k, tool, stroke),
             Intent::ClearItems => clear_items(cells),
             Intent::SetChar { slot, idx } => {
                 if slot < 2 {
@@ -262,9 +263,9 @@ impl Router {
     }
 }
 
-fn spawn_item(cells: &MenuCells, kind: ItemKind) {
+fn spawn_item(cells: &MenuCells, kind: ItemKind, tool: ToolKind, stroke: StrokeId) {
     let mut s = cells.state.get();
-    sim::spawn_kind(&mut s, kind, &cells.tune.get());
+    sim::spawn_kind(&mut s, kind, tool, stroke, &cells.tune.get());
     cells.state.set(s);
 }
 

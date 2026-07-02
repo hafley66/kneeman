@@ -153,6 +153,30 @@ new fields' bits). `Tune` fields (density, gravity, friction) do NOT fold. Gate:
 Items reuse the existing `ItemKind` + `ItemConfig` + match-dispatch pipeline
 (item.rs:97/:22) — three new variants, no new plumbing.
 
+## Pencil / pen unification (decided 2026-07-01; the anti-bespoke rule)
+
+Every stroke variant is a `StrokeProps` preset (StrokeRegistry row), NEVER a new type or
+code path. One entity, one lifecycle; variants differ only in policy fields:
+
+| axis | pencil (today's PEN) | pen (zone-maker) | mechanism |
+|---|---|---|---|
+| expiry | `stroke_life: 240` | `stroke_life: -1` = never | existing field + sentinel |
+| body | knockable | knockable | `density` prop → `mass` at finalize |
+| blast zone | excluded | extends it | `zone: bool` prop (added in step 3) |
+| persistence | match-local | world AddStroke event | implied by `stroke_life < 0` |
+
+Consequences:
+- The `owner < 0` never-expires special case (stage.rs:491) retires: baked stage strokes
+  become the `stroke_life: -1` preset; `owner` returns to pure attribution.
+- Persistence never touches the rollback sim: finalize of a permanent stroke emits an
+  AddStroke event on the two-tier log (confirmed frames only); world load rehydrates
+  events into `paths` slots. The sim reads floats/flags off the path, not stroke names.
+- A third stroke idea = one registry row (+ at most one new prop field).
+
+Foundations scope addendum (step 3.5, after blast zone): `zone` + `stroke_life: -1`
+presets wired, world AddStroke event + rehydrate. Shell awareness UI (blast-zone rect,
+minimap, edge-danger tint on the existing edge tags) follows as its own phase.
+
 ## Open questions (parked, none block step 0)
 
 - Ally pass-through: does your own ink bump you? (Melee platform no; Splatoon yes.)

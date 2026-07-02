@@ -22,7 +22,7 @@ impl Screen for Items {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if theme.button(ui, "Spawn").clicked() {
-                            out.push(Intent::SpawnItem(card.kind));
+                            out.push(Intent::SpawnItem(card.kind, card.tool, card.stroke));
                         }
                     });
                 });

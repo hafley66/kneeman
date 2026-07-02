@@ -137,6 +137,12 @@ pub enum WorldEvent {
     /// The world OWNER sets/changes the background (content-addressed gif/image; `None` = stage default).
     /// A folded event, NOT the frozen `Seed.bg`, so changing it doesn't fork the `WorldId`; last write wins.
     SetBackground { bg: Option<AssetId> },
+    /// A finished PERMANENT ink stroke (a `stroke_life < 0` material) settling into the world.
+    /// `pts` are world-space bend vertices ONLY (simplified before emit — the segment between two
+    /// vertices IS the interpolation, so a smooth curve costs a handful of points, not per-pixel).
+    /// A struck stroke that re-settles elsewhere is a `Revert{target}` of the old placement plus a
+    /// fresh `AddStroke` — forward events, history kept, same as platform erase.
+    AddStroke { owner: PlayerId, stroke: StrokeId, pts: Vec<Vector2> },
     // APPEND NEW VARIANTS HERE, at the end. Never reorder, never remove.
 }
 
@@ -292,6 +298,11 @@ mod golden {
             WorldEvent::PlayerJoin { player: PlayerId([4u8; 32]), name: "ann".to_string(), color: 0x11223344, char_pick: 5 },
             WorldEvent::PlayerLeave { player: PlayerId([4u8; 32]) },
             WorldEvent::SetBackground { bg: Some(AssetId([5u8; 32])) },
+            WorldEvent::AddStroke {
+                owner: PlayerId([6u8; 32]),
+                stroke: 1,
+                pts: vec![Vector2::new(1.0, 2.0), Vector2::new(3.0, 4.0)],
+            },
         ]
     }
 
@@ -307,6 +318,7 @@ mod golden {
             "0600000004040404040404040404040404040404040404040404040404040404040404040300000000000000616e6e443322110500",
             "070000000404040404040404040404040404040404040404040404040404040404040404",
             "08000000010505050505050505050505050505050505050505050505050505050505050505",
+            "0900000006060606060606060606060606060606060606060606060606060606060606060102000000000000000000803f000000400000404000008040",
         ];
         for (e, want) in frozen_events().iter().zip(expect) {
             assert_eq!(hex(&canon(e)), want); // reordering/moving a field breaks this exact byte string
@@ -325,6 +337,7 @@ mod golden {
             "02e2ed3e3b8d8007887eaeb58037eb8fafe6700b6f463d3dd6b3263586cab4c7",
             "92b948b3846a0b087d169d9d482a6bf384a24497eef046281431b8c48e73f0dc",
             "3f3fe3308babe4d9c2cccb3b9540ec394ce64f34ffa5e148073f318cfa6d728d",
+            "a818139c4424d754e0d12888c8a3dfc5a4759f289d0abc197c688608a7d5a975",
         ];
         let mut parent = None;
         for (e, want) in frozen_events().iter().zip(expect) {

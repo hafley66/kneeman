@@ -18,6 +18,15 @@ pub struct Plat {
     pub owner: PlayerId,
 }
 
+/// A folded permanent ink stroke: who laid it, its material row, and the simplified world-space
+/// polyline (bend vertices only; loaders re-finalize into a live `InkPath`).
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Stroke {
+    pub owner: PlayerId,
+    pub stroke: crate::StrokeId,
+    pub pts: Vec<Vector2>,
+}
+
 /// A folded player entity: their durable identity + display data + presence. Built by `PlayerJoin`,
 /// flipped offline by `PlayerLeave` (the entry stays — logging off is not a delete).
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -38,6 +47,7 @@ pub struct World {
     pub platforms: BTreeMap<EventId, Plat>,
     pub rules: BTreeMap<u16, f32>,
     pub bg: Option<AssetId>,            // content-addressed background; None = the stage's own backdrop
+    pub strokes: BTreeMap<EventId, Stroke>, // permanent player ink, keyed like platforms (appended LAST: positional bincode)
 }
 
 impl World {
@@ -48,6 +58,7 @@ impl World {
             platforms: BTreeMap::new(),
             rules: BTreeMap::new(),
             bg: None,
+            strokes: BTreeMap::new(),
         }
     }
 }
@@ -64,6 +75,7 @@ pub fn apply(w: &mut World, n: &Node) {
         }
         WorldEvent::Revert { target } => {
             w.platforms.remove(target); // MVP: revert of a placement (its deterministic inverse)
+            w.strokes.remove(target); // a stroke placement's inverse: knocked out / moved away
         }
         WorldEvent::SetRule { key, val } => {
             w.rules.insert(key.0, val.0);
@@ -85,6 +97,9 @@ pub fn apply(w: &mut World, n: &Node) {
         }
         WorldEvent::SetBackground { bg } => {
             w.bg = *bg; // owner changed the backdrop; last write wins (folded, not the frozen seed)
+        }
+        WorldEvent::AddStroke { owner, stroke, pts } => {
+            w.strokes.insert(n.id, Stroke { owner: *owner, stroke: *stroke, pts: pts.clone() });
         }
     }
 }
@@ -303,6 +318,26 @@ mod tests {
         // clearing back to the stage default is just another event
         let cleared = chain(&[WorldEvent::SetBackground { bg: Some(a) }, WorldEvent::SetBackground { bg: None }]);
         assert_eq!(fold(B, &cleared).bg, None);
+    }
+
+    #[test]
+    fn addstroke_folds_and_revert_removes_it() {
+        let pid = PlayerId([7u8; 32]);
+        let add = WorldEvent::AddStroke {
+            owner: pid,
+            stroke: 1,
+            pts: vec![Vector2::new(100.0, 500.0), Vector2::new(300.0, 500.0)],
+        };
+        let placed = chain(&[add.clone()])[0].id;
+        let w = fold(B, &chain(&[add.clone()]));
+        assert_eq!(w.strokes.len(), 1);
+        let st = w.strokes.get(&placed).unwrap();
+        assert_eq!(st.owner, pid);
+        assert_eq!(st.stroke, 1);
+        assert_eq!(st.pts.len(), 2);
+        // knock it away: Revert of the placement is its inverse (same shape as platform erase)
+        let gone = fold(B, &chain(&[add, WorldEvent::Revert { target: placed }]));
+        assert!(gone.strokes.is_empty());
     }
 
     #[test]

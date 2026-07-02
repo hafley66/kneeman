@@ -3,8 +3,9 @@
 //! for the slot type carried in `SimState.items`. Pure; re-exported at the crate root.
 
 use crate::{
-    airborne, hurtbox, knockback_units, out_of_bounds, Fighter, Hitbox, SimState, StrokeId, ThrowDir,
-    ToolKind, Tune, Vector2, DT, FLOOR_LEFT, FLOOR_RIGHT, GROUND_Y, HITLAG_PER_DMG, MAX_ITEMS,
+    airborne, hurtbox, knockback_units, out_of_bounds, resolve_hit_ink, strike_ink, Fighter, Hitbox,
+    SimState, StrokeId, ThrowDir, ToolKind, Tune, Vector2, DT, FLOOR_LEFT, FLOOR_RIGHT, GROUND_Y,
+    HITLAG_PER_DMG, MAX_ITEMS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -169,18 +170,29 @@ impl Item {
 }
 
 /// A menu-facing description of a spawnable item: which kind, plus the name + one-line blurb the
-/// item screen shows. Host-independent so the shell renders the roster without knowing the kinds.
+/// item screen shows, plus the pen loadout (`tool` + `stroke` registry row — two cards can share
+/// `ItemKind::Pen` and differ only in material, per the anti-bespoke rule). Host-independent so
+/// the shell renders the roster without knowing the kinds.
 pub struct ItemCard {
     pub kind: ItemKind,
     pub name: &'static str,
     pub blurb: &'static str,
+    pub tool: ToolKind,
+    pub stroke: StrokeId,
 }
 
 /// The items the menu offers to spawn. Order here is the order the screen lists them.
 pub const MENU_ITEMS: &[ItemCard] = &[
-    ItemCard { kind: ItemKind::LaserGun, name: "Laser Gun", blurb: "hold attack to spray flat bolts" },
-    ItemCard { kind: ItemKind::BobGun, name: "Bob Gun", blurb: "lobs an arcing bomb that blasts" },
-    ItemCard { kind: ItemKind::Pen, name: "Pen", blurb: "draw ink terrain to stand on" },
+    ItemCard { kind: ItemKind::LaserGun, name: "Laser Gun", blurb: "hold attack to spray flat bolts", tool: ToolKind::TrailPen, stroke: 0 },
+    ItemCard { kind: ItemKind::BobGun, name: "Bob Gun", blurb: "lobs an arcing bomb that blasts", tool: ToolKind::TrailPen, stroke: 0 },
+    ItemCard { kind: ItemKind::Pen, name: "Pen", blurb: "draw ink terrain to stand on", tool: ToolKind::TrailPen, stroke: 0 },
+    ItemCard {
+        kind: ItemKind::Pen,
+        name: "Tetris Pen",
+        blurb: "aimed straight strokes that never expire — strike them away",
+        tool: ToolKind::StrokeRuler,
+        stroke: crate::StrokeRegistry::TETRIS_ROW,
+    },
 ];
 
 // --- items ---------------------------------------------------------------------------------------
@@ -272,8 +284,9 @@ fn fresh_gas(kind: ItemKind, t: &Tune) -> f32 {
 }
 
 /// Force-drop one item of a chosen kind into a free slot (the menu's debug spawn). Lands mid-stage,
-/// dropping in from above like a natural spawn. No-op when the field is full.
-pub fn spawn_kind(n: &mut SimState, kind: ItemKind, t: &Tune) {
+/// dropping in from above like a natural spawn. `tool`/`stroke` are the pen loadout off the menu
+/// card (guns ignore them). No-op when the field is full.
+pub fn spawn_kind(n: &mut SimState, kind: ItemKind, tool: ToolKind, stroke: StrokeId, t: &Tune) {
     let Some(slot) = n.items.iter().position(|it| !it.active()) else {
         return;
     };
@@ -288,8 +301,8 @@ pub fn spawn_kind(n: &mut SimState, kind: ItemKind, t: &Tune) {
         gas_max: gas,
         timer: 0,
         facing: 1.0,
-        tool: ToolKind::TrailPen,
-        stroke: 0,
+        tool,
+        stroke,
         thrown: false,
     };
 }
@@ -462,6 +475,11 @@ pub(crate) fn update_items(n: &mut SimState, t: &Tune) {
                         hit_someone = true;
                     }
                 }
+                // an armed throw whacks ink bodies too (billiards): same contact box, spent on impact
+                let ti = t.throw_item.hit;
+                if strike_ink(&mut n.paths, p, ti.r, &ti, ti.damage, it.facing, t) {
+                    hit_someone = true;
+                }
                 if out_of_bounds(p) {
                     n.items[k] = Item::EMPTY; // crossed a blast zone: quiet despawn
                 } else if hit_someone {
@@ -531,6 +549,11 @@ pub(crate) fn update_items(n: &mut SimState, t: &Tune) {
                         spent = true;
                     }
                 }
+                // bolts chip ink bodies (weak: shakes + builds hp, rarely launches). Bolt is spent.
+                let scale = if it.gas == 1.0 { t.laser.autofire_dmg } else { 1.0 };
+                if strike_ink(&mut n.paths, p, BOLT_R, &t.laser.hit, t.laser.hit.damage * scale, it.facing, t) {
+                    spent = true;
+                }
                 if spent {
                     n.items[k] = Item::EMPTY;
                 }
@@ -597,6 +620,22 @@ fn explode(n: &mut SimState, center: Vector2, t: &Tune) {
         f.tumble = speed > t.tumble_speed;
         f.hitlag = (dmg * HITLAG_PER_DMG) as i64 + 4;
         f.arm_hits();
+    }
+    // the blast shoves ink bodies too: radial-ish (the box's up-and-out angle, signed away from the
+    // center), damage falls off by distance to the body's rim like the fighter hit does.
+    for ink in n.paths.iter_mut() {
+        if !ink.active() || ink.mass <= 0.0 || ink.drawing {
+            continue;
+        }
+        let (c, br) = ink.bound_circle();
+        let d = c - center;
+        let dist = (d.length() - br).max(0.0);
+        if dist > t.bomb.blast_r {
+            continue;
+        }
+        let falloff = 1.0 - 0.5 * (dist / t.bomb.blast_r);
+        let facing = if d.x >= 0.0 { 1.0 } else { -1.0 };
+        resolve_hit_ink(&atk, atk.damage * falloff, facing, ink, t);
     }
 }
 

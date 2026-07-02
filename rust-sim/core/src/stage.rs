@@ -3,7 +3,7 @@
 //! polyline of segments — so stage geometry and ink share this module. Everything here is pure and
 //! `Copy`-friendly so it rides inside the rolled-back `SimState`. Re-exported at the crate root.
 
-use crate::{geo, Fighter, InputFrame, SimState, Tune, Vector2};
+use crate::{geo, knockback_units, Fighter, Hitbox, InputFrame, SimState, Tune, Vector2, DT, HITLAG_PER_DMG};
 use serde::{Deserialize, Serialize};
 
 // Battlefield-style stage: one solid main platform (with grabbable ledges) + soft platforms
@@ -75,7 +75,7 @@ pub fn stage_walls() -> [(geo::Iso, geo::Shape); 2] {
 // that emits these same points — never in the tick — so it can't break determinism. See the
 // `ink-paths` skill for the full architecture.
 pub const MAX_PATH_PTS: usize = 24; // points per path → up to MAX_PATH_PTS-1 segments
-pub const MAX_DRAWN: usize = 6;     // simultaneous live paths (drawn ink + loaded stage strokes)
+pub const MAX_DRAWN: usize = 12;    // simultaneous live paths (drawn ink + loaded stage strokes)
 
 /// What one segment collides as. Computed ONCE at finalize by `classify` and cached on the path, so
 /// the per-tick collision read is O(segments) with no trig. Grabbability lives here: a `Ledge` is a
@@ -123,6 +123,11 @@ impl StrokeProps {
         force_wall: false, // classify by slope (flat Floor / steep Wall / mid sloped Floor)
         zone: false,       // the prototype pencil: temporary ink, does NOT grow the blast zone
     };
+
+    /// Permanent platform material (the tetris pen): identical surface feel to PEN but the stroke
+    /// never times out — it dies only by leaving the blast zone. `stroke_life < 0` is the
+    /// never-expires sentinel the decay loop honors.
+    pub const TETRIS: Self = Self { stroke_life: -1, ..Self::PEN };
 }
 
 /// Index into a `StrokeRegistry`'s preset table. Plain `u8` so it rides inside `Item`/`SimState` as
@@ -143,8 +148,16 @@ pub struct StrokeRegistry {
 }
 
 impl StrokeRegistry {
-    /// Every slot starts at the baseline pen; row 0 is the default. Panels/serde override rows later.
-    pub const DEFAULT: Self = Self { presets: [StrokeProps::PEN; STROKE_SLOTS] };
+    /// Registry row of the permanent tetris-platform material.
+    pub const TETRIS_ROW: StrokeId = 1;
+
+    /// Every slot starts at the baseline pen; row 0 is the default, row 1 the permanent tetris
+    /// material. Panels/serde override rows later.
+    pub const DEFAULT: Self = {
+        let mut presets = [StrokeProps::PEN; STROKE_SLOTS];
+        presets[Self::TETRIS_ROW as usize] = StrokeProps::TETRIS;
+        Self { presets }
+    };
 
     /// Resolve a `StrokeId` to its material, falling back to the default row (0) on an out-of-range id.
     pub fn get(&self, id: StrokeId) -> StrokeProps {
@@ -249,6 +262,7 @@ pub struct InkPath {
     pub vel: Vector2,                    // px/s; ZERO = still, nonzero = traveling
     pub hp: f32,                         // damage %, scales knockback taken (fighters' formula)
     pub mass: f32,                       // Σ|seg|·density at finalize; 0.0 = not a body (baked/drawing)
+    pub shake: i64,                      // hitstun frames left from a too-weak strike (cosmetic jitter)
 }
 
 impl InkPath {
@@ -266,6 +280,7 @@ impl InkPath {
         vel: Vector2::ZERO,
         hp: 0.0,
         mass: 0.0,
+        shake: 0,
     };
 
     pub fn active(&self) -> bool {
@@ -531,8 +546,11 @@ pub(crate) fn update_paths(n: &mut SimState, inputs: &[&InputFrame], t: &Tune) {
     // stage strokes (owner < 0) never expire. The timer is anchored on the newest node's birth, so it
     // starts counting from the moment the owner stops extending the stroke.
     for p in n.paths.iter_mut() {
-        if !p.active() || p.owner < 0 || p.drawing {
-            continue;
+        if p.shake > 0 {
+            p.shake -= 1; // struck-ink hitstun countdown (shell jitters while > 0)
+        }
+        if !p.active() || p.owner < 0 || p.drawing || p.props.stroke_life < 0 {
+            continue; // stroke_life < 0 = the never-expires sentinel (tetris pen, later: baked stage)
         }
         let newest = p.born[p.len as usize - 1];
         if tick.saturating_sub(newest) > p.props.stroke_life as u64 {
@@ -614,6 +632,126 @@ pub(crate) fn prune_outside(n: &mut SimState) {
             *p = InkPath::EMPTY;
         }
     }
+}
+
+// ── striking ink (billiards: anything moving can knock ink) ──────────────────────────────────────
+
+/// Ink mass → the kb formula's weight param. A ~300px default-density stroke weighs in near a
+/// fighter (Tune.weight ~104); longer/denser strokes are heavier and fly less far.
+pub const INK_WEIGHT_SCALE: f32 = 0.35;
+
+pub fn mass_as_weight(mass: f32) -> f32 {
+    mass * INK_WEIGHT_SCALE
+}
+
+/// A hit landing on a finalized ink body: the un-lock primitive (plans/ink-billiards.md step 4).
+/// Damage accumulates on `hp` like a fighter's percent; knockback runs the same community formula
+/// with `mass_as_weight` standing in for victim weight. A launch below `Tune.ink_launch_speed`
+/// does NOT un-lock the stroke — it shakes in place for a few frames (the ink "hitstun"), so a
+/// weak graze can't knock a platform out from under someone, but chip damage still builds `hp`
+/// toward a real launch. `dmg` is passed separately so callers keep their own scaling
+/// (auto-fire weakness, blast falloff).
+pub fn resolve_hit_ink(hb: &Hitbox, dmg: f32, facing: f32, ink: &mut InkPath, t: &Tune) {
+    if ink.mass <= 0.0 || ink.drawing {
+        return; // baked stage / still-being-authored ink is not a body
+    }
+    ink.hp += dmg;
+    let units = knockback_units(ink.hp, dmg, mass_as_weight(ink.mass), hb);
+    let speed = units * t.kb_speed * t.knockback_mult;
+    if speed >= t.ink_launch_speed {
+        let ang = hb.angle.to_radians();
+        // ink vel is px/frame (integrate_ink adds gravity and steps pos += vel with no DT).
+        ink.vel = Vector2::new(ang.cos() * facing, -ang.sin()) * speed * DT;
+        ink.shake = 0; // launched: the travel IS the reaction
+    } else {
+        ink.shake = (dmg * HITLAG_PER_DMG) as i64 + 2; // too weak to un-lock: jiggle in place
+    }
+}
+
+/// Point-contact strike: apply `hb` to every finalized ink body within `r` of point `p` (coarse
+/// bound-circle cull, then per-segment capsule test). Returns true if anything was struck so a
+/// projectile can spend itself. `facing` signs the launch direction exactly like a fighter hit.
+pub(crate) fn strike_ink(
+    paths: &mut [InkPath; MAX_DRAWN],
+    p: Vector2,
+    r: f32,
+    hb: &Hitbox,
+    dmg: f32,
+    facing: f32,
+    t: &Tune,
+) -> bool {
+    let mut hit = false;
+    for ink in paths.iter_mut() {
+        if !ink.active() || ink.mass <= 0.0 || ink.drawing {
+            continue;
+        }
+        let (c, br) = ink.bound_circle();
+        if (p - c).length() > br + r {
+            continue;
+        }
+        let n = ink.len as usize;
+        let touched = (0..n.saturating_sub(1)).any(|s| {
+            let (a, b) = ink.world_seg(s);
+            (p - geo::closest_on_seg(p, a, b)).length() <= r
+        });
+        if touched {
+            resolve_hit_ink(hb, dmg, facing, ink, t);
+            hit = true;
+        }
+    }
+    hit
+}
+
+// ── persistence helpers (A4: permanent ink ↔ durable world) ──────────────────────────────────────
+
+/// Ramer-Douglas-Peucker polyline simplification: keeps both endpoints and every vertex whose
+/// perpendicular distance from the chord of its span exceeds `eps` px. This is the persisted-ink
+/// space saver: store only the bends — the straight segment between two kept vertices IS the
+/// interpolation, so a hand-drawn wobble collapses to a few points instead of one per sample.
+/// Deterministic, iterative (explicit stack), order-preserving.
+pub fn simplify_polyline(pts: &[Vector2], eps: f32) -> Vec<Vector2> {
+    if pts.len() <= 2 {
+        return pts.to_vec();
+    }
+    let mut keep = vec![false; pts.len()];
+    keep[0] = true;
+    keep[pts.len() - 1] = true;
+    let mut spans = vec![(0usize, pts.len() - 1)];
+    while let Some((a, b)) = spans.pop() {
+        if b <= a + 1 {
+            continue;
+        }
+        // farthest interior vertex from the chord a→b
+        let (mut worst, mut worst_d) = (a, -1.0f32);
+        for i in a + 1..b {
+            let d = (pts[i] - geo::closest_on_seg(pts[i], pts[a], pts[b])).length();
+            if d > worst_d {
+                worst = i;
+                worst_d = d;
+            }
+        }
+        if worst_d > eps {
+            keep[worst] = true;
+            spans.push((a, worst));
+            spans.push((worst, b));
+        }
+    }
+    pts.iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| *p).collect()
+}
+
+/// Build a live sim path from a persisted stroke: world-space `pts` in, material off the registry,
+/// finalized (rebased + classified + massed) so it lands as a Still body. `owner` is the LOCAL match
+/// attribution slot (the durable `PlayerId` stays in the world log; the sim only knows handles).
+pub fn rehydrate_stroke(pts: &[Vector2], stroke: StrokeId, owner: i8, t: &Tune) -> InkPath {
+    let mut p = InkPath::EMPTY;
+    p.owner = owner;
+    p.drawing = true; // keep pos ZERO while pushing world points (local == world), like a live draw
+    p.props = t.strokes.get(stroke);
+    for (i, w) in pts.iter().take(MAX_PATH_PTS).enumerate() {
+        p.push(*w, i as u64);
+    }
+    finalize_path(&mut p);
+    p
 }
 
 /// Stop drawing a path and cache its per-segment surface classes (the grabbability the collision read
@@ -818,5 +956,111 @@ mod tests {
         let mut moving = p;
         moving.vel = Vector2::new(5.0, 0.0);
         assert!(!moving.traveling(), "mass 0 never travels even with vel set");
+    }
+
+    #[test]
+    fn tetris_material_never_expires() {
+        let t = crate::Tune::default();
+        assert!(t.strokes.get(StrokeRegistry::TETRIS_ROW) == StrokeProps::TETRIS, "registry row 1");
+        let mut n = crate::SimState::spawn();
+        let mut perm = body_at(Vector2::new(600.0, 500.0));
+        perm.props = StrokeProps::TETRIS;
+        n.paths[0] = perm;
+        n.paths[1] = body_at(Vector2::new(500.0, 500.0)); // control: a pencil stroke, expires
+        n.tick = StrokeProps::PEN.stroke_life as u64 + 100; // well past the pencil's life
+        let inputs = crate::InputFrame::default();
+        update_paths(&mut n, &[&inputs, &inputs], &t);
+        assert!(n.paths[0].active(), "stroke_life < 0 = never expires");
+        assert!(!n.paths[1].active(), "the pencil control decayed");
+    }
+
+    #[test]
+    fn weak_strike_shakes_without_unlocking_and_strong_strike_launches() {
+        let t = crate::Tune::default();
+        let mut ink = body_at(Vector2::new(600.0, 500.0));
+        // weak: the laser bolt's near-flat chip on a fresh stroke
+        resolve_hit_ink(&t.laser.hit, t.laser.hit.damage, 1.0, &mut ink, &t);
+        assert_eq!(ink.vel, Vector2::ZERO, "below ink_launch_speed: still locked");
+        assert!(ink.shake > 0, "shakes as its hitstun");
+        assert!(ink.hp > 0.0, "chip damage builds hp");
+        // strong: the item-throw hit launches
+        let hp_before = ink.hp;
+        resolve_hit_ink(&t.throw_item.hit, t.throw_item.hit.damage, 1.0, &mut ink, &t);
+        assert!(ink.traveling(), "a real hit un-locks the body");
+        assert!(ink.vel.x > 0.0 && ink.vel.y < 0.0, "launched up-and-out toward facing");
+        assert!(ink.hp > hp_before);
+    }
+
+    #[test]
+    fn strikes_never_touch_baked_or_still_authored_ink() {
+        let t = crate::Tune::default();
+        let mut baked = body_at(Vector2::new(600.0, 500.0));
+        baked.mass = 0.0; // baked stage sentinel
+        resolve_hit_ink(&t.throw_item.hit, 9.0, 1.0, &mut baked, &t);
+        assert_eq!(baked.vel, Vector2::ZERO);
+        assert_eq!(baked.hp, 0.0);
+
+        let mut drawing = body_at(Vector2::new(600.0, 500.0));
+        drawing.drawing = true;
+        resolve_hit_ink(&t.throw_item.hit, 9.0, 1.0, &mut drawing, &t);
+        assert_eq!(drawing.vel, Vector2::ZERO);
+        assert_eq!(drawing.hp, 0.0);
+    }
+
+    #[test]
+    fn simplify_drops_collinear_points_and_keeps_bends() {
+        // a flat run with redundant midpoints, then a sharp bend up
+        let pts = [
+            Vector2::new(0.0, 0.0),
+            Vector2::new(50.0, 0.1),  // ~collinear: dropped
+            Vector2::new(100.0, 0.0),
+            Vector2::new(150.0, 0.2), // ~collinear: dropped
+            Vector2::new(200.0, 0.0),
+            Vector2::new(200.0, -100.0), // the bend endpoint (kept: last)
+        ];
+        let out = simplify_polyline(&pts, 2.0);
+        assert_eq!(out.first(), Some(&pts[0]), "first endpoint kept");
+        assert_eq!(out.last(), Some(&pts[5]), "last endpoint kept");
+        assert!(out.contains(&pts[4]), "the corner vertex survives");
+        assert!(out.len() <= 3, "wobble collapses, got {:?}", out);
+        // a real curve keeps enough points to stay within eps
+        let arc: Vec<Vector2> =
+            (0..=10).map(|i| { let a = i as f32 * 0.31; Vector2::new(a.cos() * 100.0, a.sin() * 100.0) }).collect();
+        let slim = simplify_polyline(&arc, 6.0); // 2-segment sagitta ~4.8px < eps: alternates drop
+        assert!(slim.len() > 3 && slim.len() < arc.len(), "curve thins but keeps its bends: {}", slim.len());
+    }
+
+    #[test]
+    fn rehydrated_stroke_matches_a_drawn_one() {
+        let t = crate::Tune::default();
+        let world = [
+            Vector2::new(400.0, 500.0),
+            Vector2::new(500.0, 500.0),
+            Vector2::new(500.0, 400.0),
+        ];
+        let p = rehydrate_stroke(&world, StrokeRegistry::TETRIS_ROW, 0, &t);
+        assert!(p.active() && !p.drawing);
+        assert!(p.mass > 0.0, "a body on arrival");
+        assert!(p.props == StrokeProps::TETRIS, "material off the registry row");
+        for (i, w) in world.iter().enumerate() {
+            assert!((p.world_pt(i) - *w).length() < 1e-3, "world geometry preserved");
+        }
+        assert!(p.class[0] == SegClass::Floor || p.class[0] == SegClass::Ledge, "classified on load");
+    }
+
+    #[test]
+    fn strike_ink_hits_by_contact_and_reports_it() {
+        let t = crate::Tune::default();
+        let mut paths = [InkPath::EMPTY; MAX_DRAWN];
+        paths[0] = body_at(Vector2::new(600.0, 500.0)); // 60px bar at y=500
+        let hb = t.throw_item.hit;
+        // graze the bar's midpoint
+        assert!(strike_ink(&mut paths, Vector2::new(600.0, 510.0), hb.r, &hb, hb.damage, 1.0, &t));
+        assert!(paths[0].traveling());
+        // far away: no contact
+        let mut paths2 = [InkPath::EMPTY; MAX_DRAWN];
+        paths2[0] = body_at(Vector2::new(600.0, 500.0));
+        assert!(!strike_ink(&mut paths2, Vector2::new(100.0, 100.0), hb.r, &hb, hb.damage, 1.0, &t));
+        assert_eq!(paths2[0].hp, 0.0);
     }
 }
