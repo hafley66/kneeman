@@ -524,9 +524,59 @@ pub fn step(s: &SimState, inputs: &[&InputFrame], t: &Tune) -> SimState {
         stage::integrate_ink(&mut p, &snap, i, t); // traveling ink arcs + settles/stacks (locks)
         n.paths[i] = p;
     }
+    ink_hits_fighters(&mut n, np, t); // a flying piece is a live hazard — its maker included
     stage::prune_outside(&mut n); // still ink that settled outside the blast zone dies
     stage::update_paths(&mut n, inputs, t); // lay/extend/finalize drawn ink, decay old nodes
     n
+}
+
+/// Traveling ink slams fighters: any body moving at least `INK_TRUCK_SPEED` that overlaps a
+/// hurtbox hits like a truck — no owner exemption, you CAN eat your own lob on the ricochet.
+/// Mirrors `apply_bolt_hit`'s tail, but the launch direction is the body's travel direction
+/// (up-biased) and damage scales with impact speed. Hitstun/hitlag/i-frames gate the re-hit:
+/// a fighter already reeling can't be ground into paste by the same flyby.
+fn ink_hits_fighters(n: &mut SimState, np: usize, t: &Tune) {
+    for pi in 0..stage::MAX_DRAWN {
+        let p = n.paths[pi];
+        if !p.traveling() {
+            continue;
+        }
+        let sp = p.vel.length();
+        if sp < stage::INK_TRUCK_SPEED {
+            continue;
+        }
+        for f in n.fighters[..np].iter_mut() {
+            if f.invuln > 0 || f.intangible || f.hitlag > 0 || f.hitstun > 0 {
+                continue;
+            }
+            let (c, r) = hurtbox(f);
+            let (bc, br) = p.bound_circle();
+            if (c - bc).length() > br + r {
+                continue;
+            }
+            let nseg = p.len as usize;
+            let touched = (0..nseg.saturating_sub(1)).any(|s| {
+                let (a, b) = p.world_seg(s);
+                (c - geo::closest_on_seg(c, a, b)).length() <= r
+            });
+            if !touched {
+                continue;
+            }
+            // truck-grade box: heavy base + growth so it kills at high percent like a real hazard
+            let hb = Hitbox { bkb: 50.0, kbg: 85.0, ..Hitbox::NONE };
+            let dmg = (6.0 + sp * 0.5).min(18.0); // impact speed feeds the damage
+            f.damage += dmg;
+            let kb = knockback_units(f.damage, dmg, t.weight, &hb);
+            let speed = kb * t.kb_speed * t.knockback_mult;
+            let dir = (p.vel.normalize_or_zero() + Vector2::new(0.0, -0.5)).normalize_or_zero();
+            f.vel = dir * speed;
+            f.hitstun = (kb * t.kb_hitstun) as i64;
+            f.tumble = speed > t.tumble_speed;
+            f.state = CharState::Launched;
+            f.frame = 0;
+            f.hitlag = (dmg * HITLAG_PER_DMG) as i64 + 4;
+        }
+    }
 }
 
 /// Two distinct fighters (`a != b`) borrowed mutably at once, via one `split_at_mut`. Replaces the

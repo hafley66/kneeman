@@ -580,6 +580,11 @@ pub(crate) fn update_paths(n: &mut SimState, inputs: &[&InputFrame], t: &Tune) {
     }
 }
 
+/// Ink gravity/terminal scale vs fighters: pieces hang in the air (the floaty stage hazard).
+pub const INK_FLOAT: f32 = 0.35;
+/// A traveling body at or above this speed (px/frame) is a live hazard: it slams any fighter it
+/// touches — INCLUDING its maker. Below it, it drifts harmlessly.
+pub const INK_TRUCK_SPEED: f32 = 5.0;
 /// Faster than this into a floor (px/frame) the body BOUNCES (Brawl soccer ball); at or below it
 /// locks into terrain. `props.bounce` is the restitution.
 pub const INK_SETTLE_SPEED: f32 = 3.5;
@@ -604,7 +609,8 @@ pub(crate) fn integrate_ink(p: &mut InkPath, others: &[InkPath; MAX_DRAWN], me: 
     }
     // ink vel is px/FRAME: convert the fighters' px/s² gravity and px/s terminal. (Un-converted,
     // gravity slammed vel to terminal in ONE frame — the "lob lands flat instantly" bug.)
-    p.vel.y = (p.vel.y + t.gravity * DT * DT).min(t.max_fall * DT);
+    // INK_FLOAT then softens both: pieces hang and drift, fighters keep their weight.
+    p.vel.y = (p.vel.y + t.gravity * DT * DT * INK_FLOAT).min(t.max_fall * DT * INK_FLOAT);
     p.pos += p.vel;
     p.rot += p.omega;
     p.omega *= INK_SPIN_DAMP;
